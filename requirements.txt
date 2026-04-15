@@ -1,0 +1,6 @@
+aiohttp>=3.9
+websockets>=12
+python-dotenv>=1.0
+mariadb>=1.1
+fastapi>=0.111
+uvicorn>=0.30

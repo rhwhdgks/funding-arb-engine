@@ -1,0 +1,234 @@
+# Environment Variables
+
+## Exchange credentials
+- `BINANCE_ACCESS_KEY`
+- `BINANCE_SECRET_KEY`
+- `GATEIO_ACCESS_KEY`
+- `GATEIO_SECRET_KEY`
+- `OKX_ACCESS_KEY`
+- `OKX_SECRET_KEY`
+- `OKX_PASSPHRASE`
+
+## Exchange runtime
+- `SYMBOL`
+- `SYMBOLS`
+- `LEVERAGE`
+- `MARGIN_MODE`
+- `BINANCE_ACCOUNT_INTERVAL_SEC`
+- `BINANCE_BOOK_TICKER_ENABLED`
+- `BINANCE_MAX_STREAMS_PER_CONNECTION`
+- `BINANCE_WS_REST_PREFILL_ENABLED`
+- `BINANCE_TICKER_LIST_CACHE_SEC`
+- `GATEIO_ACCOUNT_INTERVAL_SEC`
+- `GATE_BOOK_TICKER_ENABLED`
+- `GATE_MAX_TICKERS_PER_CONNECTION`
+- `GATE_WS_REST_PREFILL_ENABLED`
+- `GATEIO_TICKER_LIST_CACHE_SEC`
+- `OKX_ACCOUNT_INTERVAL_SEC`
+- `OKX_BOOK_TICKER_ENABLED`
+- `OKX_MAX_TICKERS_PER_CONNECTION`
+- `OKX_WS_REST_PREFILL_ENABLED`
+- `OKX_FORCE_IPV4`
+- `OKX_TICKER_LIST_CACHE_SEC`
+- `MAX_SERVER_PC_DRIFT_MS`
+- `AUTO_RECONCILE_ON_WS_EVENTS`
+- `AUTO_RECONCILE_COOLDOWN_SEC`
+- `RECONCILE_GUARD_INTERVAL_SEC`
+- `PERIODIC_RECONCILE_SEC`
+- `ACCOUNT_STALE_GUARD_SEC`
+- `OPEN_ORDERS_STALE_GUARD_SEC`
+- `WAITING_ORDER_SNAPSHOT_GRACE_SEC`
+- `MARKET_ORDER_FOLLOWUP_DELAY_SEC`
+- `MARKET_ORDER_FOLLOWUP_TRADE_LIMIT`
+- `SOAK_CYCLES`
+- `SOAK_RESTART_EVERY`
+- `SOAK_RECONCILE_EVERY`
+- `SOAK_LOOP_SLEEP_SEC`
+- `SOAK_LOG_PATH`
+- `SOAK_LOOP_DELAY_SEC`
+- `SOAK_JSONL_PATH`
+- `SOAK_STDOUT_LOG`
+- `SOAK_MAX_FAILURES`
+
+## MariaDB
+- `MARIADB_HOST`
+- `MARIADB_PORT`
+- `MARIADB_USER`
+- `MARIADB_PASSWORD`
+- `MARIADB_DATABASE`
+
+## DB sync script
+- `TARGET_EXCHANGE`
+- `TARGET_EXCHANGES`
+- `ENABLE_ORDER_EVENTS`
+- `SYNC_TRADES`
+- `SYNC_FUNDING`
+- `SYNC_ORDERS`
+- `SYNC_BALANCE`
+- `SYNC_POSITIONS`
+- `TRADE_LIMIT`
+- `FUNDING_LIMIT`
+- `WAIT_WS_SEC`
+- `ENSURE_SCHEMA`
+- `SYNC_INTERVAL_SEC`
+
+## CLI report
+- `REPORT_WAIT_WS_SEC`
+- `REPORT_TRADE_LIMIT`
+- `INTERFACE_SYMBOL_MAP`
+- `SYMBOL_MAP`
+
+## FastAPI web viewer
+- `OPS_WEB_HOST`
+- `OPS_WEB_PORT`
+- `WEB_RUNTIME_SYMBOLS`
+- `WEB_RUNTIME_STARTUP_WAIT_SEC`
+- `ENABLE_WEB_TRADING`
+- `WEB_ACTION_TOKEN`
+- `WEB_ACTION_TOKEN_REQUIRED`
+- `WEB_ACTION_WAIT_WS_SEC`
+- `WEB_ACTION_POST_WAIT_SEC`
+- `WEB_ACTION_SETTLE_WAIT_SEC`
+- `WEB_ACTION_TIMEOUT_SEC`
+- `WEB_DB_TRADE_LIMIT`
+- `WEB_DB_FUNDING_LIMIT`
+- `WEB_DB_EVENT_LIMIT`
+- `WEB_DB_ORDER_LIMIT`
+- `WEB_DB_BALANCE_LIMIT`
+- `WEB_DB_POSITION_LIMIT`
+- `WEB_SOAK_RECENT_LIMIT`
+
+## Notes
+- `SYMBOLS` uses comma-separated base symbols like `BTC,ETH`
+- If `SYMBOLS` is empty, scripts fall back to `SYMBOL`
+- OKX currently defaults to IPv4-only access to stay aligned with IP whitelist setups
+- `ENABLE_ORDER_EVENTS=1` enables best-effort local order/cancel event writes from exchange execution paths
+- `SYNC_BALANCE=1` enables append-only balance/equity snapshot writes during DB sync
+- `SYNC_POSITIONS=1` enables append-only per-symbol position snapshot writes during DB sync
+- `*_WS_REST_PREFILL_ENABLED=1` enables initial REST best bid/ask prefill before websocket updates arrive
+- `AUTO_RECONCILE_ON_WS_EVENTS=1` enables automatic account/open-order reconcile on websocket stale and recovery transitions
+- `AUTO_RECONCILE_COOLDOWN_SEC` throttles automatic reconcile frequency
+- `RECONCILE_GUARD_INTERVAL_SEC` controls how often each exchange runs a lightweight local-state guard check
+- `PERIODIC_RECONCILE_SEC` enables periodic best-effort reconcile even when no websocket event has fired
+- `ACCOUNT_STALE_GUARD_SEC` marks account state as stale for guard-triggered reconcile when account polling has not refreshed in time
+- `OPEN_ORDERS_STALE_GUARD_SEC` marks open-order snapshot state as stale for guard-triggered reconcile
+- `WAITING_ORDER_SNAPSHOT_GRACE_SEC` delays guard alarms for very fresh waiting orders before comparing them against the latest open-order snapshot
+- `MARKET_ORDER_FOLLOWUP_DELAY_SEC` controls the short post-market-order delay before status/trade follow-up
+- `MARKET_ORDER_FOLLOWUP_TRADE_LIMIT` controls how many recent trades are scanned when closing out market-order lifecycle events
+- `SOAK_*` variables control `test/recovery/runtime_soak_smoke.py`
+- `SOAK_LOOP_DELAY_SEC` controls how long the long-running soak loop sleeps between smoke runs
+- `SOAK_JSONL_PATH` is the append-only JSONL path used by the long-running soak loop and the browser soak panel
+- `SOAK_STDOUT_LOG` is the plain-text runtime soak loop log
+- `SOAK_MAX_FAILURES` optionally aborts the soak loop after N consecutive failures; `0` means keep retrying forever
+- `SYMBOL_MAP` uses comma-separated `exchange:SYMBOL1|SYMBOL2` pairs like `binance:BTC,gateio:BTC,okx:ETH`
+- `INTERFACE_SYMBOL_MAP` uses comma-separated `exchange:SYMBOL` pairs like `binance:BTC,gateio:BTC,okx:ETH`
+- Browser viewer defaults to `http://0.0.0.0:8000` unless `OPS_WEB_HOST` / `OPS_WEB_PORT` are overridden
+- Browser trading endpoints stay disabled unless `ENABLE_WEB_TRADING=1`
+- `WEB_RUNTIME_SYMBOLS` lets the resident web runtime preload a fixed symbol set instead of creating a fresh exchange per request
+- `WEB_RUNTIME_STARTUP_WAIT_SEC` controls the one-time warmup delay when the resident web runtime starts
+- `WEB_ACTION_TOKEN` is sent as `X-OPS-TOKEN` for web order/cancel endpoints when configured
+- `WEB_ACTION_TOKEN_REQUIRED=1` forces the browser action token check even if a permissive server config is present
+- `WEB_ACTION_SETTLE_WAIT_SEC` is the resident web action settle wait shown in the UI; default is `0.0`
+- `WEB_ACTION_TIMEOUT_SEC` limits how long the resident web runtime waits for one browser-triggered action
+- `WEB_SOAK_RECENT_LIMIT` controls how many recent JSONL soak rows the browser reads for the soak summary panel
+
+## Root strategy.py
+- `STRATEGY_EXCHANGES`
+- `STRATEGY_ALLOWED_PAIRS`
+- `STRATEGY_SYMBOLS`
+- `STRATEGY_ENABLE_LIVE`
+- `STRATEGY_APPROVAL_MODE`
+- `STRATEGY_ORDER_NOTIONAL_USD`
+- `STRATEGY_LEVERAGE`
+- `STRATEGY_MARGIN_MODE`
+- `STRATEGY_FIRST_LEG_ROLE`
+- `STRATEGY_CLOSE_FIRST_LEG_ROLE`
+- `STRATEGY_FIRST_LEG_TIMEOUT_SEC`
+- `STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC`
+- `STRATEGY_HEDGE_REQUOTE_COUNT`
+- `STRATEGY_ACTION_SETTLE_WAIT_SEC`
+- `STRATEGY_SCAN_INTERVAL_SEC`
+- `STRATEGY_MIN_RECOMPUTE_INTERVAL_SEC`
+- `STRATEGY_AUTO_ENTER_ENABLED`
+- `STRATEGY_AUTO_ENTER_COOLDOWN_SEC`
+- `STRATEGY_RENDER_INTERVAL_SEC`
+- `STRATEGY_RECOVERY_RETRY_COOLDOWN_SEC`
+- `STRATEGY_DANGER_LOG_COOLDOWN_SEC`
+- `STRATEGY_MIN_EXPECTED_NET_EDGE_USD`
+- `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS`
+- `STRATEGY_MIN_EFFECTIVE_FUNDING_USD`
+- `STRATEGY_HOLD_BUFFER_USD`
+- `STRATEGY_MIN_HOLD_SEC`
+- `STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC`
+- `STRATEGY_MAX_HOLD_SEC`
+- `STRATEGY_TAKE_PROFIT_USD`
+- `STRATEGY_STOP_LOSS_USD`
+- `STRATEGY_POSITION_STALE_IGNORE_SEC`
+- `STRATEGY_ENTRY_FEE_BPS_BINANCE`
+- `STRATEGY_ENTRY_FEE_BPS_GATEIO`
+- `STRATEGY_ENTRY_FEE_BPS_OKX`
+- `STRATEGY_CLOSE_FEE_BPS_BINANCE`
+- `STRATEGY_CLOSE_FEE_BPS_GATEIO`
+- `STRATEGY_CLOSE_FEE_BPS_OKX`
+- `STRATEGY_CLOSE_SLIPPAGE_BPS`
+- `STRATEGY_RISK_BUFFER_BPS`
+- `STRATEGY_STALE_DATA_PENALTY_BPS`
+- `STRATEGY_FUNDING_MISSING_CONFIDENCE`
+- `STRATEGY_FUNDING_ALIGNMENT_MIN_FACTOR`
+- `STRATEGY_FUNDING_ALIGNMENT_FULL_PENALTY_SEC`
+- `STRATEGY_FUNDING_TIME_DECAY_MIN_FACTOR`
+- `STRATEGY_FUNDING_TIME_DECAY_FULL_PENALTY_SEC`
+- `STRATEGY_AUTO_CLOSE_ENABLED`
+- `STRATEGY_BOOTSTRAP_ON_ENTRY`
+- `STRATEGY_MAX_CANDIDATES_PRINT`
+- `STRATEGY_MAX_OPEN_PAIRS`
+- `STRATEGY_ASSUMED_FLAT_GRACE_SEC`
+- `STRATEGY_SUPPORTED_SYMBOLS_CACHE_SEC`
+- `STRATEGY_MAKER_FEE_BPS_BINANCE`
+- `STRATEGY_MAKER_FEE_BPS_GATEIO`
+- `STRATEGY_MAKER_FEE_BPS_OKX`
+- `STRATEGY_ROUNDTRIP_CYCLES`
+- `STRATEGY_ROUNDTRIP_SCAN_TIMEOUT_SEC`
+- `STRATEGY_ROUNDTRIP_SLEEP_BETWEEN_SEC`
+- `STRATEGY_ROUNDTRIP_LOG_PATH`
+
+## Strategy notes
+- `STRATEGY_SYMBOLS=ALL`이면 선택된 거래소들의 공통 지원 심볼 전체를 스캔합니다
+- `STRATEGY_ALLOWED_PAIRS`는 `binance-okx,binance-gateio` 같은 CSV 형식을 씁니다
+- `STRATEGY_ENABLE_LIVE=0`이 기본이며, 이때는 콘솔에서 `enter`나 `close`를 눌러도 paper 모드로만 동작합니다
+- `STRATEGY_AUTO_ENTER_ENABLED=1`이면 콘솔 입력 없이도 usable candidate를 자동 진입시킵니다. `STRATEGY_MAX_OPEN_PAIRS` 범위 안에서 심볼별로 동시에 여러 pair를 열 수 있습니다. 실전 전략 런에는 `STRATEGY_APPROVAL_MODE=auto`, `STRATEGY_ENABLE_LIVE=1`과 같이 써야 합니다
+- `STRATEGY_AUTO_ENTER_COOLDOWN_SEC`는 자동 진입 재시도 최소 간격입니다
+- `STRATEGY_RENDER_INTERVAL_SEC`는 live/paper 전략 스캔 테이블 출력 최소 간격입니다. 기본 `30초`입니다
+- `STRATEGY_RECOVERY_RETRY_COOLDOWN_SEC`는 한쪽만 포지션이 남았을 때 recovery/emergency flatten 재시도 최소 간격입니다. 기본 `15초`입니다
+- `STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC`는 같은 pair에 대해 auto close를 다시 시도하는 최소 간격입니다. 기본 `15초`입니다
+- `STRATEGY_DANGER_LOG_COOLDOWN_SEC`는 direction mismatch 같은 경고 로그 반복 출력 최소 간격입니다. 기본 `10초`입니다
+- `STRATEGY_ACTION_ACCOUNT_FRESH_SEC`는 auto close / recovery 같은 적극적 액션을 허용하기 위해 양 거래소 계정 스냅샷이 이 시간 이내로 fresh해야 하는 기준입니다. 기본 `2.5초`입니다
+- `STRATEGY_SUPPORTED_SYMBOLS_CACHE_SEC`는 거래소 지원 심볼 목록 캐시 TTL입니다. 기본 `21600초(6시간)`이며, fresh fetch 실패 시 stale cache를 fallback으로 사용합니다
+- `BINANCE_TICKER_LIST_CACHE_SEC`, `GATEIO_TICKER_LIST_CACHE_SEC`, `OKX_TICKER_LIST_CACHE_SEC`는 거래소 모듈 내부 `get_ticker_list()` 캐시 TTL입니다. 기본 `21600초(6시간)`이며, runtime를 새로 띄워도 `exchangeInfo/instruments/contracts` 반복 호출을 줄입니다
+- `BINANCE_ACCOUNT_INTERVAL_SEC`, `GATEIO_ACCOUNT_INTERVAL_SEC`, `OKX_ACCOUNT_INTERVAL_SEC`는 계정 REST polling 주기입니다. 기본 `2.0초`로 낮춰 두었고, Binance는 `/fapi/v2/account` weight가 큰 편이라 더 짧게 줄이는 건 권장하지 않습니다
+- 기본 추천 조합은 `STRATEGY_ALLOWED_PAIRS=binance-okx`
+- 기본 진입은 `first_leg_timeout_sec=2.0`, `hedge_requote_timeout_sec=0.7`, `hedge_requote_count=2`
+- `STRATEGY_FIRST_LEG_ROLE=long`이면 long leg를 먼저 지정가로 넣고, 반대 short leg를 재호가 후 최종 시장가 hedge 합니다
+- `STRATEGY_CLOSE_FIRST_LEG_ROLE=short`이면 close 시 short leg를 먼저 줄이고, long leg를 재호가 후 최종 시장가 hedge 합니다
+- `STRATEGY_ENTRY_FEE_BPS_*`와 `STRATEGY_CLOSE_FEE_BPS_*`는 진입/청산 비용 가정을 따로 잡을 때 씁니다
+- 현재 기본 가정은 Binance/OKX 지정가 `2bp`, Gate 지정가 `8bp`, `STRATEGY_CLOSE_SLIPPAGE_BPS=0` 입니다
+- `STRATEGY_MAKER_FEE_BPS_*`는 하위 호환 fallback이며, 새 값이 없을 때만 사용됩니다
+- `STRATEGY_MIN_EFFECTIVE_FUNDING_USD`는 timing/quality 보정 후 유효 funding 기대값 하한입니다. 값을 아예 주지 않으면 이 하드 블록은 비활성화되고, funding이 음수여도 총 기대값이 충분하면 진입 후보가 될 수 있습니다
+- `STRATEGY_HOLD_BUFFER_USD`는 `hold_pnl_next_funding`이 이 값보다 커야 유지하도록 하는 보수 버퍼입니다
+- `STRATEGY_MIN_HOLD_SEC`는 진입 직후 auto close를 막는 최소 보유 시간입니다. 기본 `300초`입니다
+- `STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC`는 일반적인 `close_candidate` 사유로 청산을 허용하기 전까지 기다리는 최소 보유 시간입니다. 손절/익절/최대보유시간과는 별개로 동작합니다. 기본 `1800초(30분)`입니다
+- `STRATEGY_MAX_HOLD_SEC`는 일반 청산을 강제로 재평가하는 최대 보유 시간입니다. 기본 `14400초(4시간)`입니다
+- `STRATEGY_TAKE_PROFIT_USD`는 현재 즉시 청산 손익이 이 값 이상이면 auto close를 허용하는 익절 기준입니다. 기본 `0.10 USD`입니다
+- `STRATEGY_STOP_LOSS_USD`는 현재 즉시 청산 손익이 이 값 이하이면 auto close를 허용하는 손절 기준입니다. 기본 `-0.25 USD`입니다
+- `STRATEGY_POSITION_STALE_IGNORE_SEC`는 계정 스냅샷이 이 시간 이상 오래됐고 open order도 없으면 `existing_position` 차단을 무시하는 기준입니다. 기본 `20초`입니다
+- `STRATEGY_LIVE_EVENT_LOG_PATH`는 live 전략 런이 `pair_opened`, `pair_auto_close_trigger`, `pair_closed`, `pair_closed_after_emergency` 같은 구조화 이벤트를 JSONL로 남기는 경로입니다. 기본 `logs/strategy_live.jsonl`입니다
+- `STRATEGY_STALE_DATA_PENALTY_BPS`는 funding timing/quality가 나쁠 때 기대수익에서 차감하는 패널티입니다
+- `STRATEGY_FUNDING_MISSING_CONFIDENCE`는 next funding timestamp가 비어 있을 때 적용되는 confidence 바닥값입니다
+- `STRATEGY_FUNDING_ALIGNMENT_*`는 두 거래소 next funding 시각 차이에 대한 감점 강도입니다
+- `STRATEGY_FUNDING_TIME_DECAY_*`는 다음 funding까지 남은 시간이 멀수록 기대 funding을 줄여 보는 감점 강도입니다
+- `STRATEGY_ASSUMED_FLAT_GRACE_SEC`는 close 직후 resident snapshot 반영이 늦을 때, 거래소가 이미 flat이라고 응답한 leg를 잠깐 `assumed flat`으로 취급하는 grace window입니다
+- `scripts/runtime/strategy_roundtrip_soak.py`는 `STRATEGY_ROUNDTRIP_*` env를 사용해서 소액 live round-trip 반복 검증 결과를 JSONL로 남깁니다
+- `STRATEGY_ROUNDTRIP_SCAN_TIMEOUT_SEC`의 기본값은 wrapper 기준 `30초`입니다
+- `scripts/runtime/run_strategy_live.sh`는 roundtrip soak가 아니라 실제 전략처럼 `auto-enter + hold/auto-close`로 resident runtime을 돌리는 실행 래퍼입니다
+- `scripts/runtime/run_strategy_live.sh jsonl`은 live 이벤트 JSONL을 실시간으로 보고, `summary`는 현재 실행 시작 시각 이후 이벤트와 pair ledger 요약을 함께 집계합니다
+- `scripts/runtime/run_strategy_live.sh ledger`는 현재 실행 구간의 `pair_id`별 정산 요약을 별도로 보여주고, DB `pair_ledger` 테이블도 같이 upsert합니다
