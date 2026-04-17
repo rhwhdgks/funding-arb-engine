@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
-
+from src.core.action_gate import ActionGate
 from dotenv import load_dotenv
 from src.ops.persistence.live_snapshot import persist_exchange_snapshots
 from src.core.exchange_registry import SUPPORTED_EXCHANGES, build_exchange
@@ -164,59 +164,6 @@ def load_snapshot_config() -> dict[str, Any]:
         "persist_balance": _env_flag("SNAPSHOT_PERSIST_BALANCE", "1"),
         "persist_positions": _env_flag("SNAPSHOT_PERSIST_POSITIONS", "1"),
     }
-
-
-async def run_snapshot_loop(
-    exchanges: dict[str, Any],
-    symbols: list[str],
-    *,
-    config: dict[str, Any],
-) -> None:
-    if not config.get("enabled", False):
-        print("[snapshot-loop] disabled")
-        return
-
-    interval_sec = float(config["interval_sec"])
-    funding_limit = int(config["funding_limit"])
-    persist_funding = bool(config["persist_funding"])
-    persist_balance = bool(config["persist_balance"])
-    persist_positions = bool(config["persist_positions"])
-
-    print(
-        "[snapshot-loop] start",
-        {
-            "interval_sec": interval_sec,
-            "funding_limit": funding_limit,
-            "persist_funding": persist_funding,
-            "persist_balance": persist_balance,
-            "persist_positions": persist_positions,
-            "symbols": symbols,
-            "exchanges": sorted(exchanges.keys()),
-        },
-    )
-
-    while True:
-        started_ms = int(time.time() * 1000)
-        for exchange_name, exchange in exchanges.items():
-            try:
-                summary = await persist_exchange_snapshots(
-                    exchange_name=exchange_name,
-                    exchange=exchange,
-                    symbols=symbols,
-                    funding_limit=funding_limit,
-                    persist_funding=persist_funding,
-                    persist_balance=persist_balance,
-                    persist_positions=persist_positions,
-                )
-                print(f"[snapshot-loop][{exchange_name}] {summary}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                print(f"[snapshot-loop][{exchange_name}][error] {exc}")
-
-        elapsed_sec = max((int(time.time() * 1000) - started_ms) / 1000.0, 0.0)
-        sleep_sec = max(interval_sec - elapsed_sec, 1.0)
-        await asyncio.sleep(sleep_sec)
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
@@ -596,7 +543,76 @@ def ceil_by_step(value: float, step: float) -> float:
     step_dec = Decimal(str(step))
     units = (value_dec / step_dec).to_integral_value(rounding=ROUND_UP)
     return float(units * step_dec)
+def _env_flag(key: str, default: str = "0") -> bool:
+    return os.getenv(key, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
+def load_snapshot_config() -> dict[str, Any]:
+    interval_sec = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "120").strip())
+    funding_limit = int(os.getenv("SNAPSHOT_FUNDING_LIMIT", "30").strip())
+
+    return {
+        "enabled": _env_flag("ENABLE_DB_SNAPSHOTS", "1"),
+        "interval_sec": max(interval_sec, 10.0),
+        "funding_limit": max(funding_limit, 1),
+        "persist_funding": _env_flag("SNAPSHOT_PERSIST_FUNDING", "1"),
+        "persist_balance": _env_flag("SNAPSHOT_PERSIST_BALANCE", "1"),
+        "persist_positions": _env_flag("SNAPSHOT_PERSIST_POSITIONS", "1"),
+    }
+
+
+async def run_snapshot_loop(
+    exchanges: dict[str, Any],
+    symbols: list[str],
+    *,
+    config: dict[str, Any],
+) -> None:
+    if not config.get("enabled", False):
+        print("[snapshot-loop] disabled")
+        return
+
+    interval_sec = float(config["interval_sec"])
+    funding_limit = int(config["funding_limit"])
+    persist_funding = bool(config["persist_funding"])
+    persist_balance = bool(config["persist_balance"])
+    persist_positions = bool(config["persist_positions"])
+
+    print(
+        "[snapshot-loop] start",
+        {
+            "interval_sec": interval_sec,
+            "funding_limit": funding_limit,
+            "persist_funding": persist_funding,
+            "persist_balance": persist_balance,
+            "persist_positions": persist_positions,
+            "symbols": symbols,
+            "exchanges": sorted(exchanges.keys()),
+        },
+    )
+
+    while True:
+        started_ms = int(time.time() * 1000)
+
+        for exchange_name, exchange in exchanges.items():
+            try:
+                summary = await persist_exchange_snapshots(
+                    exchange_name=exchange_name,
+                    exchange=exchange,
+                    symbols=symbols,
+                    funding_limit=funding_limit,
+                    persist_funding=persist_funding,
+                    persist_balance=persist_balance,
+                    persist_positions=persist_positions,
+                )
+                print(f"[snapshot-loop][{exchange_name}] {summary}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"[snapshot-loop][{exchange_name}][error] {exc}")
+
+        elapsed_sec = max((int(time.time() * 1000) - started_ms) / 1000.0, 0.0)
+        sleep_sec = max(interval_sec - elapsed_sec, 1.0)
+        await asyncio.sleep(sleep_sec)
 
 def extract_best_bid(snapshot: dict[str, Any]) -> float:
     orderbook = snapshot.get("orderbook", {}) or {}
@@ -2749,50 +2765,66 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
 
 async def strategy_loop() -> None:
     config = load_strategy_config()
+    snapshot_config = load_snapshot_config()
+
     symbols = await resolve_strategy_symbols(config)
     exchanges = build_strategy_exchanges(config, symbols)
-    await start_strategy_exchanges(exchanges)
-    snapshot_config = load_snapshot_config()
-    snapshot_task: asyncio.Task | None = None
 
-    # exchanges가 이미 build/run 된 뒤
-    if snapshot_config.get("enabled", False):
-        snapshot_task = asyncio.create_task(
-            run_snapshot_loop(
-                exchanges,
-                symbols,
-                config=snapshot_config,
-            )
-        )
-    print_strategy_config(config, symbols)
-    record_live_event(
-        config,
-        "runtime_started",
-        mode="LIVE" if config.enable_live else "PAPER",
-        exchanges=config.exchange_names,
-        allowed_pairs=config.allowed_pairs,
-        symbols=symbols,
-        order_notional_usd=config.order_notional_usd,
-    )
+    snapshot_task: asyncio.Task[Any] | None = None
+    console_task: asyncio.Task[Any] | None = None
+    listener_tasks: list[asyncio.Task[Any]] = []
 
     command_queue: asyncio.Queue[str] = asyncio.Queue()
     wake_queue: asyncio.Queue[tuple[str, str, int]] = asyncio.Queue()
-    console_task = asyncio.create_task(console_command_reader(command_queue), name="strategy-console")
-    listener_tasks = await attach_strategy_listeners(exchanges, symbols, wake_queue)
+
     open_pairs: dict[str, OpenPairState] = {}
     assumed_flat_until_ms: dict[tuple[str, str], int] = {}
+
     last_signature: tuple[Any, ...] | None = None
     last_render_ts = 0.0
     last_recompute_ts = 0.0
     last_auto_enter_ts = 0.0
-    last_auto_enter_candidate_id: str | None = None
 
     try:
+        await start_strategy_exchanges(exchanges)
+
+        if snapshot_config.get("enabled", False):
+            snapshot_task = asyncio.create_task(
+                run_snapshot_loop(
+                    exchanges,
+                    symbols,
+                    config=snapshot_config,
+                ),
+                name="strategy-snapshot-loop",
+            )
+
+        print_strategy_config(config, symbols)
+        record_live_event(
+            config,
+            "runtime_started",
+            mode="LIVE" if config.enable_live else "PAPER",
+            exchanges=config.exchange_names,
+            allowed_pairs=config.allowed_pairs,
+            symbols=symbols,
+            order_notional_usd=config.order_notional_usd,
+        )
+
+        console_task = asyncio.create_task(
+            console_command_reader(command_queue),
+            name="strategy-console",
+        )
+        listener_tasks = await attach_strategy_listeners(exchanges, symbols, wake_queue)
+
         while True:
             now = time.monotonic()
             wait_timeout = max(config.scan_interval_sec, 0.05)
+
             if (now - last_recompute_ts) < config.min_recompute_interval_sec:
-                wait_timeout = min(wait_timeout, config.min_recompute_interval_sec - (now - last_recompute_ts))
+                wait_timeout = min(
+                    wait_timeout,
+                    config.min_recompute_interval_sec - (now - last_recompute_ts),
+                )
+
             try:
                 await asyncio.wait_for(wake_queue.get(), timeout=wait_timeout)
                 while True:
@@ -2804,6 +2836,7 @@ async def strategy_loop() -> None:
                 pass
 
             prune_assumed_flat(assumed_flat_until_ms)
+
             candidates = collect_candidates(
                 symbols,
                 exchanges,
@@ -2811,11 +2844,17 @@ async def strategy_loop() -> None:
                 open_pairs=open_pairs,
                 assumed_flat_until_ms=assumed_flat_until_ms,
             )
+
             last_recompute_ts = time.monotonic()
-            signature = build_candidate_signature(candidates, top_n=min(5, config.max_candidates_print))
+            signature = build_candidate_signature(
+                candidates,
+                top_n=min(5, config.max_candidates_print),
+            )
+
             now = time.monotonic()
             if signature != last_signature:
                 last_signature = signature
+
             if (now - last_render_ts) >= config.render_interval_sec:
                 print(
                     render_candidate_table(
@@ -2828,14 +2867,18 @@ async def strategy_loop() -> None:
 
             if config.enable_live and config.auto_enter_enabled:
                 active_open_pairs = [
-                    pair for pair in open_pairs.values() if pair.status not in {"closed", "failed"}
+                    pair
+                    for pair in open_pairs.values()
+                    if pair.status not in {"closed", "failed"}
                 ]
                 available_slots = max(config.max_open_pairs - len(active_open_pairs), 0)
+
                 now = time.monotonic()
                 if available_slots > 0 and (now - last_auto_enter_ts) >= config.auto_enter_cooldown_sec:
                     active_symbols = {pair.symbol for pair in active_open_pairs}
                     selected_candidates: list[PairCandidate] = []
                     selected_symbols: set[str] = set()
+
                     for candidate in candidates:
                         if not candidate.can_enter:
                             continue
@@ -2845,15 +2888,18 @@ async def strategy_loop() -> None:
                         selected_symbols.add(candidate.symbol)
                         if len(selected_candidates) >= available_slots:
                             break
+
                     if selected_candidates:
                         last_auto_enter_ts = now
-                        last_auto_enter_candidate_id = ",".join(candidate.id for candidate in selected_candidates)
+
                     for candidate in selected_candidates:
                         print(
                             f"[strategy][auto-enter] candidate_id={candidate.id} "
-                            f"symbol={candidate.symbol} net_usd={candidate.expected_net_edge_usd:.4f} "
+                            f"symbol={candidate.symbol} "
+                            f"net_usd={candidate.expected_net_edge_usd:.4f} "
                             f"net_bps={candidate.expected_net_edge_bps:.2f}"
                         )
+
                         pair = await enter_pair_limit_then_hedge(
                             candidate,
                             exchanges,
@@ -2862,14 +2908,13 @@ async def strategy_loop() -> None:
                         )
                         if pair is not None:
                             open_pairs[pair.pair_id] = pair
-                    if selected_candidates:
-                        last_auto_enter_candidate_id = None
 
             while True:
                 try:
                     command = command_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
                 should_continue = await handle_command(
                     command,
                     candidates,
@@ -2881,14 +2926,20 @@ async def strategy_loop() -> None:
                 if not should_continue:
                     return
 
-            await manage_open_pairs(open_pairs, exchanges, config, assumed_flat_until_ms)
+            await manage_open_pairs(
+                open_pairs,
+                exchanges,
+                config,
+                assumed_flat_until_ms,
+            )
+
     finally:
         record_live_event(
             config,
             "runtime_stopped",
             open_pair_ids=sorted(open_pairs.keys()),
         )
-        console_task.cancel()
+
         if snapshot_task is not None:
             snapshot_task.cancel()
             try:
@@ -2897,10 +2948,28 @@ async def strategy_loop() -> None:
                 pass
             except Exception as exc:
                 print(f"[snapshot-loop][stop][error] {exc}")
+
+        if console_task is not None:
+            console_task.cancel()
+            try:
+                await console_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"[strategy][console-stop][error] {exc}")
+
         for task in listener_tasks:
             task.cancel()
-        await stop_strategy_exchanges(exchanges)
 
+        for task in listener_tasks:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"[strategy][listener-stop][error] {exc}")
+
+        await stop_strategy_exchanges(exchanges)
 
 async def main() -> None:
     await strategy_loop()

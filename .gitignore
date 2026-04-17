@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.pyd
 
+.env
+test_server/.env
+
 logs/
 
 .vscode/
