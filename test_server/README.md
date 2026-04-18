@@ -4,7 +4,7 @@
 
 분리되는 건 딱 두 가지입니다.
 - `test_server/.env`
-- `test_server/strategy.py`
+- `test_server/main.py`
 
 나머지 실행 로직, DB 초기화, 리포트, persistence는 모두 루트 코드를 공유합니다.
 
@@ -13,7 +13,7 @@
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh start
 ```
 
@@ -22,28 +22,28 @@ scripts/runtime/run_strategy_live.sh start
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh status
 ```
 
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh logs
 ```
 
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh jsonl
 ```
 
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh report
 ```
 
@@ -52,7 +52,7 @@ scripts/runtime/run_strategy_live.sh report
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/strategy.py \
+STRATEGY_SCRIPT_PATH=test_server/main.py \
 scripts/runtime/run_strategy_live.sh stop
 ```
 

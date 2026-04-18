@@ -20,7 +20,7 @@ def main() -> None:
         sys.path.insert(0, str(REPO_ROOT))
 
     os.chdir(REPO_ROOT)
-    runpy.run_path(str(REPO_ROOT / "strategy.py"), run_name="__main__")
+    runpy.run_path(str(REPO_ROOT / "main.py"), run_name="__main__")
 
 
 if __name__ == "__main__":
