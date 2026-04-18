@@ -4,6 +4,28 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+STRATEGY_ENV_FILE="${STRATEGY_ENV_FILE:-$PROJECT_ROOT/.env}"
+if [[ -f "$STRATEGY_ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$STRATEGY_ENV_FILE"
+  set +a
+fi
+
+STRATEGY_SCRIPT_PATH="${STRATEGY_SCRIPT_PATH:-$PROJECT_ROOT/strategy.py}"
+STRATEGY_WORKDIR="${STRATEGY_WORKDIR:-$PROJECT_ROOT}"
+STRATEGY_SCRIPT_PATH_ABS="$(python3 - <<PY
+from pathlib import Path
+print(Path(r"""$STRATEGY_SCRIPT_PATH""").expanduser().resolve())
+PY
+)"
+STRATEGY_WORKDIR_ABS="$(python3 - <<PY
+from pathlib import Path
+print(Path(r"""$STRATEGY_WORKDIR""").expanduser().resolve())
+PY
+)"
+PYTHON_BIN="${STRATEGY_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+
 LOG_DIR="${STRATEGY_LIVE_LOG_DIR:-$PROJECT_ROOT/logs}"
 PID_FILE="${STRATEGY_LIVE_PID_FILE:-$LOG_DIR/strategy_live.pid}"
 LOCK_FILE="${STRATEGY_LIVE_LOCK_FILE:-$LOG_DIR/strategy_live.lock}"
@@ -39,7 +61,7 @@ ACTION="${1:-start}"
 
 usage() {
   cat <<'EOF'
-usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|ledger|report]
+usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report]
 
 commands:
   start   start background live strategy runtime
@@ -47,16 +69,15 @@ commands:
   status  show whether the live strategy runtime is running
   logs    tail -f stdout log
   jsonl   tail -f structured live event jsonl
-  summary print current-run live event summary plus pair ledger summary
-  ledger  print current-run pair ledger summary
+  summary print current-run live event summary
   report  show current exchange report snapshot
 EOF
 }
 
 ensure_runtime() {
   mkdir -p "$LOG_DIR"
-  if [[ ! -x ".venv/bin/python" ]]; then
-    echo "[run_strategy_live] missing .venv/bin/python" >&2
+  if [[ ! -x "$PYTHON_BIN" ]]; then
+    echo "[run_strategy_live] missing python: $PYTHON_BIN" >&2
     exit 1
   fi
 }
@@ -71,7 +92,7 @@ running_pid() {
     fi
   fi
   local detected_pid
-  detected_pid="$(pgrep -fo '.venv/bin/python -u strategy.py' || true)"
+  detected_pid="$(pgrep -fo "$STRATEGY_SCRIPT_PATH_ABS" || true)"
   if [[ -n "$detected_pid" ]] && kill -0 "$detected_pid" 2>/dev/null; then
     echo "$detected_pid" > "$PID_FILE"
     echo "$detected_pid"
@@ -90,11 +111,11 @@ running_pids() {
 
   while IFS= read -r pid; do
     [[ -n "$pid" ]] && candidates+=("$pid")
-  done < <(pgrep -f 'timeout .*\.venv/bin/python -u strategy.py' || true)
+  done < <(pgrep -f "$STRATEGY_SCRIPT_PATH_ABS" || true)
 
   while IFS= read -r pid; do
     [[ -n "$pid" ]] && candidates+=("$pid")
-  done < <(pgrep -f '\.venv/bin/python -u strategy.py' || true)
+  done < <(pgrep -f "$STRATEGY_SCRIPT_PATH_ABS" || true)
 
   if [[ ${#candidates[@]} -eq 0 ]]; then
     return 1
@@ -125,6 +146,8 @@ PY
   "started_at_ms": ${started_at_ms},
   "started_at_iso": "${started_at_iso}",
   "duration": "${RUN_DURATION}",
+  "env_file": "${STRATEGY_ENV_FILE}",
+  "script_path": "${STRATEGY_SCRIPT_PATH_ABS}",
   "stdout_log": "${STDOUT_LOG}",
   "jsonl_log": "${JSONL_LOG}",
   "symbols": "${STRATEGY_SYMBOLS}",
@@ -135,8 +158,9 @@ EOF
   (
     trap 'rm -f "$PID_FILE"' EXIT
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] strategy live runtime start duration=${RUN_DURATION}" >> "$STDOUT_LOG"
+    echo "[$ts] strategy live runtime start duration=${RUN_DURATION} script=${STRATEGY_SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
 
+    cd "$STRATEGY_WORKDIR_ABS"
     flock -n "$LOCK_FILE" env \
       STRATEGY_ENABLE_LIVE="$STRATEGY_ENABLE_LIVE" \
       STRATEGY_APPROVAL_MODE="$STRATEGY_APPROVAL_MODE" \
@@ -161,8 +185,9 @@ EOF
       STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC="$STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC" \
       STRATEGY_ACTION_ACCOUNT_FRESH_SEC="$STRATEGY_ACTION_ACCOUNT_FRESH_SEC" \
       STRATEGY_LIVE_EVENT_LOG_PATH="$JSONL_LOG" \
+      STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
       timeout "$RUN_DURATION" \
-      .venv/bin/python -u strategy.py >> "$STDOUT_LOG" 2>&1
+      "$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS" >> "$STDOUT_LOG" 2>&1
 
     status=$?
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -221,7 +246,7 @@ show_status() {
 
 show_report() {
   ensure_runtime
-  TARGET_EXCHANGES="$STRATEGY_EXCHANGES" SYMBOLS="$STRATEGY_SYMBOLS" .venv/bin/python -u scripts/ops/report.py --wait-ws-sec 1 --trade-limit 3
+  TARGET_EXCHANGES="$STRATEGY_EXCHANGES" SYMBOLS="$STRATEGY_SYMBOLS" STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/report.py --wait-ws-sec 1 --trade-limit 3
 }
 
 show_summary() {
@@ -253,21 +278,6 @@ print("recent =")
 for row in run_rows[-10:]:
     print(json.dumps(row, ensure_ascii=False))
 PY
-  echo "pair_ledger ="
-  .venv/bin/python scripts/runtime/strategy_pair_ledger.py --run-meta "$RUN_META_FILE" --jsonl-path "$JSONL_LOG" --limit 10
-}
-
-show_ledger() {
-  ensure_runtime
-  if [[ ! -f "$RUN_META_FILE" ]]; then
-    echo "[run_strategy_live] missing run meta: $RUN_META_FILE"
-    exit 1
-  fi
-  if [[ ! -f "$JSONL_LOG" ]]; then
-    echo "[run_strategy_live] missing jsonl log: $JSONL_LOG"
-    exit 1
-  fi
-  .venv/bin/python scripts/runtime/strategy_pair_ledger.py --run-meta "$RUN_META_FILE" --jsonl-path "$JSONL_LOG" --limit 20
 }
 
 case "$ACTION" in
@@ -292,9 +302,6 @@ case "$ACTION" in
     ;;
   summary)
     show_summary
-    ;;
-  ledger)
-    show_ledger
     ;;
   report)
     show_report

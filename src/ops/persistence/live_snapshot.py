@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from src.ops.persistence.balance_report import build_balance_report
-from src.ops.persistence.db import (
-    current_utc_ms,
-    get_db_connection,
-    insert_balance_snapshot,
-    insert_position_snapshots,
-    upsert_funding_history,
+from src.ops.persistence.db import current_utc_ms, get_db_connection
+from src.ops.persistence.trading_dev_normalizers import (
+    build_balance_snapshot_row,
+    build_funding_rate_rows,
+)
+from src.ops.persistence.trading_dev_store import (
+    upsert_balance_snapshot_rows,
+    upsert_funding_rate_rows,
 )
 
 
@@ -50,16 +53,7 @@ async def persist_exchange_snapshots(
         }
 
         if persist_funding:
-            funding_result: dict[str, int] = {}
-            for symbol in normalized_symbols:
-                try:
-                    history = await exchange.preload_funding_history(symbol, limit=funding_limit)
-                    inserted = upsert_funding_history(conn, normalized_exchange, symbol, history or [])
-                    funding_result[symbol] = inserted
-                except Exception as exc:
-                    funding_result[symbol] = -1
-                    funding_result[f"{symbol}__error"] = str(exc)
-            summary["funding"] = funding_result
+            summary["funding"] = {}
 
         if persist_balance or persist_positions:
             snapshot_time_ms = current_utc_ms()
@@ -74,14 +68,27 @@ async def persist_exchange_snapshots(
                 symbol_snapshots,
             )
 
+            if persist_funding:
+                funding_rows = build_funding_rate_rows(
+                    normalized_exchange,
+                    symbol_snapshots,
+                    snapshot_time_ms=snapshot_time_ms,
+                )
+                inserted = await asyncio.to_thread(upsert_funding_rate_rows, conn, funding_rows)
+                summary["funding"] = {
+                    "inserted": inserted,
+                    "snapshot_time_ms": snapshot_time_ms,
+                    "symbol_count": len(funding_rows),
+                }
+
             if persist_balance:
-                inserted = insert_balance_snapshot(
-                    conn,
+                balance_row = build_balance_snapshot_row(
                     normalized_exchange,
                     normalized_symbols,
                     balance_report,
                     snapshot_time_ms=snapshot_time_ms,
                 )
+                inserted = await asyncio.to_thread(upsert_balance_snapshot_rows, conn, [balance_row])
                 summary["balance"] = {
                     "inserted": inserted,
                     "snapshot_time_ms": snapshot_time_ms,
@@ -92,21 +99,15 @@ async def persist_exchange_snapshots(
                 }
 
             if persist_positions:
-                inserted = insert_position_snapshots(
-                    conn,
-                    normalized_exchange,
-                    normalized_symbols,
-                    balance_report,
-                    snapshot_time_ms=snapshot_time_ms,
-                )
                 summary["positions"] = {
-                    "inserted": inserted,
+                    "inserted": len(balance_report.get("positions") or []),
                     "snapshot_time_ms": snapshot_time_ms,
                     "position_count": len(balance_report.get("positions") or []),
                     "symbols_with_positions": [
                         row.get("ticker") or row.get("symbol")
                         for row in (balance_report.get("positions") or [])
                     ],
+                    "embedded_in_balance_snapshot": bool(persist_balance),
                 }
 
         return summary

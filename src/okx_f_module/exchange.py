@@ -41,6 +41,10 @@ from .api import (
 from .websocket_manager import WebSocketManager
 
 
+def simple_stdout_enabled() -> bool:
+    return os.getenv("STRATEGY_STDOUT_LOG_STYLE", "verbose").strip().lower() == "simple"
+
+
 class Exchange:
     name = "okxFuture"
     persist_name = "okx"
@@ -361,7 +365,8 @@ class Exchange:
         if self._running:
             return
 
-        print(f"[{self.name}] run start")
+        if not simple_stdout_enabled():
+            print(f"[{self.name}] run start")
 
         await self.before_run()
         await self.bootstrap()
@@ -378,7 +383,8 @@ class Exchange:
             asyncio.create_task(self.run_reconcile_guard(), name=f"{self.name}-run_reconcile_guard"),
         ]
 
-        print(f"[{self.name}] tasks created")
+        if not simple_stdout_enabled():
+            print(f"[{self.name}] tasks created")
 
     async def stop(self):
         self._running = False
@@ -643,7 +649,9 @@ class Exchange:
                     await asyncio.sleep(self.open_orders_interval)
                     continue
 
-                self._apply_open_orders_reconcile(order_list)
+                disappeared_orders = self._apply_open_orders_reconcile(order_list)
+                if disappeared_orders:
+                    await self._finalize_disappeared_orders(disappeared_orders)
                 self.open_orders_snapshot_last_sync_ms = int(time.time() * 1000)
                 self._refresh_runtime_summary(refresh_source="run_check_open_orders", error="", touch_attempt=False)
 
@@ -731,7 +739,11 @@ class Exchange:
                     if (not prev_market_ready) and market_ready and prev_has_ws_issue:
                         should_auto_reconcile_recovered = True
 
-                    if (prev_market_ready != market_ready or prev_reasons != set(reasons)) and (reasons or prev_reasons):
+                    if (
+                        not simple_stdout_enabled()
+                        and (prev_market_ready != market_ready or prev_reasons != set(reasons))
+                        and (reasons or prev_reasons)
+                    ):
                         print(
                             f"[{self.name}][health][{ticker}] "
                             f"market_ready={market_ready} reasons={reasons or ['-']} "
@@ -795,30 +807,42 @@ class Exchange:
         can_submit, _ = self.can_submit_order(ticker, require_funding=False)
         return can_submit
 
-    async def order(self, ticker: str, side: str, amount: float, price: float):
+    async def order(self, ticker: str, side: str, amount: float, price: float, *, is_hedge: bool = False):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, price=price, order_type="limit")
         request_payload.setdefault("client_order_id", f"okxl{ticker}{int(time.time() * 1000)}")
         request_payload.setdefault("uuid", request_payload["client_order_id"])
+        if is_hedge:
+            request_payload["is_hedge"] = True
+            snapshot = self.get_symbol_snapshot(ticker)
+            if not snapshot.get("account_ready", False):
+                result = {
+                    "error": "cannot_submit_order",
+                    "ticker": ticker,
+                    "gate_reasons": [f"account:{snapshot.get('health', {}).get('account_sync_reason') or 'not_ready'}"],
+                }
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        can_submit, gate_reasons = self.can_submit_order(ticker, require_funding=False)
-        if not can_submit:
-            result = {
-                "error": "cannot_submit_order",
-                "ticker": ticker,
-                "gate_reasons": gate_reasons,
-            }
-            schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
-            return result
+        if not is_hedge:
+            can_submit, gate_reasons = self.can_submit_order(ticker, require_funding=False)
+            if not can_submit:
+                result = {
+                    "error": "cannot_submit_order",
+                    "ticker": ticker,
+                    "gate_reasons": gate_reasons,
+                }
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        key = f"{ticker}_{side}"
-        if time.time() - self.last_order_time.get(key, 0) < self.order_cooldown_sec:
-            result = {"error": "order_cooldown", "ticker": ticker}
-            schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
-            return result
+            key = f"{ticker}_{side}"
+            if time.time() - self.last_order_time.get(key, 0) < self.order_cooldown_sec:
+                result = {"error": "order_cooldown", "ticker": ticker}
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        self.last_order_time[key] = time.time()
+            self.last_order_time[key] = time.time()
         schedule_order_submit(self.persist_name, request_payload)
 
         order_data = await post_limit_order(
@@ -838,14 +862,25 @@ class Exchange:
         self._update_rate_limit_state(order_data)
         return order_data
 
-    async def market_order(self, ticker: str, side: str, amount: float, is_close: bool = False):
+    async def market_order(self, ticker: str, side: str, amount: float, is_close: bool = False, *, is_hedge: bool = False):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, order_type="market", is_close=is_close)
         request_payload.setdefault("client_order_id", f"okxm{ticker}{int(time.time() * 1000)}")
         request_payload.setdefault("uuid", request_payload["client_order_id"])
+        if is_hedge:
+            request_payload["is_hedge"] = True
+            snapshot = self.get_symbol_snapshot(ticker)
+            if not snapshot.get("account_ready", False):
+                result = {
+                    "error": "cannot_submit_order",
+                    "ticker": ticker,
+                    "gate_reasons": [f"account:{snapshot.get('health', {}).get('account_sync_reason') or 'not_ready'}"],
+                }
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        if not is_close:
+        if not is_close and not is_hedge:
             can_submit, gate_reasons = self.can_submit_order(ticker, require_funding=False)
             if not can_submit:
                 result = {
@@ -1155,7 +1190,14 @@ class Exchange:
         self._remove_waiting_order(uuid)
         self._forget_order_status(uuid)
 
-    def _apply_open_orders_reconcile(self, order_list: Optional[list[dict]]):
+    def _apply_open_orders_reconcile(self, order_list: Optional[list[dict]]) -> list[dict]:
+        previous_waiting_by_key: dict[str, dict] = {}
+        for row in self.waiting_list:
+            order_key = self._order_key(row)
+            if not order_key or order_key in previous_waiting_by_key:
+                continue
+            previous_waiting_by_key[order_key] = deepcopy(row)
+
         self._update_open_orders_snapshot(order_list)
         reconciled_waiting_list: list[dict] = []
         seen_keys: set[str] = set()
@@ -1165,10 +1207,135 @@ class Exchange:
                 continue
             seen_keys.add(order_key)
             reconciled_waiting_list.append(row)
+        disappeared_orders = [
+            row
+            for order_key, row in previous_waiting_by_key.items()
+            if order_key not in seen_keys
+        ]
         self.waiting_list = reconciled_waiting_list
         self.order_status_cache = {}
         for row in reconciled_waiting_list:
             self._remember_order_status(row)
+        return disappeared_orders
+
+    async def _finalize_disappeared_orders(self, orders: list[dict]):
+        for order in orders:
+            try:
+                await self._finalize_disappeared_order(order)
+            except Exception as exc:
+                ticker = str(order.get("ticker") or order.get("symbol") or "").upper()
+                order_key = self._order_key(order)
+                print(
+                    f"[{self.name}][open_orders_reconcile][error] "
+                    f"ticker={ticker or '-'} order_key={order_key or '-'} error={exc}"
+                )
+
+    async def _finalize_disappeared_order(self, order: dict):
+        if not isinstance(order, dict) or not order:
+            return None
+
+        ticker = str(order.get("ticker") or order.get("symbol") or "").upper()
+        if not ticker:
+            return None
+
+        order_key = self._order_key(order)
+        previous_status = self._get_cached_order_status(order)
+        current_status: dict | None = None
+
+        try:
+            polled = await self.get_order_status(order)
+            if polled:
+                current_status = self._merge_polled_status(order, polled)
+                latest_status = str(current_status.get("status", "")).upper()
+                latest_state = str(current_status.get("state", "")).lower()
+
+                is_open_like = latest_status in {"NEW", "OPEN", "LIVE", "PARTIALLY_FILLED"}
+                if latest_state == "exist" or (is_open_like and latest_state != "not_exist"):
+                    self._replace_waiting_order(current_status)
+                    self._remember_order_status(current_status)
+                    print(
+                        f"[{self.name}][open_orders_reconcile][restore_live] "
+                        f"ticker={ticker} order_key={order_key or '-'} "
+                        f"status={latest_status or '-'} state={latest_state or '-'}"
+                    )
+                    return None
+
+                polled_event = schedule_polled_order_status(
+                    self.persist_name,
+                    ticker,
+                    previous_status,
+                    current_status,
+                    event_source="open_orders_reconcile",
+                )
+                if polled_event in {"partial_fill", "fill"}:
+                    self._schedule_trade_history_sync(ticker, current_status)
+                if polled_event in {"fill", "order_canceled", "order_rejected", "order_expired", "order_missing"}:
+                    self._forget_order_status(order)
+                    print(
+                        f"[{self.name}][open_orders_reconcile][finalized] "
+                        f"ticker={ticker} order_key={order_key or '-'} event={polled_event}"
+                    )
+                    return polled_event
+        except Exception as exc:
+            print(
+                f"[{self.name}][open_orders_reconcile][status_error] "
+                f"ticker={ticker} order_key={order_key or '-'} error={exc}"
+            )
+
+        try:
+            trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
+            progress_event, progress_payload = schedule_order_progress_from_trades(
+                self.persist_name,
+                ticker,
+                order,
+                trades or [],
+                event_source="open_orders_reconcile",
+            )
+            if progress_event == "fill":
+                self._forget_order_status(order)
+                print(
+                    f"[{self.name}][open_orders_reconcile][finalized] "
+                    f"ticker={ticker} order_key={order_key or '-'} event=fill"
+                )
+                return progress_event
+            if progress_event == "partial_fill" and isinstance(progress_payload, dict):
+                terminal_payload = deepcopy(progress_payload)
+                terminal_payload["status"] = "CANCELED"
+                terminal_payload["state"] = "not_exist"
+                terminal_payload["event_reason"] = "open_orders_reconcile_partial_close"
+                terminal_event = schedule_order_state_event(
+                    self.persist_name,
+                    ticker,
+                    terminal_payload,
+                    event_source="open_orders_reconcile",
+                )
+                self._forget_order_status(order)
+                print(
+                    f"[{self.name}][open_orders_reconcile][finalized] "
+                    f"ticker={ticker} order_key={order_key or '-'} event={terminal_event or 'order_canceled'}"
+                )
+                return terminal_event or "order_canceled"
+        except Exception as exc:
+            print(
+                f"[{self.name}][open_orders_reconcile][trade_error] "
+                f"ticker={ticker} order_key={order_key or '-'} error={exc}"
+            )
+
+        missing_payload = deepcopy(current_status or previous_status or order)
+        missing_payload["state"] = "not_exist"
+        missing_payload.setdefault("timestamp", int(time.time() * 1000))
+        missing_event = schedule_order_state_event(
+            self.persist_name,
+            ticker,
+            missing_payload,
+            event_source="open_orders_reconcile",
+        )
+        self._forget_order_status(order)
+        print(
+            f"[{self.name}][open_orders_reconcile][finalized] "
+            f"ticker={ticker} order_key={order_key or '-'} event={missing_event or 'order_missing'}"
+        )
+        return missing_event or "order_missing"
 
     def _update_rate_limit_state(self, response: Optional[dict]):
         if not response:

@@ -1,47 +1,65 @@
 # Test Server Runtime
 
-이 폴더는 기존 라이브 코드를 건드리지 않고, 테스트 서버/데모 계정으로 별도 런타임을 돌리기 위한 전용 폴더입니다.
+`test_server`는 이제 로직 복사본을 들고 있지 않습니다.
 
-핵심 원칙:
-- 기존 루트 코드 수정 없이 별도 실행
-- 별도 `.env`
-- 별도 `logs/`
-- 별도 DB 권장
+분리되는 건 딱 두 가지입니다.
+- `test_server/.env`
+- `test_server/strategy.py`
 
-## 준비
-
-1. `test_server/.env.example`를 `test_server/.env`로 복사
-2. 테스트/데모 키 입력
-3. 가능하면 `MARIADB_DATABASE`도 별도 DB 사용
-
-## DB 스키마 초기화
-
-```bash
-cd test_server
-scripts/db/init_db_schema.sh
-```
+나머지 실행 로직, DB 초기화, 리포트, persistence는 모두 루트 코드를 공유합니다.
 
 ## 실행
 
 ```bash
-cd test_server
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh start
 ```
 
-## 확인
+## 상태 확인
 
 ```bash
-cd test_server
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh status
+```
+
+```bash
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh logs
+```
+
+```bash
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh jsonl
+```
+
+```bash
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh report
-scripts/runtime/run_strategy_live.sh ledger
 ```
 
 ## 중지
 
 ```bash
-cd test_server
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+STRATEGY_SCRIPT_PATH=test_server/strategy.py \
 scripts/runtime/run_strategy_live.sh stop
+```
+
+## DB 스키마 초기화
+
+```bash
+cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env \
+.venv/bin/python -u scripts/db/init_db_schema.py
 ```

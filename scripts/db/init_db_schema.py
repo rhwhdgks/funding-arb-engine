@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 import sys
+import os
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
+
+env_file = os.getenv("STRATEGY_ENV_FILE")
+if env_file:
+    load_dotenv(env_file, override=True)
+else:
+    load_dotenv(PROJECT_ROOT / ".env")
 
 from src.ops.persistence.db import DEFAULT_SCHEMA_PATH, ensure_schema, get_db_connection
 

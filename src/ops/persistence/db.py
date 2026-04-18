@@ -12,7 +12,18 @@ from dotenv import load_dotenv
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_SCHEMA_PATH = PROJECT_ROOT / "sql" / "mariadb_schema.sql"
+LEGACY_SCHEMA_PATH = PROJECT_ROOT / "sql" / "mariadb_schema.sql"
+TRADING_DEV_SCHEMA_PATH = PROJECT_ROOT / "sql" / "trading_dev_schema.sql"
+
+
+def resolve_default_schema_path() -> Path:
+    database_name = os.getenv("MARIADB_DATABASE", "trading").strip().lower()
+    if database_name == "trading_dev" and TRADING_DEV_SCHEMA_PATH.exists():
+        return TRADING_DEV_SCHEMA_PATH
+    return LEGACY_SCHEMA_PATH
+
+
+DEFAULT_SCHEMA_PATH = resolve_default_schema_path()
 
 
 @dataclass

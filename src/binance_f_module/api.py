@@ -13,7 +13,7 @@ load_dotenv()
 
 BINANCE_API_KEY = os.getenv("BINANCE_ACCESS_KEY")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-BASE_URL = "https://fapi.binance.com"
+BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 
 _TIME_OFFSET_MS = 0
 _TICKER_LIST_CACHE: tuple[int, tuple[list[str], dict[str, dict[str, Any]]]] | None = None

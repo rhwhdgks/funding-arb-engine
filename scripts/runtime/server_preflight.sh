@@ -32,12 +32,6 @@ PY
 echo "[preflight] schema check"
 .venv/bin/python scripts/db/init_db_schema.py
 
-echo "[preflight] db sync smoke"
-.venv/bin/python -u scripts/db/sync_db.py \
-  --exchanges "${TARGET_EXCHANGES:-${TARGET_EXCHANGE:-okx}}" \
-  --symbols "${SYMBOLS:-${SYMBOL:-BTC}}" \
-  --wait-ws-sec "${WAIT_WS_SEC:-6}"
-
 echo "[preflight] live report smoke"
 .venv/bin/python -u scripts/ops/report.py \
   --exchanges "${TARGET_EXCHANGES:-${TARGET_EXCHANGE:-okx}}" \

@@ -11,10 +11,28 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.append(str(PROJECT_ROOT))
-load_dotenv()
+env_file = os.getenv("STRATEGY_ENV_FILE")
+if env_file:
+    load_dotenv(env_file, override=True)
+else:
+    load_dotenv()
 
+from src.core.exchange_registry import SUPPORTED_EXCHANGES
 from src.ops.persistence.live_report import collect_exchange_report
-from src.ops.persistence.sync import SUPPORTED_EXCHANGES, build_default_symbols, parse_csv_list
+
+
+def parse_csv_list(raw: str | None, fallback: list[str] | None = None) -> list[str]:
+    if not raw:
+        return list(fallback or [])
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
+def build_default_symbols() -> list[str]:
+    symbols = parse_csv_list(os.getenv("SYMBOLS"))
+    if symbols:
+        return symbols
+    symbol = os.getenv("SYMBOL", "BTC").strip().upper()
+    return [symbol]
 
 
 def build_parser() -> argparse.ArgumentParser:

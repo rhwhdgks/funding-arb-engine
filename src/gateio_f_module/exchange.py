@@ -588,25 +588,28 @@ class Exchange:
         state = self.hedge_state.get(ticker, {})
         return state.get("can_trade", True)
 
-    async def order(self, ticker: str, side: str, amount: float, price: float):
+    async def order(self, ticker: str, side: str, amount: float, price: float, *, is_hedge: bool = False):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, price=price, order_type="limit")
         request_payload.setdefault("client_order_id", f"gtl{ticker}{int(time.time() * 1000)}")
         request_payload.setdefault("uuid", request_payload["client_order_id"])
+        if is_hedge:
+            request_payload["is_hedge"] = True
 
-        if not self.can_trade_symbol(ticker):
-            result = {"error": "cannot_trade_symbol", "ticker": ticker}
-            schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
-            return result
+        if not is_hedge:
+            if not self.can_trade_symbol(ticker):
+                result = {"error": "cannot_trade_symbol", "ticker": ticker}
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        key = f"{ticker}_{side}"
-        if time.time() - self.last_order_time.get(key, 0) < self.order_cooldown_sec:
-            result = {"error": "order_cooldown", "ticker": ticker}
-            schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
-            return result
+            key = f"{ticker}_{side}"
+            if time.time() - self.last_order_time.get(key, 0) < self.order_cooldown_sec:
+                result = {"error": "order_cooldown", "ticker": ticker}
+                schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
+                return result
 
-        self.last_order_time[key] = time.time()
+            self.last_order_time[key] = time.time()
         schedule_order_submit(self.persist_name, request_payload)
 
         order_data = await post_limit_order(
@@ -626,14 +629,16 @@ class Exchange:
         self._update_rate_limit_state(order_data)
         return order_data
 
-    async def market_order(self, ticker: str, side: str, amount: float, is_close: bool = False):
+    async def market_order(self, ticker: str, side: str, amount: float, is_close: bool = False, *, is_hedge: bool = False):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, order_type="market", is_close=is_close)
         request_payload.setdefault("client_order_id", f"gtm{ticker}{int(time.time() * 1000)}")
         request_payload.setdefault("uuid", request_payload["client_order_id"])
+        if is_hedge:
+            request_payload["is_hedge"] = True
 
-        if not self.can_trade_symbol(ticker) and not is_close:
+        if not self.can_trade_symbol(ticker) and not is_close and not is_hedge:
             result = {"error": "cannot_trade_symbol", "ticker": ticker}
             schedule_order_result(self.persist_name, ticker, result, request_payload, event_source="local")
             return result

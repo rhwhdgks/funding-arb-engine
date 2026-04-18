@@ -2,8 +2,9 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
+from src.core.exchange_registry import build_exchange
+
 from .balance_report import build_balance_report
-from .sync import build_exchange
 
 
 def utc_now_iso() -> str:

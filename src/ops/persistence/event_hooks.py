@@ -4,7 +4,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .db import append_order_event, get_db_connection, upsert_trade_history
+from .db import get_db_connection
+from .trading_dev_normalizers import build_order_history_row, build_trade_history_rows
+from .trading_dev_store import upsert_order_history_rows, upsert_trade_history_rows
 
 
 def _env_flag(key: str, default: str = "1") -> bool:
@@ -99,24 +101,17 @@ def _run_background(func, *args, **kwargs) -> None:
         func(*args, **kwargs)
 
 
-def _store_event_sync(exchange_name: str, symbol: str, event_type: str, event_source: str, payload: dict[str, Any]) -> None:
-    if not _event_enabled():
+def _store_trade_history_sync(exchange_name: str, symbol: str, trades: list[dict[str, Any]]) -> None:
+    if not trades:
         return
 
     conn = None
     try:
         conn = get_db_connection()
-        append_order_event(
-            conn,
-            exchange_name=exchange_name,
-            symbol=symbol,
-            event_type=event_type,
-            event_source=event_source,
-            payload=payload,
-            event_time_ms=payload.get("timestamp"),
-        )
+        rows = build_trade_history_rows(exchange_name, symbol, trades)
+        upsert_trade_history_rows(conn, rows)
     except Exception as exc:
-        print(f"[order-events] skip exchange={exchange_name} symbol={symbol} type={event_type}: {exc}")
+        print(f"[trade-history] skip exchange={exchange_name} symbol={symbol}: {exc}")
     finally:
         if conn is not None:
             try:
@@ -125,16 +120,19 @@ def _store_event_sync(exchange_name: str, symbol: str, event_type: str, event_so
                 pass
 
 
-def _store_trade_history_sync(exchange_name: str, symbol: str, trades: list[dict[str, Any]]) -> None:
-    if not trades:
+def _store_order_history_sync(exchange_name: str, symbol: str, event_type: str, payload: dict[str, Any]) -> None:
+    if not _event_enabled():
         return
 
     conn = None
     try:
         conn = get_db_connection()
-        upsert_trade_history(conn, exchange_name=exchange_name, symbol=symbol, trades=trades)
+        row = build_order_history_row(exchange_name, symbol, payload, event_type=event_type)
+        if row is None:
+            return
+        upsert_order_history_rows(conn, [row])
     except Exception as exc:
-        print(f"[trade-history] skip exchange={exchange_name} symbol={symbol}: {exc}")
+        print(f"[order-history] skip exchange={exchange_name} symbol={symbol} type={event_type}: {exc}")
     finally:
         if conn is not None:
             try:
@@ -168,7 +166,7 @@ def schedule_order_event(exchange_name: str, symbol: str, event_type: str, event
     normalized_payload = _with_event_context(payload, event_type=event_type, event_source=event_source)
     normalized_payload.setdefault("symbol", normalized_symbol)
     normalized_payload.setdefault("ticker", normalized_symbol)
-    _run_background(_store_event_sync, exchange_name, normalized_symbol, event_type, event_source, normalized_payload)
+    _run_background(_store_order_history_sync, exchange_name, normalized_symbol, event_type, normalized_payload)
 
 
 def build_order_request_payload(
