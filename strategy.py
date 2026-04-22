@@ -11,6 +11,17 @@ from src.core.action_gate import ActionGate
 from dotenv import load_dotenv
 from src.ops.persistence.live_snapshot import persist_exchange_snapshots
 from src.core.exchange_registry import SUPPORTED_EXCHANGES, build_exchange
+from src.strategy.hedge import HedgeExecutionResult, execute_residual_hedge
+from src.strategy.execution import (
+    wait_for_position_fill as _execution_wait_for_position_fill,
+    wait_for_position_close as _execution_wait_for_position_close,
+    extract_order_uuid as _execution_extract_order_uuid,
+    extract_order_avg_price as _execution_extract_order_avg_price,
+    cancel_if_open as _execution_cancel_if_open,
+    execute_requoting_limit_leg as _execution_execute_requoting_limit_leg,
+    resolve_effective_order_qty as _execution_resolve_effective_order_qty,
+    settle_grace_sec as _execution_settle_grace_sec,
+)
 
 load_dotenv()
 
@@ -789,6 +800,15 @@ def extract_position_qty(snapshot: dict[str, Any]) -> float:
     return 0.0
 
 
+def extract_position_entry_price(snapshot: dict[str, Any]) -> float:
+    position = snapshot.get("position", {}) or {}
+    for key in ("entry_price", "avg_price", "avgPrice", "entryPrice"):
+        value = _safe_float(position.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
 def assumed_flat_key(exchange_name: str, symbol: str) -> tuple[str, str]:
     return (str(exchange_name).lower(), str(symbol).upper())
 
@@ -1486,16 +1506,17 @@ async def wait_for_position_fill(
     target_qty: float,
     timeout_sec: float,
 ) -> float:
-    deadline = time.monotonic() + max(timeout_sec, 0.0)
-    filled_qty = 0.0
-    while time.monotonic() < deadline:
-        post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-        filled_qty = position_fill_delta(pre_qty, post_qty, side)
-        if filled_qty + EPS >= target_qty:
-            return filled_qty
-        await asyncio.sleep(0.1)
-    post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-    return position_fill_delta(pre_qty, post_qty, side)
+    return await _execution_wait_for_position_fill(
+        exchange,
+        symbol,
+        side,
+        pre_qty,
+        target_qty,
+        timeout_sec,
+        extract_position_qty=extract_position_qty,
+        position_fill_delta=position_fill_delta,
+        eps=EPS,
+    )
 
 
 async def wait_for_position_close(
@@ -1506,36 +1527,25 @@ async def wait_for_position_close(
     target_qty: float,
     timeout_sec: float,
 ) -> float:
-    deadline = time.monotonic() + max(timeout_sec, 0.0)
-    closed_qty = 0.0
-    while time.monotonic() < deadline:
-        post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-        closed_qty = position_close_delta(pre_qty, post_qty, side)
-        if closed_qty + EPS >= target_qty:
-            return closed_qty
-        await asyncio.sleep(0.1)
-    post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-    return position_close_delta(pre_qty, post_qty, side)
+    return await _execution_wait_for_position_close(
+        exchange,
+        symbol,
+        side,
+        pre_qty,
+        target_qty,
+        timeout_sec,
+        extract_position_qty=extract_position_qty,
+        position_close_delta=position_close_delta,
+        eps=EPS,
+    )
 
 
 def extract_order_uuid(order_result: dict[str, Any] | None) -> str | None:
-    if not isinstance(order_result, dict):
-        return None
-    for key in ("uuid", "client_order_id", "order_id"):
-        value = order_result.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return None
+    return _execution_extract_order_uuid(order_result)
 
 
 def extract_order_avg_price(order_result: dict[str, Any] | None, fallback_price: float) -> float:
-    if not isinstance(order_result, dict):
-        return fallback_price
-    for key in ("avg_price", "price", "fill_price"):
-        value = _safe_float(order_result.get(key), 0.0)
-        if value > 0:
-            return value
-    return fallback_price
+    return _execution_extract_order_avg_price(order_result, fallback_price)
 
 
 def pair_entry_spread_usd(pair: OpenPairState) -> float:
@@ -1567,21 +1577,11 @@ async def bootstrap_candidate_exchanges(
 
 
 async def cancel_if_open(exchange: Any, symbol: str, order_result: dict[str, Any] | None) -> None:
-    order_uuid = extract_order_uuid(order_result)
-    if not order_uuid:
-        return
-    try:
-        await exchange.cancel_order(symbol, order_uuid)
-    except Exception as exc:
-        print(f"[strategy][cancel_if_open][warn] symbol={symbol} uuid={order_uuid} error={exc}")
-
-
-def adaptive_limit_action_interval_sec(exchange: Any, config: StrategyConfig) -> float:
-    return max(
-        _safe_float(getattr(exchange, "order_cooldown_sec", 0.0), 0.0),
-        _safe_float(getattr(exchange, "cancel_cooldown_sec", 0.0), 0.0),
-        config.min_recompute_interval_sec,
-        0.25,
+    await _execution_cancel_if_open(
+        exchange,
+        symbol,
+        order_result,
+        extract_order_uuid=extract_order_uuid,
     )
 
 
@@ -1619,183 +1619,29 @@ async def execute_requoting_limit_leg(
     log_prefix: str,
     probe_reason_prefix: str,
 ) -> tuple[float, dict[str, Any] | None, float]:
-    deadline = time.monotonic() + max(timeout_sec, 0.0)
-    action_interval_sec = adaptive_limit_action_interval_sec(exchange, config)
-    settle_wait_sec = max(config.action_settle_wait_sec, action_interval_sec)
-
-    active_order: dict[str, Any] | None = None
-    active_price = 0.0
-    resolved_qty = 0.0
-
-    while True:
-        remaining_time_sec = deadline - time.monotonic()
-        resolved_qty = max(
-            resolved_qty,
-            await resolve_effective_order_qty(
-                exchange=exchange,
-                symbol=symbol,
-                side=side,
-                pre_qty=pre_qty,
-                target_qty=target_qty,
-                order_result=active_order,
-                is_close=is_close,
-                reason=f"{probe_reason_prefix}_loop",
-            ),
-        )
-        remaining_qty = max(target_qty - resolved_qty, 0.0)
-        if remaining_qty <= EPS or remaining_time_sec <= 0:
-            break
-
-        if active_order and not is_waiting_order_active(exchange, active_order):
-            active_order = None
-            active_price = 0.0
-
-        target_price = price_resolver()
-        if target_price <= 0:
-            await asyncio.sleep(min(action_interval_sec, max(remaining_time_sec, 0.05)))
-            continue
-
-        if active_order and limit_price_changed(exchange, symbol, active_price, target_price):
-            print(
-                f"[strategy][{log_prefix}][requote] 재호가 symbol={symbol} side={side} "
-                f"old_price={active_price} new_price={target_price}"
-            )
-            await cancel_if_open(exchange, symbol, active_order)
-            active_order = None
-            active_price = 0.0
-            await asyncio.sleep(min(settle_wait_sec, max(deadline - time.monotonic(), 0.05)))
-            resolved_qty = max(
-                resolved_qty,
-                await resolve_effective_order_qty(
-                    exchange=exchange,
-                    symbol=symbol,
-                    side=side,
-                    pre_qty=pre_qty,
-                    target_qty=target_qty,
-                    order_result=None,
-                    is_close=is_close,
-                    reason=f"{probe_reason_prefix}_after_requote_cancel",
-                ),
-            )
-            remaining_qty = max(target_qty - resolved_qty, 0.0)
-            if remaining_qty <= EPS:
-                break
-
-        if active_order is None:
-            submit_qty = normalize_exchange_qty_for_order(exchange, symbol, remaining_qty, target_price)
-            if submit_qty <= EPS:
-                break
-            print_verbose(
-                config,
-                f"[strategy][{log_prefix}] exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
-                f"side={side} qty={submit_qty:.6f} requested={target_qty:.6f} "
-                f"remaining={remaining_qty:.6f} price={target_price}"
-            )
-            order_result = await exchange.order(symbol, side, submit_qty, target_price)
-            if order_result and not order_result.get("error"):
-                active_order = order_result
-                active_price = target_price
-            else:
-                print(f"[strategy][{log_prefix}][warn] 주문 제출 실패 result={order_result}")
-                await asyncio.sleep(min(action_interval_sec, max(deadline - time.monotonic(), 0.05)))
-                continue
-
-        await asyncio.sleep(min(action_interval_sec, max(deadline - time.monotonic(), 0.05)))
-
-    resolved_qty = max(
-        resolved_qty,
-        await resolve_effective_order_qty(
-            exchange=exchange,
-            symbol=symbol,
-            side=side,
-            pre_qty=pre_qty,
-            target_qty=target_qty,
-            order_result=active_order,
-            is_close=is_close,
-            reason=f"{probe_reason_prefix}_before_final_cancel",
-        ),
+    return await _execution_execute_requoting_limit_leg(
+        exchange=exchange,
+        symbol=symbol,
+        side=side,
+        target_qty=target_qty,
+        pre_qty=pre_qty,
+        timeout_sec=timeout_sec,
+        config=config,
+        is_close=is_close,
+        price_resolver=price_resolver,
+        log_prefix=log_prefix,
+        probe_reason_prefix=probe_reason_prefix,
+        resolve_effective_order_qty=resolve_effective_order_qty,
+        is_waiting_order_active=is_waiting_order_active,
+        limit_price_changed=limit_price_changed,
+        cancel_if_open=cancel_if_open,
+        normalize_exchange_qty_for_order=normalize_exchange_qty_for_order,
+        print_verbose=print_verbose,
+        settle_grace_sec=settle_grace_sec,
+        wait_for_position_fill=wait_for_position_fill,
+        wait_for_position_close=wait_for_position_close,
+        eps=EPS,
     )
-    if active_order:
-        if is_waiting_order_active(exchange, active_order):
-            await cancel_if_open(exchange, symbol, active_order)
-            await asyncio.sleep(settle_wait_sec)
-            resolved_qty = max(
-                resolved_qty,
-                await resolve_effective_order_qty(
-                    exchange=exchange,
-                    symbol=symbol,
-                    side=side,
-                    pre_qty=pre_qty,
-                    target_qty=target_qty,
-                    order_result=active_order,
-                    is_close=is_close,
-                    reason=f"{probe_reason_prefix}_after_final_cancel",
-                ),
-            )
-        active_order = None
-
-    if resolved_qty + EPS < target_qty:
-        waiter = wait_for_position_close if is_close else wait_for_position_fill
-        resolved_qty = max(
-            resolved_qty,
-            await waiter(
-                exchange,
-                symbol,
-                side,
-                pre_qty,
-                target_qty,
-                settle_grace_sec(config),
-            ),
-        )
-
-    return resolved_qty, active_order, active_price
-
-
-async def resolve_executed_qty_from_order_status(exchange: Any, order_result: dict[str, Any] | None, target_qty: float) -> float:
-    if not order_result or not hasattr(exchange, "get_order_status"):
-        return 0.0
-    try:
-        status = await exchange.get_order_status(order_result)
-    except Exception as exc:
-        print(f"[strategy][order_status][warn] error={exc}")
-        return 0.0
-    if not isinstance(status, dict) or status.get("error"):
-        return 0.0
-    executed_qty = _safe_float(status.get("executed_qty"), 0.0)
-    if executed_qty > EPS:
-        return min(executed_qty, target_qty)
-    status_text = str(status.get("status") or "").upper()
-    if status_text in {"FILLED", "FULLY_FILLED"}:
-        return target_qty
-    return 0.0
-
-
-async def resolve_executed_qty_from_recent_trades(
-    exchange: Any,
-    symbol: str,
-    order_result: dict[str, Any] | None,
-    target_qty: float,
-) -> float:
-    if not order_result or not hasattr(exchange, "get_trade_history"):
-        return 0.0
-    order_id = order_result.get("order_id")
-    if order_id in (None, ""):
-        return 0.0
-    try:
-        rows = await exchange.get_trade_history(symbol, limit=30)
-    except Exception as exc:
-        print(f"[strategy][trade_lookup][warn] symbol={symbol} error={exc}")
-        return 0.0
-    if not isinstance(rows, list):
-        return 0.0
-    matched_qty = 0.0
-    for row in rows:
-        if str(row.get("order_id")) != str(order_id):
-            continue
-        matched_qty += abs(_safe_float(row.get("qty"), 0.0))
-    if matched_qty <= EPS:
-        return 0.0
-    return min(matched_qty, target_qty)
 
 
 async def resolve_effective_order_qty(
@@ -1809,20 +1655,25 @@ async def resolve_effective_order_qty(
     is_close: bool,
     reason: str,
 ) -> float:
-    await refresh_symbol_state(exchange, symbol, reason)
-    post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-    position_qty = (
-        position_close_delta(pre_qty, post_qty, side)
-        if is_close
-        else position_fill_delta(pre_qty, post_qty, side)
+    return await _execution_resolve_effective_order_qty(
+        exchange=exchange,
+        symbol=symbol,
+        side=side,
+        pre_qty=pre_qty,
+        target_qty=target_qty,
+        order_result=order_result,
+        is_close=is_close,
+        reason=reason,
+        refresh_symbol_state=refresh_symbol_state,
+        extract_position_qty=extract_position_qty,
+        position_close_delta=position_close_delta,
+        position_fill_delta=position_fill_delta,
+        eps=EPS,
     )
-    status_qty = await resolve_executed_qty_from_order_status(exchange, order_result, target_qty)
-    trade_qty = await resolve_executed_qty_from_recent_trades(exchange, symbol, order_result, target_qty)
-    return max(position_qty, status_qty, trade_qty)
 
 
 def settle_grace_sec(config: StrategyConfig) -> float:
-    return max(1.5, config.action_settle_wait_sec * 4.0)
+    return _execution_settle_grace_sec(config)
 
 
 def use_reduce_only_market_close(exchange: Any, current_qty: float, side: str) -> bool:
@@ -1925,16 +1776,25 @@ async def emergency_flatten_symbol_state(
             return (True, False)
 
         side = "sell" if current_qty > 0 else "buy"
+        close_qty = normalize_exchange_qty(exchange, symbol, abs(current_qty))
+        if close_qty <= EPS:
+            print(
+                f"[strategy][emergency_flatten][dust] 최소 주문 단위 미만 잔량으로 flat 간주 "
+                f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+                f"symbol={symbol} side={side} qty={abs(current_qty):.12f}"
+            )
+            return (True, True)
+
         try:
             print(
                 f"[strategy][emergency_flatten] 강제 청산 시도 attempt={attempt + 1} "
                 f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
-                f"symbol={symbol} side={side} qty={abs(current_qty):.6f}"
+                f"symbol={symbol} side={side} qty={close_qty:.6f}"
             )
             market_result = await exchange.market_order(
                 symbol,
                 side,
-                abs(current_qty),
+                close_qty,
                 is_close=use_reduce_only_market_close(exchange, current_qty, side),
             )
             if not (market_result and market_result.get("error")):
@@ -1943,17 +1803,26 @@ async def emergency_flatten_symbol_state(
                     symbol=symbol,
                     side=side,
                     pre_qty=current_qty,
-                    target_qty=abs(current_qty),
+                    target_qty=close_qty,
                     order_result=market_result,
                     is_close=True,
                     reason=f"strategy_emergency_flatten_market_{attempt + 1}",
                 )
-                if resolved_close_qty + qty_match_tolerance(abs(current_qty)) >= abs(current_qty):
-                    return (True, False)
                 await asyncio.sleep(1.2)
+                await refresh_symbol_state(exchange, symbol, f"strategy_emergency_flatten_check_{attempt + 1}")
                 current_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
                 if abs(current_qty) <= EPS:
                     return (True, False)
+                remaining_side = "sell" if current_qty > 0 else "buy"
+                remaining_close_qty = normalize_exchange_qty(exchange, symbol, abs(current_qty))
+                if remaining_close_qty <= EPS:
+                    print(
+                        f"[strategy][emergency_flatten][dust] 청산 후 최소 주문 단위 미만 잔량으로 flat 간주 "
+                        f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+                        f"symbol={symbol} side={remaining_side} qty={abs(current_qty):.12f} "
+                        f"closed_qty={resolved_close_qty:.12f}"
+                    )
+                    return (True, True)
             else:
                 if error_means_no_position_to_close(market_result):
                     return (True, True)
@@ -1968,7 +1837,17 @@ async def emergency_flatten_symbol_state(
             await asyncio.sleep(0.8)
 
     remaining_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-    return (abs(remaining_qty) <= EPS, False)
+    if abs(remaining_qty) <= EPS:
+        return (True, False)
+    side = "sell" if remaining_qty > 0 else "buy"
+    if normalize_exchange_qty(exchange, symbol, abs(remaining_qty)) <= EPS:
+        print(
+            f"[strategy][emergency_flatten][dust] 재시도 후 최소 주문 단위 미만 잔량으로 flat 간주 "
+            f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+            f"symbol={symbol} side={side} qty={abs(remaining_qty):.12f}"
+        )
+        return (True, True)
+    return (False, False)
 
 
 async def emergency_flatten_symbol(exchange: Any, symbol: str, aggressive_bps: float = 20.0) -> bool:
@@ -2107,88 +1986,31 @@ async def enter_pair_limit_then_hedge(
             print(f"[strategy][danger] 헤지 불가 첫 체결 강제 청산 실패 symbol={symbol}")
         return None
 
-    hedged_qty = 0.0
-    hedge_price_used = 0.0
-    remaining_qty = max(first_filled_qty - hedged_qty, 0.0)
-
-    if config.hedge_market_immediate and remaining_qty > EPS:
-        print_verbose(
-            config,
-            f"[strategy][hedge][market] 헤지 시장가 exchange={hedge_exchange_name} side={hedge_side} "
-            f"qty={remaining_qty:.6f}"
-        )
-        market_result = await hedge_exchange.market_order(symbol, hedge_side, remaining_qty, is_hedge=True)
-        if market_result and market_result.get("error"):
-            print(f"[strategy][hedge][market][error] 헤지 시장가 오류 result={market_result}")
-        await asyncio.sleep(config.action_settle_wait_sec)
-        await refresh_symbol_state(hedge_exchange, symbol, "strategy_entry_hedge_market")
-        hedged_qty = position_fill_delta(
-            pre_qty_hedge,
-            extract_position_qty(hedge_exchange.get_symbol_snapshot(symbol)),
-            hedge_side,
-        )
-        remaining_qty = max(first_filled_qty - hedged_qty, 0.0)
-        hedge_price_used = extract_order_avg_price(market_result, hedge_price_used)
-    else:
-        for attempt in range(config.hedge_requote_count + 1):
-            if remaining_qty <= EPS:
-                break
-            hedge_price = marketable_limit_price_with_bps(hedge_exchange, symbol, hedge_side, config.close_aggressive_bps)
-            if hedge_price <= 0:
-                break
-            hedge_price_used = hedge_price
-            print_verbose(
-                config,
-                f"[strategy][hedge] 헤지 재호가 attempt={attempt + 1} exchange={hedge_exchange_name} side={hedge_side} "
-                f"qty={remaining_qty:.6f} price={hedge_price}"
-            )
-            hedge_result = await hedge_exchange.order(symbol, hedge_side, remaining_qty, hedge_price, is_hedge=True)
-            if hedge_result and not hedge_result.get("error"):
-                await wait_for_position_fill(
-                    hedge_exchange,
-                    symbol,
-                    hedge_side,
-                    pre_qty_hedge,
-                    first_filled_qty,
-                    config.hedge_requote_timeout_sec,
-                )
-                hedged_qty = await resolve_effective_order_qty(
-                    exchange=hedge_exchange,
-                    symbol=symbol,
-                    side=hedge_side,
-                    pre_qty=pre_qty_hedge,
-                    target_qty=first_filled_qty,
-                    order_result=hedge_result,
-                    is_close=False,
-                    reason="strategy_entry_hedge_probe_before_cancel",
-                )
-                remaining_qty = max(first_filled_qty - hedged_qty, 0.0)
-                if remaining_qty > EPS:
-                    await cancel_if_open(hedge_exchange, symbol, hedge_result)
-                    await asyncio.sleep(config.action_settle_wait_sec)
-                    hedged_qty = await resolve_effective_order_qty(
-                        exchange=hedge_exchange,
-                        symbol=symbol,
-                        side=hedge_side,
-                        pre_qty=pre_qty_hedge,
-                        target_qty=first_filled_qty,
-                        order_result=hedge_result,
-                        is_close=False,
-                        reason="strategy_entry_hedge_after_cancel",
-                    )
-                    if remaining_qty > EPS:
-                        hedged_qty = max(
-                            hedged_qty,
-                            await wait_for_position_fill(
-                                hedge_exchange,
-                                symbol,
-                                hedge_side,
-                                pre_qty_hedge,
-                                first_filled_qty,
-                                settle_grace_sec(config),
-                            ),
-                        )
-                    remaining_qty = max(first_filled_qty - hedged_qty, 0.0)
+    hedge_execution = await execute_residual_hedge(
+        stage_label="entry",
+        exchange_name=hedge_exchange_name,
+        exchange=hedge_exchange,
+        symbol=symbol,
+        side=hedge_side,
+        pre_qty=pre_qty_hedge,
+        target_qty=first_filled_qty,
+        config=config,
+        is_close=False,
+        eps=EPS,
+        extract_position_qty=extract_position_qty,
+        marketable_limit_price_with_bps=marketable_limit_price_with_bps,
+        print_verbose=print_verbose,
+        use_reduce_only_market_close=use_reduce_only_market_close,
+        resolve_effective_order_qty=resolve_effective_order_qty,
+        extract_order_avg_price=extract_order_avg_price,
+        wait_for_position_fill=wait_for_position_fill,
+        wait_for_position_close=wait_for_position_close,
+        cancel_if_open=cancel_if_open,
+        settle_grace_sec=settle_grace_sec,
+    )
+    hedged_qty = hedge_execution.filled_qty
+    hedge_price_used = hedge_execution.avg_price
+    remaining_qty = hedge_execution.remaining_qty
 
     if remaining_qty > EPS:
         print(
@@ -2200,8 +2022,10 @@ async def enter_pair_limit_then_hedge(
 
     await refresh_symbol_state(exchanges[candidate.long_exchange], symbol, "strategy_entry_post_open_long")
     await refresh_symbol_state(exchanges[candidate.short_exchange], symbol, "strategy_entry_post_open_short")
-    long_qty_after = extract_position_qty(exchanges[candidate.long_exchange].get_symbol_snapshot(symbol))
-    short_qty_after = extract_position_qty(exchanges[candidate.short_exchange].get_symbol_snapshot(symbol))
+    long_snapshot_after = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
+    short_snapshot_after = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
+    long_qty_after = extract_position_qty(long_snapshot_after)
+    short_qty_after = extract_position_qty(short_snapshot_after)
     if long_qty_after <= EPS or short_qty_after >= -EPS:
         print(
             f"[strategy][danger] 진입 후 방향 불일치 symbol={symbol} "
@@ -2211,8 +2035,27 @@ async def enter_pair_limit_then_hedge(
         await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
         return None
 
-    long_entry_price = first_price_used if first_exchange_name == candidate.long_exchange else hedge_price_used
-    short_entry_price = hedge_price_used if hedge_exchange_name == candidate.short_exchange else first_price_used
+    long_order_price = first_price_used if first_exchange_name == candidate.long_exchange else hedge_price_used
+    short_order_price = hedge_price_used if hedge_exchange_name == candidate.short_exchange else first_price_used
+    long_entry_price = (
+        extract_position_entry_price(long_snapshot_after)
+        or long_order_price
+        or extract_mid_price(long_snapshot_after)
+    )
+    short_entry_price = (
+        extract_position_entry_price(short_snapshot_after)
+        or short_order_price
+        or extract_mid_price(short_snapshot_after)
+    )
+    if long_entry_price <= 0 or short_entry_price <= 0:
+        print(
+            f"[strategy][danger] 진입 평단 누락 symbol={symbol} "
+            f"long_exchange={candidate.long_exchange} long_entry={long_entry_price:.8f} "
+            f"short_exchange={candidate.short_exchange} short_entry={short_entry_price:.8f}"
+        )
+        await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+        return None
+
     pair_qty = min(abs(long_qty_after), abs(short_qty_after))
     pair_id = f"{symbol}:{candidate.long_exchange}:{candidate.short_exchange}:{int(time.time() * 1000)}"
 
@@ -2352,157 +2195,25 @@ async def close_pair_limit_then_hedge(
     config: StrategyConfig,
 ) -> bool:
     pair.assumed_flat_exchanges = []
-    symbol = pair.symbol
-    first_exchange_name, first_side = close_first_leg_plan(pair, config)
-    hedge_exchange_name, hedge_side = close_hedge_leg_plan(pair, config)
-    first_exchange = exchanges[first_exchange_name]
-    hedge_exchange = exchanges[hedge_exchange_name]
-
-    pre_qty_first = extract_position_qty(first_exchange.get_symbol_snapshot(symbol))
-    pre_qty_hedge = extract_position_qty(hedge_exchange.get_symbol_snapshot(symbol))
-    target_close_qty = min(abs(pre_qty_first), abs(pre_qty_hedge), pair.qty)
-    first_price = marketable_limit_price_with_bps(first_exchange, symbol, first_side, config.close_aggressive_bps)
-    hedge_price_preview = marketable_limit_price_with_bps(hedge_exchange, symbol, hedge_side, config.close_aggressive_bps)
-    target_close_qty = compute_common_executable_qty(
-        first_exchange,
-        hedge_exchange,
-        symbol,
-        target_close_qty,
-        left_price=first_price,
-        right_price=hedge_price_preview,
-    )
-    if target_close_qty <= EPS:
-        print(f"[strategy][close] 청산할 수량 없음 pair_id={pair.pair_id}")
-        record_live_event(config, "pair_close_noop", pair=pair_event_payload(pair))
-        return True
-
-    if first_price <= 0:
-        print(f"[strategy][close][abort] 첫 청산 가격 없음 exchange={first_exchange_name} symbol={symbol}")
-        return False
-
     print_verbose(
         config,
-        f"[strategy][close] first_leg exchange={first_exchange_name} side={first_side} "
-        f"qty={target_close_qty:.6f} price={first_price}"
-    )
-    first_closed_qty, _, _ = await execute_requoting_limit_leg(
-        exchange=first_exchange,
-        symbol=symbol,
-        side=first_side,
-        target_qty=target_close_qty,
-        pre_qty=pre_qty_first,
-        timeout_sec=config.first_leg_timeout_sec,
-        config=config,
-        is_close=True,
-        price_resolver=lambda: marketable_limit_price_with_bps(first_exchange, symbol, first_side, config.close_aggressive_bps),
-        log_prefix="close",
-        probe_reason_prefix="strategy_close_first",
+        f"[strategy][close] pair flatten 시작 pair_id={pair.pair_id} "
+        f"symbol={pair.symbol} long={pair.long_exchange} short={pair.short_exchange}"
     )
 
-    if first_closed_qty <= EPS:
-        pair.status = "open"
-        return False
-
-    hedged_qty = 0.0
-    remaining_qty = max(first_closed_qty, 0.0)
-    if config.hedge_market_immediate and remaining_qty > EPS:
-        print_verbose(
-            config,
-            f"[strategy][close-hedge][market] 청산 헤지 시장가 exchange={hedge_exchange_name} side={hedge_side} "
-            f"qty={remaining_qty:.6f}"
-        )
-        current_hedge_qty = extract_position_qty(hedge_exchange.get_symbol_snapshot(symbol))
-        market_result = await hedge_exchange.market_order(
-            symbol,
-            hedge_side,
-            remaining_qty,
-            is_close=use_reduce_only_market_close(hedge_exchange, current_hedge_qty, hedge_side),
-            is_hedge=True,
-        )
-        if market_result and market_result.get("error"):
-            print(f"[strategy][close-hedge][market][error] 청산 헤지 시장가 오류 result={market_result}")
-        await asyncio.sleep(config.action_settle_wait_sec)
-        hedged_qty = max(
-            hedged_qty,
-            await resolve_effective_order_qty(
-                exchange=hedge_exchange,
-                symbol=symbol,
-                side=hedge_side,
-                pre_qty=pre_qty_hedge,
-                target_qty=first_closed_qty,
-                order_result=market_result,
-                is_close=True,
-                reason="strategy_close_hedge_market",
-            ),
-        )
-        remaining_qty = max(first_closed_qty - hedged_qty, 0.0)
-    else:
-        for attempt in range(config.hedge_requote_count + 1):
-            outstanding = max(first_closed_qty - hedged_qty, 0.0)
-            if outstanding <= EPS:
-                break
-            hedge_price = marketable_limit_price_with_bps(hedge_exchange, symbol, hedge_side, config.close_aggressive_bps)
-            if hedge_price <= 0:
-                break
-            print_verbose(
-                config,
-                f"[strategy][close-hedge] 청산 헤지 재호가 attempt={attempt + 1} exchange={hedge_exchange_name} side={hedge_side} "
-                f"qty={outstanding:.6f} price={hedge_price}"
-            )
-            hedge_result = await hedge_exchange.order(symbol, hedge_side, outstanding, hedge_price, is_hedge=True)
-            if hedge_result and not hedge_result.get("error"):
-                await wait_for_position_close(
-                    hedge_exchange,
-                    symbol,
-                    hedge_side,
-                    pre_qty_hedge,
-                    first_closed_qty,
-                    config.hedge_requote_timeout_sec,
-                )
-                hedged_qty = await resolve_effective_order_qty(
-                    exchange=hedge_exchange,
-                    symbol=symbol,
-                    side=hedge_side,
-                    pre_qty=pre_qty_hedge,
-                    target_qty=first_closed_qty,
-                    order_result=hedge_result,
-                    is_close=True,
-                    reason="strategy_close_hedge_probe_before_cancel",
-                )
-                remaining_qty = max(first_closed_qty - hedged_qty, 0.0)
-                if remaining_qty > EPS:
-                    await cancel_if_open(hedge_exchange, symbol, hedge_result)
-                    await asyncio.sleep(config.action_settle_wait_sec)
-                    hedged_qty = await resolve_effective_order_qty(
-                        exchange=hedge_exchange,
-                        symbol=symbol,
-                        side=hedge_side,
-                        pre_qty=pre_qty_hedge,
-                        target_qty=first_closed_qty,
-                        order_result=hedge_result,
-                        is_close=True,
-                        reason="strategy_close_hedge_after_cancel",
-                    )
-                    if remaining_qty > EPS:
-                        hedged_qty = max(
-                            hedged_qty,
-                            await wait_for_position_close(
-                                hedge_exchange,
-                                symbol,
-                                hedge_side,
-                                pre_qty_hedge,
-                                first_closed_qty,
-                                settle_grace_sec(config),
-                            ),
-                        )
-                    remaining_qty = max(first_closed_qty - hedged_qty, 0.0)
+    flattened, forced_flat_exchanges = await emergency_flatten_pair_state(
+        pair,
+        exchanges,
+        aggressive_bps=config.emergency_flatten_bps,
+    )
 
     close_state, long_qty_after, short_qty_after, balanced_qty_after, residual_gap = await settle_pair_close_state(
         pair,
         exchanges,
         config,
-        reference_qty=max(pair.qty, first_closed_qty),
+        reference_qty=pair.qty,
         reason_prefix="strategy_close_post",
+        forced_flat_exchanges=forced_flat_exchanges,
     )
     pair.qty = balanced_qty_after
     if close_state == "closed":
@@ -2513,49 +2224,29 @@ async def close_pair_limit_then_hedge(
         return True
 
     if close_state == "balanced_open":
-        pair.status = "open"
+        pair.status = "close_pending"
         print(
-            f"[strategy][close] 부분 청산 완료 pair_id={pair.pair_id} remaining_pair_qty={pair.qty:.6f}"
+            f"[strategy][close][warn] 전량 청산 후 균형 포지션 잔존 pair_id={pair.pair_id} "
+            f"remaining_pair_qty={pair.qty:.6f} flattened={flattened}"
         )
-        record_live_event(config, "pair_partial_close_done", pair=pair_event_payload(pair))
-        return True
+        record_live_event(
+            config,
+            "pair_close_pending",
+            pair=pair_event_payload(pair),
+            close_state=close_state,
+            long_qty_after=long_qty_after,
+            short_qty_after=short_qty_after,
+            residual_gap=residual_gap,
+        )
+        return False
 
     pair.status = "close_imbalance"
     print(
         f"[strategy][danger] 청산 불균형 pair_id={pair.pair_id} "
         f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "
-        f"residual_gap={residual_gap:.6f} remaining_qty={remaining_qty:.6f} state={close_state}"
+        f"residual_gap={residual_gap:.6f} state={close_state} flattened={flattened}"
     )
-    flattened, forced_flat_exchanges = await emergency_flatten_pair_state(
-        pair,
-        exchanges,
-        aggressive_bps=config.emergency_flatten_bps,
-    )
-    close_state, long_qty_after, short_qty_after, balanced_qty_after, residual_gap = await settle_pair_close_state(
-        pair,
-        exchanges,
-        config,
-        reference_qty=max(pair.qty, first_closed_qty),
-        reason_prefix="strategy_close_post_emergency",
-        forced_flat_exchanges=forced_flat_exchanges,
-    )
-    pair.qty = balanced_qty_after
-    if flattened and close_state == "closed":
-        pair.status = "closed"
-        pair.assumed_flat_exchanges = [pair.long_exchange, pair.short_exchange]
-        print(f"[strategy][close] 강제 청산 후 페어 청산 완료 pair_id={pair.pair_id}")
-        record_live_event(config, "pair_closed_after_emergency", pair=pair_event_payload(pair))
-        return True
-
     pair.status = "close_pending"
-    if close_state == "balanced_open":
-        pair.status = "open"
-        print(
-            f"[strategy][close] 강제 청산 후 부분 청산 완료 pair_id={pair.pair_id} "
-            f"remaining_pair_qty={pair.qty:.6f}"
-        )
-        record_live_event(config, "pair_partial_close_done_after_emergency", pair=pair_event_payload(pair))
-        return True
     print(
         f"[strategy][close][warn] 청산 보류 pair_id={pair.pair_id} "
         f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "

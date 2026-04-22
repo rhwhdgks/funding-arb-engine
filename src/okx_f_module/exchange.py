@@ -1160,21 +1160,35 @@ class Exchange:
         if not ticker or not isinstance(order_payload, dict) or not order_payload:
             return
         try:
-            retry_count = max(int(os.getenv("TRADE_HISTORY_SYNC_RETRY_COUNT", "4") or 4), 1)
-            retry_delay_sec = max(float(os.getenv("TRADE_HISTORY_SYNC_RETRY_DELAY_SEC", "0.5") or 0.5), 0.0)
+            # OKX fills can lag the order status endpoint by several seconds,
+            # especially on testnet. Keep this async so strategy execution is not blocked.
+            retry_count = max(int(os.getenv("TRADE_HISTORY_SYNC_RETRY_COUNT", "12") or 12), 1)
+            retry_delay_sec = max(float(os.getenv("TRADE_HISTORY_SYNC_RETRY_DELAY_SEC", "1.0") or 1.0), 0.0)
+            last_trades: list[dict] = []
             for attempt in range(retry_count):
                 trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
+                last_trades = [trade for trade in (trades or []) if isinstance(trade, dict)]
                 matched_count = schedule_matched_trade_history_upsert(
                     self.persist_name,
                     ticker,
                     order_payload,
-                    trades or [],
+                    last_trades,
                 )
                 if matched_count > 0:
                     return
                 if attempt + 1 < retry_count and retry_delay_sec > 0:
                     await asyncio.sleep(retry_delay_sec)
-            print(f"[{self.name}][trade_history_sync][warn] no matched trades ticker={ticker}")
+            order_refs = self._order_identifiers(order_payload)
+            trade_refs = []
+            for trade in last_trades[:5]:
+                refs = self._order_identifiers(trade)
+                if refs:
+                    trade_refs.append("/".join(refs))
+            print(
+                f"[{self.name}][trade_history_sync][warn] no matched trades "
+                f"ticker={ticker} attempts={retry_count} delay_sec={retry_delay_sec:g} "
+                f"order_refs={order_refs or '-'} recent_trade_refs={trade_refs or '-'}"
+            )
         except Exception as exc:
             print(f"[{self.name}][trade_history_sync][error] {exc}")
 
