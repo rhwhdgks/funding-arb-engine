@@ -14,6 +14,7 @@ from src.ops.persistence.event_hooks import (
     schedule_cancel_all_submit,
     schedule_cancel_result,
     schedule_cancel_submit,
+    schedule_absent_open_orders_cleanup,
     schedule_matched_trade_history_upsert,
     schedule_order_progress_from_trades,
     schedule_order_result,
@@ -89,6 +90,9 @@ class Exchange:
         self.ws_drift_avg_ms: dict[str, float] = {}
         self.ws_last_update_ms: dict[str, int] = {}
         self.ws_source_last: dict[str, str] = {}
+        self.ws_server_time_last_ms: dict[str, int] = {}
+        self.ws_event_time_last_ms: dict[str, int] = {}
+        self.ws_desktop_time_last_ms: dict[str, int] = {}
         self.max_server_pc_drift_ms = max_server_pc_drift_ms
         self.stale_threshold_ms = stale_threshold_ms
 
@@ -381,6 +385,7 @@ class Exchange:
             now_ms = int(time.time() * 1000)
             desktop_time = event.get("desktop_time", now_ms)
             server_time = event.get("server_time", now_ms)
+            event_time = event.get("event_time", server_time)
             source = event.get("source", "unknown")
 
             drift_ms = float(desktop_time - server_time)
@@ -391,6 +396,9 @@ class Exchange:
             self.ws_drift_last_ms[ticker] = drift_ms
             self.ws_drift_avg_ms[ticker] = drift_avg
             self.ws_source_last[ticker] = source
+            self.ws_server_time_last_ms[ticker] = int(server_time or 0)
+            self.ws_event_time_last_ms[ticker] = int(event_time or server_time or 0)
+            self.ws_desktop_time_last_ms[ticker] = int(desktop_time or now_ms)
 
             current = self.market_state.get(ticker, {})
             merged = deepcopy(current)
@@ -419,6 +427,7 @@ class Exchange:
 
             server_time = data.get("server_time", now_ms)
             desktop_time = data.get("desktop_time", now_ms)
+            event_time = data.get("event_time", server_time)
             source = data.get("source", channel)
 
             drift_ms = float(desktop_time - server_time)
@@ -429,6 +438,9 @@ class Exchange:
             self.ws_drift_last_ms[code] = drift_ms
             self.ws_drift_avg_ms[code] = drift_avg
             self.ws_source_last[code] = source
+            self.ws_server_time_last_ms[code] = int(server_time or 0)
+            self.ws_event_time_last_ms[code] = int(event_time or server_time or 0)
+            self.ws_desktop_time_last_ms[code] = int(desktop_time or now_ms)
 
             current = self.market_state.get(code, {})
             merged = deepcopy(current)
@@ -522,6 +534,15 @@ class Exchange:
                     last_update = self.ws_last_update_ms.get(ticker, 0)
                     stale_ms = now_ms - last_update if last_update else None
                     drift_ms = self.ws_drift_last_ms.get(ticker)
+                    ws_server_time_last_ms = self.ws_server_time_last_ms.get(ticker)
+                    ws_event_time_last_ms = self.ws_event_time_last_ms.get(ticker)
+                    ws_desktop_time_last_ms = self.ws_desktop_time_last_ms.get(ticker)
+                    event_lag_ms = None
+                    transport_lag_ms = None
+                    if ws_desktop_time_last_ms and ws_event_time_last_ms:
+                        event_lag_ms = int(ws_desktop_time_last_ms) - int(ws_event_time_last_ms)
+                    if ws_desktop_time_last_ms and ws_server_time_last_ms:
+                        transport_lag_ms = int(ws_desktop_time_last_ms) - int(ws_server_time_last_ms)
 
                     can_trade = True
                     reasons = []
@@ -554,6 +575,14 @@ class Exchange:
                     self.hedge_state[ticker]["ws_drift_last_ms"] = drift_ms
                     self.hedge_state[ticker]["ws_drift_avg_ms"] = self.ws_drift_avg_ms.get(ticker)
                     self.hedge_state[ticker]["ws_last_update_ms"] = last_update
+                    self.hedge_state[ticker]["ws_source_last"] = self.ws_source_last.get(ticker)
+                    self.hedge_state[ticker]["market_source_last"] = self.market_state.get(ticker, {}).get("source")
+                    self.hedge_state[ticker]["stale_age_ms"] = stale_ms
+                    self.hedge_state[ticker]["ws_server_time_last_ms"] = ws_server_time_last_ms
+                    self.hedge_state[ticker]["ws_event_time_last_ms"] = ws_event_time_last_ms
+                    self.hedge_state[ticker]["ws_desktop_time_last_ms"] = ws_desktop_time_last_ms
+                    self.hedge_state[ticker]["event_lag_ms"] = event_lag_ms
+                    self.hedge_state[ticker]["transport_lag_ms"] = transport_lag_ms
 
                     has_ws_issue = any(reason in {"ws_not_ready", "stale_orderbook"} for reason in reasons)
                     prev_has_ws_issue = any(reason in {"ws_not_ready", "stale_orderbook"} for reason in prev_reasons)
@@ -561,6 +590,24 @@ class Exchange:
                         should_auto_reconcile_stale = True
                     if prev_can_trade is False and can_trade and prev_has_ws_issue:
                         should_auto_reconcile_recovered = True
+
+                    if (
+                        not simple_stdout_enabled()
+                        and (prev_can_trade != can_trade or prev_reasons != set(reasons))
+                        and (reasons or prev_reasons)
+                    ):
+                        print(
+                            f"[{self.name}][health][{ticker}] "
+                            f"market_ready={can_trade} reasons={reasons or ['-']} "
+                            f"market_source={self.market_state.get(ticker, {}).get('source') or '-'} "
+                            f"ws_source={self.ws_source_last.get(ticker) or '-'} "
+                            f"drift_ms={drift_ms} stale_age_ms={stale_ms} "
+                            f"event_lag_ms={event_lag_ms} transport_lag_ms={transport_lag_ms} "
+                            f"event_time_ms={ws_event_time_last_ms} "
+                            f"server_time_ms={ws_server_time_last_ms} "
+                            f"desktop_time_ms={ws_desktop_time_last_ms} "
+                            f"local_update_ms={last_update}"
+                        )
 
                 if should_auto_reconcile_recovered:
                     self._schedule_auto_reconcile("ws_recovered")
@@ -715,6 +762,7 @@ class Exchange:
                     canceled_payload["cancel_all"] = True
                     schedule_order_state_event(self.persist_name, row_ticker, canceled_payload, event_source="rest_cancel_all")
                 self.order_status_cache = {}
+            schedule_absent_open_orders_cleanup(self.persist_name, normalized_ticker or "ALL", int(time.time() * 1000))
 
         schedule_cancel_all_result(self.persist_name, normalized_ticker, result, request_payload)
         self._update_rate_limit_state(result)
@@ -1260,6 +1308,14 @@ class Exchange:
                     "ws_drift_last_ms": self.hedge_state.get(ticker, {}).get("ws_drift_last_ms"),
                     "ws_drift_avg_ms": self.hedge_state.get(ticker, {}).get("ws_drift_avg_ms"),
                     "ws_last_update_ms": self.hedge_state.get(ticker, {}).get("ws_last_update_ms"),
+                    "ws_source_last": self.hedge_state.get(ticker, {}).get("ws_source_last"),
+                    "market_source_last": self.hedge_state.get(ticker, {}).get("market_source_last"),
+                    "stale_age_ms": self.hedge_state.get(ticker, {}).get("stale_age_ms"),
+                    "ws_server_time_last_ms": self.hedge_state.get(ticker, {}).get("ws_server_time_last_ms"),
+                    "ws_event_time_last_ms": self.hedge_state.get(ticker, {}).get("ws_event_time_last_ms"),
+                    "ws_desktop_time_last_ms": self.hedge_state.get(ticker, {}).get("ws_desktop_time_last_ms"),
+                    "event_lag_ms": self.hedge_state.get(ticker, {}).get("event_lag_ms"),
+                    "transport_lag_ms": self.hedge_state.get(ticker, {}).get("transport_lag_ms"),
                 }
                 for ticker in self.ticker_list
             },
@@ -1275,5 +1331,13 @@ class Exchange:
                 f"block_reasons={row['block_reasons']}, "
                 f"drift_last_ms={row['ws_drift_last_ms']}, "
                 f"drift_avg_ms={row['ws_drift_avg_ms']}, "
-                f"ws_last_update_ms={row['ws_last_update_ms']}"
+                f"ws_last_update_ms={row['ws_last_update_ms']}, "
+                f"stale_age_ms={row.get('stale_age_ms')}, "
+                f"ws_source={row.get('ws_source_last')}, "
+                f"market_source={row.get('market_source_last')}, "
+                f"event_lag_ms={row.get('event_lag_ms')}, "
+                f"transport_lag_ms={row.get('transport_lag_ms')}, "
+                f"event_time_ms={row.get('ws_event_time_last_ms')}, "
+                f"server_time_ms={row.get('ws_server_time_last_ms')}, "
+                f"desktop_time_ms={row.get('ws_desktop_time_last_ms')}"
             )

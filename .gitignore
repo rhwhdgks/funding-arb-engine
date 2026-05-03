@@ -8,6 +8,8 @@ __pycache__/
 test_server/.env
 
 logs/
+/runtime/
+/test_server/runtime/
 
 .vscode/
 .pytest_cache/

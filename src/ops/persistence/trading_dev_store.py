@@ -3,6 +3,27 @@ from __future__ import annotations
 from typing import Any
 
 
+OPEN_ORDER_STATUSES = {
+    "ACKNOWLEDGED",
+    "LIVE",
+    "NEW",
+    "OPEN",
+    "PARTIALLY_FILLED",
+    "SUBMITTED",
+    "UPDATED",
+}
+TERMINAL_ORDER_STATUSES = {
+    "CANCELED",
+    "CANCELLED",
+    "EXPIRED",
+    "FAILED",
+    "FILLED",
+    "MISSING",
+    "NOT_EXIST",
+    "REJECTED",
+}
+
+
 def upsert_trade_history_rows(conn, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
@@ -92,7 +113,12 @@ def upsert_order_history_rows(conn, rows: list[dict[str, Any]]) -> int:
         qty = IF(VALUES(qty) > 0, VALUES(qty), qty),
         executed_qty = GREATEST(executed_qty, VALUES(executed_qty)),
         avg_price = COALESCE(VALUES(avg_price), avg_price),
-        status = VALUES(status),
+        status = IF(
+            UPPER(COALESCE(status, '')) IN ('CANCELED', 'CANCELLED', 'EXPIRED', 'FAILED', 'FILLED', 'MISSING', 'NOT_EXIST', 'REJECTED')
+            AND UPPER(COALESCE(VALUES(status), '')) IN ('ACKNOWLEDGED', 'LIVE', 'NEW', 'OPEN', 'PARTIALLY_FILLED', 'SUBMITTED', 'UPDATED'),
+            status,
+            VALUES(status)
+        ),
         order_start = LEAST(order_start, VALUES(order_start)),
         order_end = GREATEST(order_end, VALUES(order_end)),
         desktop_time_ms = VALUES(desktop_time_ms),
@@ -132,6 +158,52 @@ def upsert_order_history_rows(conn, rows: list[dict[str, Any]]) -> int:
     finally:
         cur.close()
     return len(values)
+
+
+def mark_absent_open_order_rows(
+    conn,
+    *,
+    exchange_name: str,
+    symbol: str | None = None,
+    event_time_ms: int | None = None,
+    terminal_status: str = "NOT_EXIST",
+) -> int:
+    timestamp_ms = int(event_time_ms or 0)
+    if timestamp_ms <= 0:
+        import time
+
+        timestamp_ms = int(time.time() * 1000)
+
+    normalized_symbol = str(symbol or "").upper()
+    terminal_status = str(terminal_status or "NOT_EXIST").upper()
+    open_statuses = tuple(sorted(OPEN_ORDER_STATUSES))
+    placeholders = ", ".join("?" for _ in open_statuses)
+    params: list[Any] = [terminal_status, timestamp_ms, timestamp_ms, exchange_name, *open_statuses]
+    symbol_filter = ""
+    if normalized_symbol and normalized_symbol != "ALL":
+        symbol_filter = " AND symbol = ?"
+        params.append(normalized_symbol)
+
+    sql = f"""
+    UPDATE order_history
+    SET
+        status = ?,
+        order_end = GREATEST(order_end, ?),
+        desktop_time_ms = ?,
+        raw_json = COALESCE(raw_json, '{{}}')
+    WHERE exchange_name = ?
+      AND UPPER(status) IN ({placeholders})
+      {symbol_filter}
+    """
+
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, params)
+        affected = cur.rowcount
+        conn.commit()
+    finally:
+        cur.close()
+    return int(affected or 0)
 
 
 def upsert_balance_snapshot_rows(conn, rows: list[dict[str, Any]]) -> int:

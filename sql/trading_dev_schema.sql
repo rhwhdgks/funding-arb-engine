@@ -154,3 +154,40 @@ CREATE TABLE IF NOT EXISTS fx (
     rate DECIMAL(18, 6) NOT NULL,
     PRIMARY KEY (bucket_start_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE IF NOT EXISTS cashflow_ledger (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    movement_key VARCHAR(128) NOT NULL,
+
+    flow_type VARCHAR(32) NOT NULL,
+    status VARCHAR(16) NOT NULL,
+    reconcile_status VARCHAR(16) NOT NULL DEFAULT 'pending',
+
+    asset_code VARCHAR(16) NOT NULL,
+    amount DECIMAL(28, 12) NOT NULL,
+    fee_amount DECIMAL(28, 12) NULL,
+
+    exchange_name VARCHAR(32) NULL,
+    from_exchange_name VARCHAR(32) NULL,
+    to_exchange_name VARCHAR(32) NULL,
+
+    channel VARCHAR(16) NOT NULL,
+    network VARCHAR(32) NULL,
+    txid VARCHAR(255) NULL,
+
+    event_time_ms BIGINT UNSIGNED NOT NULL,
+    memo VARCHAR(255) NULL,
+    raw_json LONGTEXT NULL,
+
+    created_at_ms BIGINT UNSIGNED NOT NULL,
+    updated_at_ms BIGINT UNSIGNED NOT NULL,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_cashflow_movement_key (movement_key),
+    KEY idx_cashflow_event_time (event_time_ms),
+    KEY idx_cashflow_exchange_time (exchange_name, event_time_ms),
+    KEY idx_cashflow_from_to_time (from_exchange_name, to_exchange_name, event_time_ms),
+    KEY idx_cashflow_asset_time (asset_code, event_time_ms),
+    KEY idx_cashflow_status (status, reconcile_status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

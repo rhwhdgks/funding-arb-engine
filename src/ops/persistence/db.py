@@ -1133,3 +1133,282 @@ def fetch_pair_ledger_rows(
         return rows
     finally:
         cur.close()
+
+
+def insert_cashflow_row(conn, row: dict[str, Any]) -> int:
+    sql = """
+    INSERT INTO cashflow_ledger (
+        movement_key, flow_type, status, reconcile_status,
+        asset_code, amount, fee_amount,
+        exchange_name, from_exchange_name, to_exchange_name,
+        channel, network, txid,
+        event_time_ms, memo, raw_json,
+        created_at_ms, updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    now_ms = current_utc_ms()
+    values = (
+        _string_or_none(row.get("movement_key")),
+        _string_or_none(row.get("flow_type")),
+        _string_or_none(row.get("status")),
+        _string_or_none(row.get("reconcile_status")) or "pending",
+        (_string_or_none(row.get("asset_code")) or "").upper(),
+        abs(_safe_float(row.get("amount")) or 0.0),
+        _safe_float(row.get("fee_amount")),
+        _string_or_none(row.get("exchange_name")),
+        _string_or_none(row.get("from_exchange_name")),
+        _string_or_none(row.get("to_exchange_name")),
+        _string_or_none(row.get("channel")),
+        _string_or_none(row.get("network")),
+        _string_or_none(row.get("txid")),
+        _safe_int(row.get("event_time_ms")) or now_ms,
+        _string_or_none(row.get("memo")),
+        json_dumps(row.get("raw_json") if row.get("raw_json") is not None else row),
+        _safe_int(row.get("created_at_ms")) or now_ms,
+        _safe_int(row.get("updated_at_ms")) or now_ms,
+    )
+
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, values)
+        conn.commit()
+        return 1
+    finally:
+        cur.close()
+
+
+def _cashflow_row_from_cursor(cur, raw_row: tuple[Any, ...]) -> dict[str, Any]:
+    columns = [desc[0] for desc in cur.description]
+    row = dict(zip(columns, raw_row))
+    row["raw"] = json_loads_or_none(row.get("raw_json"))
+    return row
+
+
+def fetch_cashflow_row_by_movement_key(conn, movement_key: str) -> dict[str, Any] | None:
+    sql = """
+    SELECT
+        id, movement_key, flow_type, status, reconcile_status,
+        asset_code, amount, fee_amount,
+        exchange_name, from_exchange_name, to_exchange_name,
+        channel, network, txid,
+        event_time_ms, memo, raw_json,
+        created_at_ms, updated_at_ms
+    FROM cashflow_ledger
+    WHERE movement_key = ?
+    LIMIT 1
+    """
+
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, (movement_key,))
+        raw_row = cur.fetchone()
+        if raw_row is None:
+            return None
+        return _cashflow_row_from_cursor(cur, raw_row)
+    finally:
+        cur.close()
+
+
+def fetch_cashflow_row_by_id(conn, row_id: int) -> dict[str, Any] | None:
+    sql = """
+    SELECT
+        id, movement_key, flow_type, status, reconcile_status,
+        asset_code, amount, fee_amount,
+        exchange_name, from_exchange_name, to_exchange_name,
+        channel, network, txid,
+        event_time_ms, memo, raw_json,
+        created_at_ms, updated_at_ms
+    FROM cashflow_ledger
+    WHERE id = ?
+    LIMIT 1
+    """
+
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, (int(row_id),))
+        raw_row = cur.fetchone()
+        if raw_row is None:
+            return None
+        return _cashflow_row_from_cursor(cur, raw_row)
+    finally:
+        cur.close()
+
+
+def fetch_cashflow_rows(
+    conn,
+    *,
+    limit: int = 100,
+    flow_type: str | None = None,
+    status: str | None = None,
+    reconcile_status: str | None = None,
+    channel: str | None = None,
+    asset_code: str | None = None,
+    exchange_name: str | None = None,
+    start_time_ms: int | None = None,
+    end_time_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    sql = """
+    SELECT
+        id, movement_key, flow_type, status, reconcile_status,
+        asset_code, amount, fee_amount,
+        exchange_name, from_exchange_name, to_exchange_name,
+        channel, network, txid,
+        event_time_ms, memo, raw_json,
+        created_at_ms, updated_at_ms
+    FROM cashflow_ledger
+    WHERE (? IS NULL OR flow_type = ?)
+      AND (? IS NULL OR status = ?)
+      AND (? IS NULL OR reconcile_status = ?)
+      AND (? IS NULL OR channel = ?)
+      AND (? IS NULL OR asset_code = ?)
+      AND (? IS NULL OR exchange_name = ? OR from_exchange_name = ? OR to_exchange_name = ?)
+      AND (? IS NULL OR event_time_ms >= ?)
+      AND (? IS NULL OR event_time_ms <= ?)
+    ORDER BY event_time_ms DESC, id DESC
+    LIMIT ?
+    """
+
+    cur = conn.cursor()
+    try:
+        normalized_asset = (_string_or_none(asset_code) or "").upper() or None
+        normalized_exchange = _string_or_none(exchange_name)
+        cur.execute(
+            sql,
+            (
+                _string_or_none(flow_type),
+                _string_or_none(flow_type),
+                _string_or_none(status),
+                _string_or_none(status),
+                _string_or_none(reconcile_status),
+                _string_or_none(reconcile_status),
+                _string_or_none(channel),
+                _string_or_none(channel),
+                normalized_asset,
+                normalized_asset,
+                normalized_exchange,
+                normalized_exchange,
+                normalized_exchange,
+                normalized_exchange,
+                _safe_int(start_time_ms),
+                _safe_int(start_time_ms),
+                _safe_int(end_time_ms),
+                _safe_int(end_time_ms),
+                int(limit),
+            ),
+        )
+        return [_cashflow_row_from_cursor(cur, raw_row) for raw_row in cur.fetchall()]
+    finally:
+        cur.close()
+
+
+def update_cashflow_status(
+    conn,
+    *,
+    movement_key: str | None = None,
+    row_id: int | None = None,
+    status: str,
+) -> int:
+    if movement_key is None and row_id is None:
+        raise ValueError("movement_key or row_id is required")
+
+    sql = """
+    UPDATE cashflow_ledger
+    SET status = ?,
+        updated_at_ms = ?
+    WHERE (? IS NULL OR movement_key = ?)
+      AND (? IS NULL OR id = ?)
+    """
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            sql,
+            (
+                status,
+                current_utc_ms(),
+                _string_or_none(movement_key),
+                _string_or_none(movement_key),
+                _safe_int(row_id),
+                _safe_int(row_id),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        cur.close()
+
+
+def mark_cashflow_reconcile_result(
+    conn,
+    *,
+    movement_key: str | None = None,
+    row_id: int | None = None,
+    reconcile_status: str,
+) -> int:
+    if movement_key is None and row_id is None:
+        raise ValueError("movement_key or row_id is required")
+
+    sql = """
+    UPDATE cashflow_ledger
+    SET reconcile_status = ?,
+        updated_at_ms = ?
+    WHERE (? IS NULL OR movement_key = ?)
+      AND (? IS NULL OR id = ?)
+    """
+
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            sql,
+            (
+                reconcile_status,
+                current_utc_ms(),
+                _string_or_none(movement_key),
+                _string_or_none(movement_key),
+                _safe_int(row_id),
+                _safe_int(row_id),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        cur.close()
+
+
+def fetch_balance_snapshot_before_after(
+    conn,
+    *,
+    exchange_name: str,
+    event_time_ms: int,
+) -> dict[str, dict[str, Any] | None]:
+    base_sql = """
+    SELECT
+        exchange_name, bucket_start_ms, desktop_time_ms, server_time_ms,
+        cash_usdt, available_cash_usdt, locked_cash_usdt, total_equity_usdt, unrealized_pnl_usdt,
+        raw_json
+    FROM balance_snapshot
+    WHERE exchange_name = ?
+      AND desktop_time_ms {operator} ?
+    ORDER BY desktop_time_ms {direction}, bucket_start_ms {direction}
+    LIMIT 1
+    """
+
+    def _fetch(operator: str, direction: str) -> dict[str, Any] | None:
+        cur = conn.cursor()
+        try:
+            cur.execute(base_sql.format(operator=operator, direction=direction), (exchange_name, int(event_time_ms)))
+            raw_row = cur.fetchone()
+            if raw_row is None:
+                return None
+            columns = [desc[0] for desc in cur.description]
+            row = dict(zip(columns, raw_row))
+            row["raw"] = json_loads_or_none(row.get("raw_json"))
+            return row
+        finally:
+            cur.close()
+
+    return {
+        "before": _fetch("<=", "DESC"),
+        "after": _fetch(">=", "ASC"),
+    }

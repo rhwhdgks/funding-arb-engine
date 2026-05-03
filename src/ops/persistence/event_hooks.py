@@ -6,7 +6,7 @@ from typing import Any
 
 from .db import get_db_connection
 from .trading_dev_normalizers import build_order_history_row, build_trade_history_rows
-from .trading_dev_store import upsert_order_history_rows, upsert_trade_history_rows
+from .trading_dev_store import mark_absent_open_order_rows, upsert_order_history_rows, upsert_trade_history_rows
 
 
 def _env_flag(key: str, default: str = "1") -> bool:
@@ -141,6 +141,32 @@ def _store_order_history_sync(exchange_name: str, symbol: str, event_type: str, 
                 pass
 
 
+def _cleanup_absent_open_orders_sync(exchange_name: str, symbol: str, event_time_ms: int | None = None) -> None:
+    if not _event_enabled():
+        return
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        affected = mark_absent_open_order_rows(
+            conn,
+            exchange_name=exchange_name,
+            symbol=symbol,
+            event_time_ms=event_time_ms,
+            terminal_status="NOT_EXIST",
+        )
+        if affected:
+            print(f"[order-history] marked_absent_open_orders exchange={exchange_name} symbol={symbol} rows={affected}")
+    except Exception as exc:
+        print(f"[order-history] absent-open cleanup skip exchange={exchange_name} symbol={symbol}: {exc}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def schedule_trade_history_upsert(exchange_name: str, symbol: str, trades: list[dict[str, Any]] | None) -> int:
     normalized_symbol = str(symbol or "").upper()
     normalized_trades = [dict(trade) for trade in (trades or []) if isinstance(trade, dict)]
@@ -149,6 +175,11 @@ def schedule_trade_history_upsert(exchange_name: str, symbol: str, trades: list[
 
     _run_background(_store_trade_history_sync, exchange_name, normalized_symbol, normalized_trades)
     return len(normalized_trades)
+
+
+def schedule_absent_open_orders_cleanup(exchange_name: str, symbol: str | None = None, event_time_ms: int | None = None) -> None:
+    normalized_symbol = str(symbol or "ALL").upper()
+    _run_background(_cleanup_absent_open_orders_sync, exchange_name, normalized_symbol, event_time_ms)
 
 
 def schedule_matched_trade_history_upsert(

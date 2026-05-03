@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import os
+import random
 import socket
 import time
 from datetime import datetime, timezone
@@ -170,6 +172,41 @@ def create_signature(
     return base64.b64encode(digest).decode()
 
 
+_TRANSIENT_BUSY_CODES = {"50013", "50001"}
+_TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+
+
+def _transient_retry_max() -> int:
+    try:
+        return max(0, int(os.getenv("OKX_TRANSIENT_RETRY_MAX", "4")))
+    except Exception:
+        return 4
+
+
+def _transient_backoff_base_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("OKX_TRANSIENT_BACKOFF_BASE_SEC", "0.25")))
+    except Exception:
+        return 0.25
+
+
+def _transient_backoff_jitter() -> float:
+    try:
+        return max(0.0, float(os.getenv("OKX_TRANSIENT_BACKOFF_JITTER", "0.2")))
+    except Exception:
+        return 0.2
+
+
+def _classify_okx_transient(status: int, data: Any) -> str | None:
+    if status in _TRANSIENT_HTTP_STATUSES:
+        return f"http_{status}"
+    if isinstance(data, dict):
+        code = str(data.get("code") or "")
+        if code in _TRANSIENT_BUSY_CODES:
+            return f"code_{code}"
+    return None
+
+
 async def _request(
     method: str,
     path: str,
@@ -186,30 +223,76 @@ async def _request(
 
     body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
 
-    headers = {"Content-Type": "application/json"}
-    if SIMULATED_TRADING in {"1", "true", "TRUE"}:
-        headers["x-simulated-trading"] = "1"
+    retry_max = _transient_retry_max()
+    backoff_base = _transient_backoff_base_sec()
+    backoff_jitter = _transient_backoff_jitter()
 
-    if auth:
-        timestamp = _okx_timestamp()
-        headers.update(
-            {
-                "OK-ACCESS-KEY": OKX_API_KEY or "",
-                "OK-ACCESS-SIGN": create_signature(timestamp, method, request_path, body),
-                "OK-ACCESS-TIMESTAMP": timestamp,
-                "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE or "",
-            }
+    status = 0
+    data: Any = None
+    headers_out: dict[str, str] = {}
+
+    for attempt in range(retry_max + 1):
+        is_last = attempt >= retry_max
+
+        headers = {"Content-Type": "application/json"}
+        if SIMULATED_TRADING in {"1", "true", "TRUE"}:
+            headers["x-simulated-trading"] = "1"
+
+        if auth:
+            timestamp = _okx_timestamp()
+            headers.update(
+                {
+                    "OK-ACCESS-KEY": OKX_API_KEY or "",
+                    "OK-ACCESS-SIGN": create_signature(timestamp, method, request_path, body),
+                    "OK-ACCESS-TIMESTAMP": timestamp,
+                    "OK-ACCESS-PASSPHRASE": OKX_PASSPHRASE or "",
+                }
+            )
+
+        timeout_obj = aiohttp.ClientTimeout(total=timeout)
+        connector = aiohttp.TCPConnector(family=socket.AF_INET) if OKX_FORCE_IPV4 else None
+
+        transient_reason: str | None = None
+        try:
+            async with aiohttp.ClientSession(timeout=timeout_obj, connector=connector) as session:
+                async with session.request(method.upper(), url, headers=headers, data=body or None) as response:
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception:
+                        data = await response.text()
+                    status = response.status
+                    headers_out = dict(response.headers)
+            transient_reason = _classify_okx_transient(status, data)
+        except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as exc:
+            if is_last:
+                raise
+            transient_reason = f"exc:{type(exc).__name__}"
+
+        if transient_reason is None:
+            return status, data, headers_out
+
+        if is_last:
+            _log_throttled(
+                f"okx_request_retry_exhausted:{path}",
+                f"[okx][_request][retry_exhausted] path={path} reason={transient_reason} "
+                f"attempts={attempt + 1}",
+                cooldown_sec=5.0,
+            )
+            return status, data, headers_out
+
+        backoff = backoff_base * (2 ** attempt)
+        if backoff_jitter > 0:
+            backoff *= 1.0 + random.uniform(-backoff_jitter, backoff_jitter)
+        backoff = max(0.0, backoff)
+        _log_throttled(
+            f"okx_request_retry:{path}",
+            f"[okx][_request][retry] path={path} reason={transient_reason} "
+            f"attempt={attempt + 1}/{retry_max + 1} backoff={backoff:.2f}s",
+            cooldown_sec=2.0,
         )
+        await asyncio.sleep(backoff)
 
-    timeout_obj = aiohttp.ClientTimeout(total=timeout)
-    connector = aiohttp.TCPConnector(family=socket.AF_INET) if OKX_FORCE_IPV4 else None
-    async with aiohttp.ClientSession(timeout=timeout_obj, connector=connector) as session:
-        async with session.request(method.upper(), url, headers=headers, data=body or None) as response:
-            try:
-                data = await response.json(content_type=None)
-            except Exception:
-                data = await response.text()
-            return response.status, data, dict(response.headers)
+    return status, data, headers_out
 
 
 async def get_server_time() -> int | None:
@@ -629,6 +712,37 @@ async def get_accounts(option: dict[str, Any] = {}) -> tuple[dict[str, Any] | No
     balance_rows = balance_data.get("data") or []
     balance_payload = balance_rows[0] if balance_rows else {}
     return process_account_data(position_data.get("data", []), balance_payload, info)
+
+
+async def get_margin_mode(symbol: str, expected_mode: str = "cross") -> dict[str, Any]:
+    inst_id = normalize_symbol(symbol)
+    normalized_mode = str(expected_mode or "cross").strip().lower()
+    if normalized_mode == "crossed":
+        normalized_mode = "cross"
+
+    status, data, _ = await _request(
+        "GET",
+        "/api/v5/account/leverage-info",
+        params={"instId": inst_id, "mgnMode": normalized_mode},
+        auth=True,
+    )
+    if status != 200 or not isinstance(data, dict) or data.get("code") != "0":
+        return {
+            "ok": False,
+            "symbol": symbol_to_code(inst_id),
+            "margin_mode": None,
+            "error": data,
+        }
+
+    rows = data.get("data") or []
+    row = rows[0] if rows else {}
+    raw_mode = row.get("mgnMode") or normalized_mode
+    return {
+        "ok": bool(raw_mode),
+        "symbol": symbol_to_code(inst_id),
+        "margin_mode": raw_mode,
+        "error": "" if raw_mode else "margin_mode_missing",
+    }
 
 
 async def post_limit_order(symbol: str, side: str, amount: float, price: float, option: dict[str, Any] = {}) -> dict[str, Any]:

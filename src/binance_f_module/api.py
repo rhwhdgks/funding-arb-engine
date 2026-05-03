@@ -266,11 +266,16 @@ def _parse_symbol_info(symbol_row: dict[str, Any]) -> dict[str, Any]:
     if price_filter is None or lot_size_filter is None:
         raise ValueError(f"missing filter for symbol={symbol_row.get('symbol')}")
 
+    min_qty = _safe_float(lot_size_filter.get("minQty"))
+    max_qty = _safe_float(lot_size_filter.get("maxQty"))
+
     return {
         "symbol": symbol_to_code(symbol_row["symbol"]),
         "contract": symbol_row["symbol"],
-        "min_q": _safe_float(lot_size_filter.get("minQty")),
-        "max_q": _safe_float(lot_size_filter.get("maxQty")),
+        "min_q": min_qty,
+        "max_q": max_qty,
+        "min_qty": min_qty,
+        "max_qty": max_qty,
         "step_size": _safe_float(lot_size_filter.get("stepSize")),
         "tick_size": _safe_float(price_filter.get("tickSize")),
         "price_precision": int(symbol_row.get("pricePrecision", 8) or 8),
@@ -481,6 +486,36 @@ async def get_accounts(option: dict[str, Any] = {}) -> tuple[dict[str, Any], dic
     if status == 200:
         return process_account_data(data)
     return None, None
+
+
+async def get_margin_mode(symbol: str) -> dict[str, Any]:
+    normalized = normalize_symbol(symbol)
+    status, data, _ = await _request(
+        "GET",
+        "/fapi/v2/positionRisk",
+        params={"symbol": normalized},
+        signed=True,
+    )
+    if status != 200:
+        return {
+            "ok": False,
+            "symbol": symbol_to_code(normalized),
+            "margin_mode": None,
+            "error": data,
+        }
+
+    rows = data if isinstance(data, list) else [data]
+    row = next(
+        (item for item in rows if isinstance(item, dict) and item.get("positionSide") in (None, "", "BOTH")),
+        rows[0] if rows else {},
+    )
+    raw_mode = row.get("marginType") if isinstance(row, dict) else None
+    return {
+        "ok": bool(raw_mode),
+        "symbol": symbol_to_code(normalized),
+        "margin_mode": raw_mode,
+        "error": "" if raw_mode else "margin_mode_missing",
+    }
 
 
 async def post_limit_order(symbol: str, side: str, amount: float, price: float, option: dict[str, Any] = {}) -> dict[str, Any]:

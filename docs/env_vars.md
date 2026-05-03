@@ -57,6 +57,13 @@
 - `MARIADB_PASSWORD`
 - `MARIADB_DATABASE`
 
+## Notion direct API
+- `NOTION_TOKEN`
+- `NOTION_DATABASE_ID`
+- `NOTION_DISPLAY_DATABASE_ID`
+- `NOTION_INDEX_DATABASE_ID`
+- `NOTION_VERSION`
+
 ## DB sync script
 - `TARGET_EXCHANGE`
 - `TARGET_EXCHANGES`
@@ -132,6 +139,14 @@
 - `WEB_ACTION_TIMEOUT_SEC` limits how long the resident web runtime waits for one browser-triggered action
 - `WEB_SOAK_RECENT_LIMIT` controls how many recent JSONL soak rows the browser reads for the soak summary panel
 
+## Notion notes
+- `NOTION_TOKEN` is the internal integration token used for direct Notion REST API calls from local scripts
+- `NOTION_DATABASE_ID` can be either the raw database id or the full Notion database URL; the smoke script normalizes both forms
+- `NOTION_DISPLAY_DATABASE_ID` is the canonical human-facing operations context database
+- `NOTION_INDEX_DATABASE_ID` is the machine-facing source/index database
+- The target database must be explicitly shared with the Notion integration, otherwise API search/query returns zero accessible objects
+- `NOTION_VERSION` defaults to `2022-06-28`
+
 ## Root strategy.py
 - `STRATEGY_EXCHANGES`
 - `STRATEGY_ALLOWED_PAIRS`
@@ -144,6 +159,9 @@
 - `STRATEGY_FIRST_LEG_ROLE`
 - `STRATEGY_CLOSE_FIRST_LEG_ROLE`
 - `STRATEGY_FIRST_LEG_TIMEOUT_SEC`
+- `STRATEGY_ENTRY_ORDER_SETTLE_SEC`
+- `STRATEGY_ENTRY_ORDER_COOLDOWN_SEC`
+- `STRATEGY_SYMBOL_RECENT_CLOSE_COOLDOWN_SEC`
 - `STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC`
 - `STRATEGY_HEDGE_REQUOTE_COUNT`
 - `STRATEGY_ACTION_SETTLE_WAIT_SEC`
@@ -151,9 +169,13 @@
 - `STRATEGY_MIN_RECOMPUTE_INTERVAL_SEC`
 - `STRATEGY_AUTO_ENTER_ENABLED`
 - `STRATEGY_AUTO_ENTER_COOLDOWN_SEC`
+- `STRATEGY_ENTRY_CONTROL_FILE`
+- `STRATEGY_ENTRY_CONTROL_FAIL_CLOSED`
 - `STRATEGY_RENDER_INTERVAL_SEC`
 - `STRATEGY_RECOVERY_RETRY_COOLDOWN_SEC`
 - `STRATEGY_DANGER_LOG_COOLDOWN_SEC`
+- `STRATEGY_MICRO_RESIDUAL_INFO_NOTIONAL_USD`
+- `STRATEGY_MICRO_RESIDUAL_INFO_RATIO`
 - `STRATEGY_MIN_EXPECTED_NET_EDGE_USD`
 - `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS`
 - `STRATEGY_MIN_EFFECTIVE_FUNDING_USD`
@@ -187,10 +209,6 @@
 - `STRATEGY_MAKER_FEE_BPS_BINANCE`
 - `STRATEGY_MAKER_FEE_BPS_GATEIO`
 - `STRATEGY_MAKER_FEE_BPS_OKX`
-- `STRATEGY_ROUNDTRIP_CYCLES`
-- `STRATEGY_ROUNDTRIP_SCAN_TIMEOUT_SEC`
-- `STRATEGY_ROUNDTRIP_SLEEP_BETWEEN_SEC`
-- `STRATEGY_ROUNDTRIP_LOG_PATH`
 
 ## Strategy notes
 - `STRATEGY_SYMBOLS=ALL`이면 선택된 거래소들의 공통 지원 심볼 전체를 스캔합니다
@@ -198,16 +216,22 @@
 - `STRATEGY_ENABLE_LIVE=0`이 기본이며, 이때는 콘솔에서 `enter`나 `close`를 눌러도 paper 모드로만 동작합니다
 - `STRATEGY_AUTO_ENTER_ENABLED=1`이면 콘솔 입력 없이도 usable candidate를 자동 진입시킵니다. `STRATEGY_MAX_OPEN_PAIRS` 범위 안에서 심볼별로 동시에 여러 pair를 열 수 있습니다. 실전 전략 런에는 `STRATEGY_APPROVAL_MODE=auto`, `STRATEGY_ENABLE_LIVE=1`과 같이 써야 합니다
 - `STRATEGY_AUTO_ENTER_COOLDOWN_SEC`는 자동 진입 재시도 최소 간격입니다
+- `STRATEGY_ENTRY_CONTROL_FILE`은 신규 진입 pause/resume 제어 파일 경로입니다. 기본은 `runtime/entry_control.json`이며, 테스트 서버는 `test_server/runtime/entry_control.json`을 권장합니다
+- `STRATEGY_ENTRY_CONTROL_FAIL_CLOSED=1`이면 control 파일이 깨졌을 때 신규 진입을 안전하게 block합니다. close/recovery/shutdown에는 적용하지 않습니다
 - `STRATEGY_RENDER_INTERVAL_SEC`는 live/paper 전략 스캔 테이블 출력 최소 간격입니다. 기본 `30초`입니다
 - `STRATEGY_RECOVERY_RETRY_COOLDOWN_SEC`는 한쪽만 포지션이 남았을 때 recovery/emergency flatten 재시도 최소 간격입니다. 기본 `15초`입니다
 - `STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC`는 같은 pair에 대해 auto close를 다시 시도하는 최소 간격입니다. 기본 `15초`입니다
 - `STRATEGY_DANGER_LOG_COOLDOWN_SEC`는 direction mismatch 같은 경고 로그 반복 출력 최소 간격입니다. 기본 `10초`입니다
+- `STRATEGY_MICRO_RESIDUAL_INFO_NOTIONAL_USD`와 `STRATEGY_MICRO_RESIDUAL_INFO_RATIO`는 체결 단위 차이로 생긴 작은 잔량을 `danger`가 아니라 `info`로 분류하는 기준입니다. 기본은 `$50 이하`이면서 요청 수량 대비 `2% 이하`입니다
 - `STRATEGY_ACTION_ACCOUNT_FRESH_SEC`는 auto close / recovery 같은 적극적 액션을 허용하기 위해 양 거래소 계정 스냅샷이 이 시간 이내로 fresh해야 하는 기준입니다. 기본 `2.5초`입니다
 - `STRATEGY_SUPPORTED_SYMBOLS_CACHE_SEC`는 거래소 지원 심볼 목록 캐시 TTL입니다. 기본 `21600초(6시간)`이며, fresh fetch 실패 시 stale cache를 fallback으로 사용합니다
 - `BINANCE_TICKER_LIST_CACHE_SEC`, `GATEIO_TICKER_LIST_CACHE_SEC`, `OKX_TICKER_LIST_CACHE_SEC`는 거래소 모듈 내부 `get_ticker_list()` 캐시 TTL입니다. 기본 `21600초(6시간)`이며, runtime를 새로 띄워도 `exchangeInfo/instruments/contracts` 반복 호출을 줄입니다
 - `BINANCE_ACCOUNT_INTERVAL_SEC`, `GATEIO_ACCOUNT_INTERVAL_SEC`, `OKX_ACCOUNT_INTERVAL_SEC`는 계정 REST polling 주기입니다. 기본 `2.0초`로 낮춰 두었고, Binance는 `/fapi/v2/account` weight가 큰 편이라 더 짧게 줄이는 건 권장하지 않습니다
 - 기본 추천 조합은 `STRATEGY_ALLOWED_PAIRS=binance-okx`
 - 기본 진입은 `first_leg_timeout_sec=2.0`, `hedge_requote_timeout_sec=0.7`, `hedge_requote_count=2`
+- `STRATEGY_ENTRY_ORDER_SETTLE_SEC`는 first-leg 지정가 주문이 open order 목록에서 사라지거나 cancel 직후일 때, 재주문 전에 계정 포지션 델타를 확인하는 최소 settle window입니다. 기본 `1.2초`입니다
+- `STRATEGY_ENTRY_ORDER_COOLDOWN_SEC`는 같은 거래소/심볼/방향 first-leg 지정가 주문의 최소 제출 간격입니다. 기본 `1.0초`이며 hedge/close/emergency flatten에는 적용하지 않습니다
+- `STRATEGY_SYMBOL_RECENT_CLOSE_COOLDOWN_SEC`는 pair close 직후 같은 심볼 신규 진입을 잠깐 막는 시간입니다. 기본 `3.0초`이며, 양 거래소 포지션 flat + open order none이 fresh하게 확인되면 조기 해제됩니다
 - `STRATEGY_FIRST_LEG_ROLE=long`이면 long leg를 먼저 지정가로 넣고, 반대 short leg를 재호가 후 최종 시장가 hedge 합니다
 - `STRATEGY_CLOSE_FIRST_LEG_ROLE=short`이면 close 시 short leg를 먼저 줄이고, long leg를 재호가 후 최종 시장가 hedge 합니다
 - `STRATEGY_ENTRY_FEE_BPS_*`와 `STRATEGY_CLOSE_FEE_BPS_*`는 진입/청산 비용 가정을 따로 잡을 때 씁니다
@@ -227,8 +251,5 @@
 - `STRATEGY_FUNDING_ALIGNMENT_*`는 두 거래소 next funding 시각 차이에 대한 감점 강도입니다
 - `STRATEGY_FUNDING_TIME_DECAY_*`는 다음 funding까지 남은 시간이 멀수록 기대 funding을 줄여 보는 감점 강도입니다
 - `STRATEGY_ASSUMED_FLAT_GRACE_SEC`는 close 직후 resident snapshot 반영이 늦을 때, 거래소가 이미 flat이라고 응답한 leg를 잠깐 `assumed flat`으로 취급하는 grace window입니다
-- `scripts/runtime/strategy_roundtrip_soak.py`는 `STRATEGY_ROUNDTRIP_*` env를 사용해서 소액 live round-trip 반복 검증 결과를 JSONL로 남깁니다
-- `STRATEGY_ROUNDTRIP_SCAN_TIMEOUT_SEC`의 기본값은 wrapper 기준 `30초`입니다
 - `scripts/runtime/run_strategy_live.sh`는 roundtrip soak가 아니라 실제 전략처럼 `auto-enter + hold/auto-close`로 resident runtime을 돌리는 실행 래퍼입니다
-- `scripts/runtime/run_strategy_live.sh jsonl`은 live 이벤트 JSONL을 실시간으로 보고, `summary`는 현재 실행 시작 시각 이후 이벤트와 pair ledger 요약을 함께 집계합니다
-- `scripts/runtime/run_strategy_live.sh ledger`는 현재 실행 구간의 `pair_id`별 정산 요약을 별도로 보여주고, DB `pair_ledger` 테이블도 같이 upsert합니다
+- `scripts/runtime/run_strategy_live.sh jsonl`은 live 이벤트 JSONL을 실시간으로 보고, `summary`는 현재 실행 시작 시각 이후 이벤트를 집계합니다

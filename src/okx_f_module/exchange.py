@@ -14,12 +14,14 @@ from src.ops.persistence.event_hooks import (
     schedule_cancel_all_submit,
     schedule_cancel_result,
     schedule_cancel_submit,
+    schedule_absent_open_orders_cleanup,
     schedule_matched_trade_history_upsert,
     schedule_order_progress_from_trades,
     schedule_order_result,
     schedule_order_state_event,
     schedule_order_submit,
     schedule_polled_order_status,
+    schedule_trade_history_upsert,
 )
 
 from .api import (
@@ -28,6 +30,7 @@ from .api import (
     get_accounts,
     get_funding_rate,
     get_funding_rate_history,
+    get_margin_mode as api_get_margin_mode,
     get_my_trades,
     get_ohlcv_1m,
     get_open_orders,
@@ -333,6 +336,16 @@ class Exchange:
         funding_errors = list(funding_state.get("validation_errors", []) or [])
         funding_reason = ",".join(funding_errors) if funding_errors else ("ok" if funding_ready else funding_status)
 
+        ws_server_time_last_ms = raw_health.get("ws_server_time_last_ms")
+        ws_event_time_last_ms = raw_health.get("ws_event_time_last_ms")
+        ws_desktop_time_last_ms = raw_health.get("ws_desktop_time_last_ms")
+        event_lag_ms = None
+        transport_lag_ms = None
+        if ws_desktop_time_last_ms and ws_event_time_last_ms:
+            event_lag_ms = int(ws_desktop_time_last_ms) - int(ws_event_time_last_ms)
+        if ws_desktop_time_last_ms and ws_server_time_last_ms:
+            transport_lag_ms = int(ws_desktop_time_last_ms) - int(ws_server_time_last_ms)
+
         return {
             "market_ready": market_ready,
             "market_block_reasons": market_block_reasons,
@@ -345,9 +358,11 @@ class Exchange:
             "stale_age_ms": raw_health.get("stale_age_ms"),
             "ws_source_last": raw_health.get("ws_source_last"),
             "market_source_last": raw_health.get("market_source_last"),
-            "ws_server_time_last_ms": raw_health.get("ws_server_time_last_ms"),
-            "ws_event_time_last_ms": raw_health.get("ws_event_time_last_ms"),
-            "ws_desktop_time_last_ms": raw_health.get("ws_desktop_time_last_ms"),
+            "ws_server_time_last_ms": ws_server_time_last_ms,
+            "ws_event_time_last_ms": ws_event_time_last_ms,
+            "ws_desktop_time_last_ms": ws_desktop_time_last_ms,
+            "event_lag_ms": event_lag_ms,
+            "transport_lag_ms": transport_lag_ms,
             "account_ready": account_ready,
             "account_sync_ok": account_ready,
             "account_reason": account_reason,
@@ -444,6 +459,9 @@ class Exchange:
         if normalized_mode == "CROSSED":
             normalized_mode = "CROSS"
         return await set_leverage(symbol, leverage, normalized_mode.lower())
+
+    async def get_margin_mode(self, symbol: str, expected_mode: str | None = None) -> dict[str, Any]:
+        return await api_get_margin_mode(symbol, expected_mode or "cross")
 
     async def reconcile_state(
         self,
@@ -691,6 +709,15 @@ class Exchange:
                     stale_ms = now_ms - last_update if last_update else None
                     drift_ms = self.ws_drift_last_ms.get(ticker)
                     market_source = self.market_state.get(ticker, {}).get("source")
+                    ws_server_time_last_ms = self.ws_server_time_last_ms.get(ticker)
+                    ws_event_time_last_ms = self.ws_event_time_last_ms.get(ticker)
+                    ws_desktop_time_last_ms = self.ws_desktop_time_last_ms.get(ticker)
+                    event_lag_ms = None
+                    transport_lag_ms = None
+                    if ws_desktop_time_last_ms and ws_event_time_last_ms:
+                        event_lag_ms = int(ws_desktop_time_last_ms) - int(ws_event_time_last_ms)
+                    if ws_desktop_time_last_ms and ws_server_time_last_ms:
+                        transport_lag_ms = int(ws_desktop_time_last_ms) - int(ws_server_time_last_ms)
 
                     market_ready = True
                     reasons: list[str] = []
@@ -726,9 +753,11 @@ class Exchange:
                         "ws_source_last": self.ws_source_last.get(ticker),
                         "market_source_last": market_source,
                         "stale_age_ms": stale_ms,
-                        "ws_server_time_last_ms": self.ws_server_time_last_ms.get(ticker),
-                        "ws_event_time_last_ms": self.ws_event_time_last_ms.get(ticker),
-                        "ws_desktop_time_last_ms": self.ws_desktop_time_last_ms.get(ticker),
+                        "ws_server_time_last_ms": ws_server_time_last_ms,
+                        "ws_event_time_last_ms": ws_event_time_last_ms,
+                        "ws_desktop_time_last_ms": ws_desktop_time_last_ms,
+                        "event_lag_ms": event_lag_ms,
+                        "transport_lag_ms": transport_lag_ms,
                     }
 
                     has_ws_issue = any(reason in {"ws_not_ready", "stale_orderbook"} for reason in reasons)
@@ -749,8 +778,10 @@ class Exchange:
                             f"market_ready={market_ready} reasons={reasons or ['-']} "
                             f"market_source={market_source or '-'} ws_source={self.ws_source_last.get(ticker) or '-'} "
                             f"drift_ms={drift_ms} stale_age_ms={stale_ms} "
+                            f"event_lag_ms={event_lag_ms} transport_lag_ms={transport_lag_ms} "
                             f"event_time_ms={self.ws_event_time_last_ms.get(ticker)} "
                             f"server_time_ms={self.ws_server_time_last_ms.get(ticker)} "
+                            f"desktop_time_ms={self.ws_desktop_time_last_ms.get(ticker)} "
                             f"local_update_ms={last_update}"
                         )
 
@@ -990,6 +1021,7 @@ class Exchange:
                     canceled_payload["cancel_all"] = True
                     schedule_order_state_event(self.persist_name, row_ticker, canceled_payload, event_source="rest_cancel_all")
                 self.order_status_cache = {}
+            schedule_absent_open_orders_cleanup(self.persist_name, normalized_ticker or "ALL", int(time.time() * 1000))
 
         schedule_cancel_all_result(self.persist_name, normalized_ticker, result, request_payload)
         return result
@@ -1168,6 +1200,7 @@ class Exchange:
             for attempt in range(retry_count):
                 trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
                 last_trades = [trade for trade in (trades or []) if isinstance(trade, dict)]
+                matched_trades = self._matched_trades_for_order_payload(order_payload, last_trades)
                 matched_count = schedule_matched_trade_history_upsert(
                     self.persist_name,
                     ticker,
@@ -1175,6 +1208,19 @@ class Exchange:
                     last_trades,
                 )
                 if matched_count > 0:
+                    order_executed_qty = self._order_status_executed_qty(order_payload)
+                    matched_qty = self._matched_trade_qty(matched_trades)
+                    if order_executed_qty <= 1e-12 or matched_qty + 1e-9 >= order_executed_qty:
+                        return
+                    if attempt + 1 < retry_count:
+                        if retry_delay_sec > 0:
+                            await asyncio.sleep(retry_delay_sec)
+                        continue
+                    print(
+                        f"[{self.name}][trade_history_sync][warn] fills partial gap unresolved "
+                        f"ticker={ticker} matched_qty={matched_qty} executed_qty={order_executed_qty} "
+                        f"attempts={retry_count}"
+                    )
                     return
                 if attempt + 1 < retry_count and retry_delay_sec > 0:
                     await asyncio.sleep(retry_delay_sec)
@@ -1390,7 +1436,7 @@ class Exchange:
         identifiers: list[str] = []
         if not isinstance(order, dict):
             return identifiers
-        for key in ("order_id", "uuid", "client_order_id", "identifier"):
+        for key in ("order_id", "uuid", "client_order_id", "order_uid", "identifier"):
             value = order.get(key)
             if value in (None, ""):
                 continue
@@ -1398,6 +1444,75 @@ class Exchange:
             if normalized not in identifiers:
                 identifiers.append(normalized)
         return identifiers
+
+    def _matched_trades_for_order_payload(
+        self,
+        order_payload: dict | None,
+        trades: list[dict] | None,
+    ) -> list[dict]:
+        order_refs = set(self._order_identifiers(order_payload))
+        if not order_refs:
+            return []
+        matched: list[dict] = []
+        for trade in trades or []:
+            if not isinstance(trade, dict):
+                continue
+            trade_refs = set(self._order_identifiers(trade))
+            if order_refs & trade_refs:
+                matched.append(trade)
+        return matched
+
+    def _matched_trade_qty(self, trades: list[dict] | None) -> float:
+        total = 0.0
+        seen: set[str] = set()
+        for trade in trades or []:
+            if not isinstance(trade, dict):
+                continue
+            trade_key = str(
+                trade.get("trade_id")
+                or trade.get("uuid")
+                or trade.get("identifier")
+                or f"{trade.get('order_id')}:{trade.get('timestamp')}:{trade.get('qty')}"
+            )
+            if trade_key in seen:
+                continue
+            seen.add(trade_key)
+            total += max(self._first_float(trade.get("qty")), 0.0)
+        return total
+
+    def _order_status_executed_qty(self, order_payload: dict | None) -> float:
+        if not isinstance(order_payload, dict):
+            return 0.0
+        executed_qty = self._first_float(
+            order_payload.get("executed_qty"),
+            order_payload.get("filled_qty"),
+            order_payload.get("filled"),
+        )
+        order_qty = self._first_float(order_payload.get("qty"), order_payload.get("amount"))
+        left_qty = self._first_float(order_payload.get("left_qty"), order_payload.get("remaining"), default=-1.0)
+        if executed_qty <= 1e-12 and order_qty > 1e-12 and 0 <= left_qty < order_qty:
+            executed_qty = max(order_qty - left_qty, 0.0)
+        return max(executed_qty, 0.0)
+
+    def _first_float(self, *values: Any, default: float = 0.0) -> float:
+        for value in values:
+            try:
+                if value in (None, ""):
+                    continue
+                return float(value)
+            except Exception:
+                continue
+        return default
+
+    def _first_int(self, *values: Any, default: int = 0) -> int:
+        for value in values:
+            try:
+                if value in (None, ""):
+                    continue
+                return int(float(value))
+            except Exception:
+                continue
+        return default
 
     def _get_cached_order_status(self, order: dict) -> dict:
         for identifier in self._order_identifiers(order):

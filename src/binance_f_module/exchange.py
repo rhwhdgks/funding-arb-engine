@@ -14,6 +14,7 @@ from src.ops.persistence.event_hooks import (
     schedule_cancel_all_submit,
     schedule_cancel_result,
     schedule_cancel_submit,
+    schedule_absent_open_orders_cleanup,
     schedule_matched_trade_history_upsert,
     schedule_order_progress_from_trades,
     schedule_order_result,
@@ -32,6 +33,7 @@ from .api import (
     get_funding_rate,
     get_funding_rate_history,
     get_ohlcv_1m,
+    get_margin_mode as api_get_margin_mode,
     set_leverage,
     set_margin_mode,
     sync_server_time,
@@ -326,6 +328,16 @@ class Exchange:
         funding_errors = list(funding_state.get("validation_errors", []) or [])
         funding_reason = ",".join(funding_errors) if funding_errors else ("ok" if funding_ready else funding_status)
 
+        ws_server_time_last_ms = raw_health.get("ws_server_time_last_ms")
+        ws_event_time_last_ms = raw_health.get("ws_event_time_last_ms")
+        ws_desktop_time_last_ms = raw_health.get("ws_desktop_time_last_ms")
+        event_lag_ms = None
+        transport_lag_ms = None
+        if ws_desktop_time_last_ms and ws_event_time_last_ms:
+            event_lag_ms = int(ws_desktop_time_last_ms) - int(ws_event_time_last_ms)
+        if ws_desktop_time_last_ms and ws_server_time_last_ms:
+            transport_lag_ms = int(ws_desktop_time_last_ms) - int(ws_server_time_last_ms)
+
         return {
             "market_ready": market_ready,
             "market_block_reasons": market_block_reasons,
@@ -338,9 +350,11 @@ class Exchange:
             "stale_age_ms": raw_health.get("stale_age_ms"),
             "ws_source_last": raw_health.get("ws_source_last"),
             "market_source_last": raw_health.get("market_source_last"),
-            "ws_server_time_last_ms": raw_health.get("ws_server_time_last_ms"),
-            "ws_event_time_last_ms": raw_health.get("ws_event_time_last_ms"),
-            "ws_desktop_time_last_ms": raw_health.get("ws_desktop_time_last_ms"),
+            "ws_server_time_last_ms": ws_server_time_last_ms,
+            "ws_event_time_last_ms": ws_event_time_last_ms,
+            "ws_desktop_time_last_ms": ws_desktop_time_last_ms,
+            "event_lag_ms": event_lag_ms,
+            "transport_lag_ms": transport_lag_ms,
             "account_ready": account_ready,
             "account_sync_ok": account_ready,
             "account_reason": account_reason,
@@ -438,6 +452,9 @@ class Exchange:
         if margin_mode is not None:
             result["margin_mode"] = await set_margin_mode(symbol, margin_mode)
         return result
+
+    async def get_margin_mode(self, symbol: str, expected_mode: str | None = None) -> dict[str, Any]:
+        return await api_get_margin_mode(symbol)
 
     async def reconcile_state(
         self,
@@ -732,6 +749,15 @@ class Exchange:
                     stale_ms = now_ms - last_update if last_update else None
                     drift_ms = self.ws_drift_last_ms.get(ticker)
                     market_source = self.market_state.get(ticker, {}).get("source")
+                    ws_server_time_last_ms = self.ws_server_time_last_ms.get(ticker)
+                    ws_event_time_last_ms = self.ws_event_time_last_ms.get(ticker)
+                    ws_desktop_time_last_ms = self.ws_desktop_time_last_ms.get(ticker)
+                    event_lag_ms = None
+                    transport_lag_ms = None
+                    if ws_desktop_time_last_ms and ws_event_time_last_ms:
+                        event_lag_ms = int(ws_desktop_time_last_ms) - int(ws_event_time_last_ms)
+                    if ws_desktop_time_last_ms and ws_server_time_last_ms:
+                        transport_lag_ms = int(ws_desktop_time_last_ms) - int(ws_server_time_last_ms)
 
                     market_ready = True
                     reasons: list[str] = []
@@ -766,9 +792,11 @@ class Exchange:
                         "ws_source_last": self.ws_source_last.get(ticker),
                         "market_source_last": market_source,
                         "stale_age_ms": stale_ms,
-                        "ws_server_time_last_ms": self.ws_server_time_last_ms.get(ticker),
-                        "ws_event_time_last_ms": self.ws_event_time_last_ms.get(ticker),
-                        "ws_desktop_time_last_ms": self.ws_desktop_time_last_ms.get(ticker),
+                        "ws_server_time_last_ms": ws_server_time_last_ms,
+                        "ws_event_time_last_ms": ws_event_time_last_ms,
+                        "ws_desktop_time_last_ms": ws_desktop_time_last_ms,
+                        "event_lag_ms": event_lag_ms,
+                        "transport_lag_ms": transport_lag_ms,
                     }
 
                     has_ws_issue = any(reason in {"ws_not_ready", "stale_orderbook"} for reason in reasons)
@@ -789,8 +817,10 @@ class Exchange:
                             f"market_ready={market_ready} reasons={reasons or ['-']} "
                             f"market_source={market_source or '-'} ws_source={self.ws_source_last.get(ticker) or '-'} "
                             f"drift_ms={drift_ms} stale_age_ms={stale_ms} "
+                            f"event_lag_ms={event_lag_ms} transport_lag_ms={transport_lag_ms} "
                             f"event_time_ms={self.ws_event_time_last_ms.get(ticker)} "
                             f"server_time_ms={self.ws_server_time_last_ms.get(ticker)} "
+                            f"desktop_time_ms={self.ws_desktop_time_last_ms.get(ticker)} "
                             f"local_update_ms={last_update}"
                         )
 
@@ -1031,6 +1061,7 @@ class Exchange:
                     canceled_payload["cancel_all"] = True
                     schedule_order_state_event(self.persist_name, row_ticker, canceled_payload, event_source="rest_cancel_all")
                 self.order_status_cache = {}
+            schedule_absent_open_orders_cleanup(self.persist_name, normalized_ticker or "ALL", int(time.time() * 1000))
 
         schedule_cancel_all_result(self.persist_name, normalized_ticker, result, request_payload)
         self._update_rate_limit_state(result)

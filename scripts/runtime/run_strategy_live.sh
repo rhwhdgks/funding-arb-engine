@@ -5,11 +5,43 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 STRATEGY_ENV_FILE="${STRATEGY_ENV_FILE:-$PROJECT_ROOT/.env}"
+STRATEGY_RUN_DURATION_OVERRIDE="${STRATEGY_RUN_DURATION:-}"
+
+trim_env_part() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+load_env_file() {
+  local env_file="$1"
+  local line key value
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" == *"="* ]] || continue
+
+    key="$(trim_env_part "${line%%=*}")"
+    value="$(trim_env_part "${line#*=}")"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    export "$key=$value"
+  done < "$env_file"
+}
+
 if [[ -f "$STRATEGY_ENV_FILE" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$STRATEGY_ENV_FILE"
-  set +a
+  load_env_file "$STRATEGY_ENV_FILE"
+fi
+
+if [[ -n "$STRATEGY_RUN_DURATION_OVERRIDE" ]]; then
+  export STRATEGY_RUN_DURATION="$STRATEGY_RUN_DURATION_OVERRIDE"
 fi
 
 STRATEGY_SCRIPT_PATH="${STRATEGY_SCRIPT_PATH:-$PROJECT_ROOT/main.py}"
@@ -58,6 +90,10 @@ ACTION="${1:-start}"
 : "${STRATEGY_POSITION_STALE_IGNORE_SEC:=20}"
 : "${STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC:=15}"
 : "${STRATEGY_ACTION_ACCOUNT_FRESH_SEC:=2.5}"
+: "${STRATEGY_GRACEFUL_SHUTDOWN_ENABLED:=1}"
+: "${STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS:=1}"
+: "${STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS:=1}"
+: "${STRATEGY_STOP_GRACE_SEC:=180}"
 
 usage() {
   cat <<'EOF'
@@ -184,6 +220,9 @@ EOF
       STRATEGY_POSITION_STALE_IGNORE_SEC="$STRATEGY_POSITION_STALE_IGNORE_SEC" \
       STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC="$STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC" \
       STRATEGY_ACTION_ACCOUNT_FRESH_SEC="$STRATEGY_ACTION_ACCOUNT_FRESH_SEC" \
+      STRATEGY_GRACEFUL_SHUTDOWN_ENABLED="$STRATEGY_GRACEFUL_SHUTDOWN_ENABLED" \
+      STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS="$STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS" \
+      STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS="$STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS" \
       STRATEGY_LIVE_EVENT_LOG_PATH="$JSONL_LOG" \
       STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
       timeout "$RUN_DURATION" \
@@ -211,8 +250,21 @@ stop_run() {
   fi
 
   mapfile -t pid_array < <(printf '%s\n' "$pids" | sed '/^$/d' | awk '!seen[$0]++')
-  kill "${pid_array[@]}" 2>/dev/null || true
-  for _ in $(seq 1 20); do
+  signal_pids=()
+  for pid in "${pid_array[@]}"; do
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ "$cmdline" == *python*"$STRATEGY_SCRIPT_PATH_ABS"* ]]; then
+      signal_pids+=("$pid")
+    fi
+  done
+  if [[ ${#signal_pids[@]} -eq 0 ]]; then
+    signal_pids=("${pid_array[@]}")
+  fi
+
+  echo "[run_strategy_live] stopping signal_pids=$(printf '%s ' "${signal_pids[@]}") all_pids=$(printf '%s ' "${pid_array[@]}") grace_sec=${STRATEGY_STOP_GRACE_SEC}"
+  kill -TERM "${signal_pids[@]}" 2>/dev/null || true
+  stop_deadline=$((SECONDS + STRATEGY_STOP_GRACE_SEC))
+  while [[ "$SECONDS" -lt "$stop_deadline" ]]; do
     still_running=0
     for pid in "${pid_array[@]}"; do
       if kill -0 "$pid" 2>/dev/null; then

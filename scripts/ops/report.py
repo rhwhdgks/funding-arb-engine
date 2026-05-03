@@ -293,9 +293,12 @@ def _health_lines(health_snapshot: dict[str, dict[str, Any]]) -> list[str]:
             f"source={health.get('ws_source_last') or health.get('market_source_last') or '-'} "
             f"drift_last_ms={_fmt_num(health.get('ws_drift_last_ms'), 1)} "
             f"stale_age_ms={_fmt_num(health.get('stale_age_ms'), 1)} "
+            f"event_lag_ms={_fmt_num(health.get('event_lag_ms'), 1)} "
+            f"transport_lag_ms={_fmt_num(health.get('transport_lag_ms'), 1)} "
             f"ws_last={_fmt_ts_ms(health.get('ws_last_update_ms'))} "
             f"event={_fmt_ts_ms(health.get('ws_event_time_last_ms'))} "
-            f"server={_fmt_ts_ms(health.get('ws_server_time_last_ms'))}"
+            f"server={_fmt_ts_ms(health.get('ws_server_time_last_ms'))} "
+            f"desktop={_fmt_ts_ms(health.get('ws_desktop_time_last_ms'))}"
         )
     return lines
 
