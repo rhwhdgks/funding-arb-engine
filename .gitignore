@@ -5,6 +5,7 @@ __pycache__/
 *.pyd
 
 .env
+.env.notion
 test_server/.env
 
 logs/

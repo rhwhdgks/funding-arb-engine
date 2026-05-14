@@ -42,7 +42,11 @@ INFO_EVENT_TYPES = (
     "pair_closed_after_micro_residual_cleanup",
     "entry_order_disappeared_settle_started",
     "entry_order_disappeared_resolved",
+    "entry_limit_order_submit_preflight",
+    "entry_limit_order_submit_result",
 )
+
+SUBMIT_MARKET_AGE_WARN_MS = 1500
 
 
 def parse_duration_ms(value: str) -> int:
@@ -102,12 +106,61 @@ def add_check(checks: list[dict], status: str, name: str, detail: str) -> None:
     checks.append({"status": status, "name": name, "detail": detail})
 
 
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * pct))
+    return float(ordered[max(0, min(index, len(ordered) - 1))])
+
+
+def numeric_values(rows: list[dict], event_type: str, key: str) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        if row.get("event_type") != event_type:
+            continue
+        try:
+            value = float(row.get(key))
+        except Exception:
+            continue
+        values.append(value)
+    return values
+
+
+def summarize_entry_submit_telemetry(run_rows: list[dict]) -> dict:
+    preflight_rows = [row for row in run_rows if row.get("event_type") == "entry_limit_order_submit_preflight"]
+    result_rows = [row for row in run_rows if row.get("event_type") == "entry_limit_order_submit_result"]
+    market_age_values = numeric_values(run_rows, "entry_limit_order_submit_preflight", "market_age_ms")
+    stale_age_values = numeric_values(run_rows, "entry_limit_order_submit_preflight", "stale_age_ms")
+    submit_latency_values = numeric_values(run_rows, "entry_limit_order_submit_result", "submit_latency_ms")
+    stale_preflight_rows = [
+        row for row in preflight_rows
+        if float(row.get("market_age_ms") or 0) > SUBMIT_MARKET_AGE_WARN_MS
+        or row.get("can_trade") is False
+        or bool(row.get("block_reasons") or [])
+    ]
+    return {
+        "preflight_count": len(preflight_rows),
+        "result_count": len(result_rows),
+        "market_age_ms_avg": (sum(market_age_values) / len(market_age_values)) if market_age_values else 0.0,
+        "market_age_ms_p95": percentile(market_age_values, 0.95),
+        "market_age_ms_max": max(market_age_values) if market_age_values else 0.0,
+        "stale_age_ms_max": max(stale_age_values) if stale_age_values else 0.0,
+        "submit_latency_ms_avg": (sum(submit_latency_values) / len(submit_latency_values)) if submit_latency_values else 0.0,
+        "submit_latency_ms_p95": percentile(submit_latency_values, 0.95),
+        "submit_latency_ms_max": max(submit_latency_values) if submit_latency_values else 0.0,
+        "stale_preflight_count": len(stale_preflight_rows),
+        "warn_threshold_ms": SUBMIT_MARKET_AGE_WARN_MS,
+    }
+
+
 def evaluate_soak(
     *,
     meta: dict,
     status_text: str,
     event_counts: Counter,
     run_rows: list[dict],
+    submit_telemetry: dict,
     latest_shutdown: dict | None,
     open_order_rows: list[tuple],
     db_error: str,
@@ -149,6 +202,27 @@ def evaluate_soak(
             "INFO",
             f"{event_type}_count",
             f"count={count}",
+        )
+
+    preflight_count = int(submit_telemetry.get("preflight_count") or 0)
+    stale_preflight_count = int(submit_telemetry.get("stale_preflight_count") or 0)
+    if preflight_count <= 0:
+        add_check(
+            checks,
+            "INFO",
+            "entry_submit_price_age_telemetry_present",
+            "count=0; available after next strategy restart",
+        )
+    else:
+        add_check(
+            checks,
+            "PASS" if stale_preflight_count == 0 else "WARN",
+            "entry_submit_price_age_within_threshold",
+            (
+                f"preflight_count={preflight_count} stale_preflight_count={stale_preflight_count} "
+                f"max_market_age_ms={submit_telemetry.get('market_age_ms_max', 0):.1f} "
+                f"threshold_ms={submit_telemetry.get('warn_threshold_ms')}"
+            ),
         )
 
     if db_error:
@@ -243,7 +317,10 @@ def collect_open_order_rows(root: Path, env_file: Path, started_at_ms: int) -> t
         sys.path.insert(0, str(root))
         load_dotenv(env_file, override=True)
         from src.ops.persistence.db import get_db_connection
+        from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
 
+        account_label = resolve_account_label()
+        logic = resolve_logic_name()
         conn = get_db_connection()
         cur = conn.cursor()
         placeholders = ", ".join("?" for _ in OPEN_ORDER_STATUSES)
@@ -251,12 +328,14 @@ def collect_open_order_rows(root: Path, env_file: Path, started_at_ms: int) -> t
             f"""
             SELECT exchange_name, symbol, status, COUNT(*)
             FROM order_history
-            WHERE order_start >= ?
+            WHERE account_label = ?
+              AND logic = ?
+              AND order_start >= ?
               AND UPPER(status) IN ({placeholders})
             GROUP BY exchange_name, symbol, status
             ORDER BY exchange_name, symbol, status
             """,
-            (started_at_ms, *OPEN_ORDER_STATUSES),
+            (account_label, logic, started_at_ms, *OPEN_ORDER_STATUSES),
         )
         rows = cur.fetchall()
         cur.close()
@@ -266,7 +345,7 @@ def collect_open_order_rows(root: Path, env_file: Path, started_at_ms: int) -> t
         return [], str(exc)
 
 
-def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) -> None:
+def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     started_at_ms = int(meta.get("started_at_ms") or 0)
     duration_ms = parse_duration_ms(meta.get("duration")) or 3 * 3_600_000
@@ -321,6 +400,7 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
 
     run_rows = load_run_rows(jsonl_path, started_at_ms)
     event_counts = Counter(str(row.get("event_type") or "unknown") for row in run_rows)
+    submit_telemetry = summarize_entry_submit_telemetry(run_rows)
     latest_shutdown = next((row for row in reversed(run_rows) if row.get("event_type") == "shutdown_cleanup_done"), None)
     open_order_rows, db_error = collect_open_order_rows(root, env_file, started_at_ms)
     verdict = evaluate_soak(
@@ -328,11 +408,55 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
         status_text=status,
         event_counts=event_counts,
         run_rows=run_rows,
+        submit_telemetry=submit_telemetry,
         latest_shutdown=latest_shutdown,
         open_order_rows=open_order_rows,
         db_error=db_error,
         critical_lines=critical_lines,
     )
+
+    stopped_rows = [row for row in run_rows if row.get("event_type") == "runtime_stopped"]
+    observed_duration_ms = 0
+    if started_at_ms and stopped_rows:
+        observed_duration_ms = max(int(stopped_rows[-1].get("ts_ms") or started_at_ms) - started_at_ms, 0)
+
+    return {
+        "meta": meta,
+        "meta_path": str(meta_path),
+        "generated_at_ms": int(time.time() * 1000),
+        "status_text": status,
+        "summary_output": summary_output,
+        "stdout_log": str(stdout_path),
+        "jsonl_log": str(jsonl_path),
+        "run_rows_count": len(run_rows),
+        "event_counts": dict(event_counts),
+        "submit_telemetry": submit_telemetry,
+        "latest_shutdown": latest_shutdown,
+        "open_order_rows": [
+            {
+                "exchange_name": row[0],
+                "symbol": row[1],
+                "status": row[2],
+                "row_count": int(row[3] or 0),
+            }
+            for row in open_order_rows
+        ],
+        "db_error": db_error,
+        "critical_lines": critical_lines,
+        "observed_duration_ms": observed_duration_ms,
+        "verdict": verdict,
+    }
+
+
+def render_summary_markdown(payload: dict) -> str:
+    meta = payload["meta"]
+    verdict = payload["verdict"]
+    event_counts = Counter(payload.get("event_counts") or {})
+    submit_telemetry = payload.get("submit_telemetry") or {}
+    latest_shutdown = payload.get("latest_shutdown")
+    open_order_rows = payload.get("open_order_rows") or []
+    db_error = payload.get("db_error") or ""
+    critical_lines = payload.get("critical_lines") or []
 
     lines: list[str] = []
     lines.append(f"# Strategy {meta.get('duration') or ''} Soak Summary")
@@ -347,11 +471,15 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
         lines.append(f"- {check['status']} {check['name']}: {check['detail']}")
     lines.append("")
     lines.append("## Run Metadata")
-    lines.append(f"- generated_at_utc: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+    lines.append(f"- generated_at_utc: {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime((payload.get('generated_at_ms') or int(time.time() * 1000)) / 1000))}")
     lines.append(f"- run_started_at_utc: {meta.get('started_at_iso')}")
     lines.append(f"- run_duration: {meta.get('duration')}")
+    if payload.get("observed_duration_ms"):
+        lines.append(f"- observed_duration: {format_duration_ms(int(payload.get('observed_duration_ms') or 0))}")
     lines.append(f"- env_file: {meta.get('env_file')}")
-    lines.append(f"- status_after_wait: `{status}`")
+    lines.append(f"- status_after_wait: `{payload.get('status_text')}`")
+    lines.append(f"- stdout_log: {payload.get('stdout_log')}")
+    lines.append(f"- jsonl_log: {payload.get('jsonl_log')}")
     lines.append("")
     lines.append("## Event Counts")
     if event_counts:
@@ -359,6 +487,19 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
             lines.append(f"- {key}: {value}")
     else:
         lines.append("- no jsonl events found after run start")
+    lines.append("")
+    lines.append("## Entry Submit Price Age")
+    if int(submit_telemetry.get("preflight_count") or 0) <= 0:
+        lines.append("- no entry submit telemetry yet; available after next strategy restart")
+    else:
+        lines.append(f"- preflight_count: {submit_telemetry.get('preflight_count')}")
+        lines.append(f"- stale_preflight_count: {submit_telemetry.get('stale_preflight_count')}")
+        lines.append(f"- market_age_ms_avg: {submit_telemetry.get('market_age_ms_avg', 0):.1f}")
+        lines.append(f"- market_age_ms_p95: {submit_telemetry.get('market_age_ms_p95', 0):.1f}")
+        lines.append(f"- market_age_ms_max: {submit_telemetry.get('market_age_ms_max', 0):.1f}")
+        lines.append(f"- submit_latency_ms_avg: {submit_telemetry.get('submit_latency_ms_avg', 0):.1f}")
+        lines.append(f"- submit_latency_ms_p95: {submit_telemetry.get('submit_latency_ms_p95', 0):.1f}")
+        lines.append(f"- submit_latency_ms_max: {submit_telemetry.get('submit_latency_ms_max', 0):.1f}")
     lines.append("")
     lines.append("## Shutdown")
     if latest_shutdown:
@@ -373,7 +514,7 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
         lines.append(f"- db_error: {db_error}")
     elif open_order_rows:
         for row in open_order_rows:
-            lines.append(f"- {row[0]} {row[1]} {row[2]}: {row[3]}")
+            lines.append(f"- {row.get('exchange_name')} {row.get('symbol')} {row.get('status')}: {row.get('row_count')}")
     else:
         lines.append("- none")
     lines.append("")
@@ -386,10 +527,17 @@ def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) ->
     lines.append("")
     lines.append("## Script Summary Output")
     lines.append("```text")
-    lines.append(summary_output)
+    lines.append(payload.get("summary_output") or "")
     lines.append("```")
-    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
+
+
+def build_summary(root: Path, meta_path: Path, output_path: Path, wait: bool) -> dict:
+    payload = build_summary_payload(root, meta_path, wait=wait)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_summary_markdown(payload), encoding="utf-8")
     print(f"wrote {output_path}", flush=True)
+    return payload
 
 
 def main() -> int:

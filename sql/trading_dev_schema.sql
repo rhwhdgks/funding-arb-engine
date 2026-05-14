@@ -7,6 +7,8 @@
 
 CREATE TABLE IF NOT EXISTS balance_snapshot (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    account_label VARCHAR(16) NOT NULL DEFAULT 'test',
+    logic VARCHAR(64) NOT NULL DEFAULT 'funding fee',
     exchange_name VARCHAR(32) NOT NULL,
     bucket_start_ms BIGINT UNSIGNED NOT NULL,
     desktop_time_ms BIGINT UNSIGNED NOT NULL,
@@ -24,14 +26,17 @@ CREATE TABLE IF NOT EXISTS balance_snapshot (
     raw_json LONGTEXT NULL,
 
     PRIMARY KEY (id),
-    UNIQUE KEY uq_balance_snapshot_exchange_bucket (exchange_name, bucket_start_ms),
+    UNIQUE KEY uq_balance_snapshot_context_exchange_bucket (account_label, logic, exchange_name, bucket_start_ms),
     KEY idx_balance_snapshot_bucket (bucket_start_ms),
+    KEY idx_balance_snapshot_context_bucket (account_label, logic, bucket_start_ms),
     KEY idx_balance_snapshot_exchange_desktop (exchange_name, desktop_time_ms),
     KEY idx_balance_snapshot_exchange_server (exchange_name, server_time_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
 CREATE TABLE IF NOT EXISTS order_history (
+    account_label VARCHAR(16) NOT NULL DEFAULT 'test',
+    logic VARCHAR(64) NOT NULL DEFAULT 'funding fee',
     uuid VARCHAR(128) NOT NULL,
     exchange_name VARCHAR(32) NOT NULL,
     symbol VARCHAR(32) NOT NULL,
@@ -58,7 +63,8 @@ CREATE TABLE IF NOT EXISTS order_history (
 
     raw_json LONGTEXT NULL,
 
-    PRIMARY KEY (uuid),
+    PRIMARY KEY (account_label, logic, uuid),
+    KEY idx_order_history_context_time (account_label, logic, order_start),
     KEY idx_order_history_exchange_symbol_last_seen (exchange_name, symbol, order_end),
     KEY idx_order_history_exchange_client_order_id (exchange_name, client_order_id),
     KEY idx_order_history_exchange_order_id (exchange_name, order_id),
@@ -67,6 +73,8 @@ CREATE TABLE IF NOT EXISTS order_history (
 
 
 CREATE TABLE IF NOT EXISTS trade_history (
+    account_label VARCHAR(16) NOT NULL DEFAULT 'test',
+    logic VARCHAR(64) NOT NULL DEFAULT 'funding fee',
     uuid VARCHAR(128) NOT NULL,
     exchange_name VARCHAR(32) NOT NULL,
     symbol VARCHAR(32) NOT NULL,
@@ -93,7 +101,8 @@ CREATE TABLE IF NOT EXISTS trade_history (
 
     raw_json LONGTEXT NULL,
 
-    PRIMARY KEY (uuid),
+    PRIMARY KEY (account_label, logic, uuid),
+    KEY idx_trade_history_context_time (account_label, logic, desktop_time_ms),
     KEY idx_trade_history_exchange_symbol_server_time (exchange_name, symbol, server_time_ms),
     KEY idx_trade_history_exchange_symbol_desktop_time (exchange_name, symbol, desktop_time_ms),
     KEY idx_trade_history_order_uuid (order_uuid),

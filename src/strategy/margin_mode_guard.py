@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable
 from typing import Any
 
@@ -32,6 +33,70 @@ def _dedupe_reasons(reasons: list[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _classify_margin_mode(raw_mode: Any, *, source: str, error: str = "") -> dict[str, Any]:
+    normalized_mode = normalize_margin_mode(raw_mode)
+    if error and normalized_mode == "unknown":
+        reason = RISK_MARGIN_MODE_CHECK_FAILED
+    elif normalized_mode == "unknown":
+        reason = RISK_MARGIN_MODE_UNKNOWN
+    elif normalized_mode != "cross":
+        reason = RISK_MARGIN_MODE_NOT_CROSS
+    else:
+        reason = ""
+
+    return {
+        "raw_mode": raw_mode,
+        "normalized_mode": normalized_mode,
+        "reason": reason,
+        "error": error if reason == RISK_MARGIN_MODE_CHECK_FAILED else "",
+        "source": source,
+    }
+
+
+async def _read_margin_mode_from_account_snapshot(exchange: Any, symbol: str) -> dict[str, Any] | None:
+    getter = getattr(exchange, "get_margin_mode_from_account_snapshot", None)
+    if not callable(getter):
+        return None
+
+    try:
+        maybe_result = getter(symbol)
+        result = await maybe_result if inspect.isawaitable(maybe_result) else maybe_result
+    except Exception as exc:
+        return _classify_margin_mode(
+            None,
+            source="account_snapshot",
+            error=f"account_snapshot_margin_mode_read_failed:{exc}",
+        )
+
+    if not isinstance(result, dict):
+        return None
+
+    raw_mode = result.get("margin_mode")
+    if raw_mode not in (None, ""):
+        return _classify_margin_mode(
+            raw_mode,
+            source=str(result.get("source") or "account_snapshot"),
+            error=str(result.get("error") or ""),
+        )
+
+    if result.get("fallback_allowed") is False:
+        if result.get("non_blocking"):
+            return {
+                "raw_mode": raw_mode,
+                "normalized_mode": "unknown",
+                "reason": "",
+                "error": str(result.get("error") or ""),
+                "source": str(result.get("source") or "account_snapshot"),
+            }
+        return _classify_margin_mode(
+            raw_mode,
+            source=str(result.get("source") or "account_snapshot"),
+            error=str(result.get("error") or "margin_mode_unavailable"),
+        )
+
+    return None
+
+
 async def _read_margin_mode(
     exchange: Any,
     symbol: str,
@@ -39,6 +104,10 @@ async def _read_margin_mode(
     *,
     retries: int = 1,
 ) -> dict[str, Any]:
+    snapshot_result = await _read_margin_mode_from_account_snapshot(exchange, symbol)
+    if snapshot_result is not None:
+        return snapshot_result
+
     get_margin_mode = getattr(exchange, "get_margin_mode", None)
     if not callable(get_margin_mode):
         return {
@@ -46,6 +115,7 @@ async def _read_margin_mode(
             "normalized_mode": "unknown",
             "reason": RISK_MARGIN_MODE_UNKNOWN,
             "error": "exchange_margin_mode_getter_missing",
+            "source": "api",
         }
 
     result: dict[str, Any] = {}
@@ -69,33 +139,11 @@ async def _read_margin_mode(
             break
         await asyncio.sleep(0.25)
 
-    if result.get("error") and normalized_mode == "unknown":
-        return {
-            "raw_mode": raw_mode,
-            "normalized_mode": normalized_mode,
-            "reason": RISK_MARGIN_MODE_CHECK_FAILED,
-            "error": str(result.get("error")),
-        }
-    if normalized_mode == "unknown":
-        return {
-            "raw_mode": raw_mode,
-            "normalized_mode": normalized_mode,
-            "reason": RISK_MARGIN_MODE_UNKNOWN,
-            "error": "",
-        }
-    if normalized_mode != "cross":
-        return {
-            "raw_mode": raw_mode,
-            "normalized_mode": normalized_mode,
-            "reason": RISK_MARGIN_MODE_NOT_CROSS,
-            "error": "",
-        }
-    return {
-        "raw_mode": raw_mode,
-        "normalized_mode": normalized_mode,
-        "reason": "",
-        "error": "",
-    }
+    return _classify_margin_mode(
+        raw_mode,
+        source="api",
+        error=str(result.get("error") or ""),
+    )
 
 
 async def check_startup_margin_mode_guard(
@@ -127,6 +175,7 @@ async def check_startup_margin_mode_guard(
             normalized_mode = str(result.get("normalized_mode") or "unknown")
             raw_mode = result.get("raw_mode")
             error = str(result.get("error") or "")
+            source = str(result.get("source") or "api")
             ok = reason == "" and normalized_mode == "cross"
 
             if reason:
@@ -141,11 +190,12 @@ async def check_startup_margin_mode_guard(
                     "ok": ok,
                     "reason": reason,
                     "error": error,
+                    "source": source,
                 }
             )
             print(
                 f"[strategy][startup][margin-mode] exchange={exchange_name} symbol={symbol} "
-                f"raw={raw_mode or 'None'} normalized={normalized_mode} ok={'Y' if ok else 'N'}"
+                f"raw={raw_mode or 'None'} normalized={normalized_mode} source={source} ok={'Y' if ok else 'N'}"
                 + (f" reason={reason}" if reason else "")
             )
 

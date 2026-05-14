@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 
+from src.strategy.logging import log_hedge_done, log_hedge_partial_fill, log_hedge_start
+
 
 @dataclass
 class HedgeExecutionResult:
@@ -11,6 +13,19 @@ class HedgeExecutionResult:
     filled_qty: float
     remaining_qty: float
     avg_price: float = 0.0
+
+
+def emit_hedge_event(
+    recorder: Callable[..., None] | None,
+    event_type: str,
+    **payload: Any,
+) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder(event_type, **payload)
+    except Exception as exc:
+        print(f"[strategy][hedge_event][warn] event_type={event_type} error={exc!r}")
 
 
 async def execute_residual_hedge(
@@ -35,9 +50,11 @@ async def execute_residual_hedge(
     wait_for_position_close: Callable[..., Awaitable[float]],
     cancel_if_open: Callable[[Any, str, dict[str, Any] | None], Awaitable[None]],
     settle_grace_sec: Callable[[Any], float],
+    record_order_event: Callable[..., None] | None = None,
 ) -> HedgeExecutionResult:
     hedged_qty = 0.0
     hedge_price_used = 0.0
+    last_logged_hedged_qty = 0.0
 
     if target_qty <= eps:
         return HedgeExecutionResult(
@@ -55,6 +72,53 @@ async def execute_residual_hedge(
 
     def outstanding_qty() -> float:
         return max(target_qty - hedged_qty, 0.0)
+
+    def log_progress(reason: str) -> None:
+        nonlocal last_logged_hedged_qty
+        if hedged_qty <= last_logged_hedged_qty + eps:
+            return
+        filled_delta = hedged_qty - last_logged_hedged_qty
+        remaining_qty = outstanding_qty()
+        post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+        if remaining_qty > eps:
+            log_hedge_partial_fill(
+                symbol=symbol,
+                exchange=exchange_name,
+                side=side,
+                filled_delta=filled_delta,
+                filled_total=hedged_qty,
+                target_qty=target_qty,
+                remaining_qty=remaining_qty,
+                stage_label=stage_label,
+                is_close=is_close,
+                reason=reason,
+            )
+        if not is_close and stage_label == "entry":
+            emit_hedge_event(
+                record_order_event,
+                "entry_hedge_fill_progress",
+                exchange=exchange_name,
+                symbol=symbol,
+                side=side,
+                target_qty=target_qty,
+                filled_delta=filled_delta,
+                filled_total=hedged_qty,
+                remaining_qty=remaining_qty,
+                pre_qty=pre_qty,
+                post_qty=post_qty,
+                position_delta=hedged_qty,
+                reason=reason,
+            )
+        last_logged_hedged_qty = hedged_qty
+
+    log_hedge_start(
+        symbol=symbol,
+        exchange=exchange_name,
+        side=side,
+        target_qty=target_qty,
+        stage_label=stage_label,
+        is_close=is_close,
+    )
 
     if config.hedge_market_immediate:
         remaining_qty = outstanding_qty()
@@ -85,7 +149,17 @@ async def execute_residual_hedge(
                     reason=f"{probe_reason_prefix}_market",
                 ),
             )
+            log_progress("market")
             hedge_price_used = extract_order_avg_price(market_result, hedge_price_used)
+        if outstanding_qty() <= eps:
+            log_hedge_done(
+                symbol=symbol,
+                exchange=exchange_name,
+                filled_qty=hedged_qty,
+                remaining_qty=outstanding_qty(),
+                stage_label=stage_label,
+                is_close=is_close,
+            )
         return HedgeExecutionResult(
             requested_qty=target_qty,
             filled_qty=hedged_qty,
@@ -129,6 +203,7 @@ async def execute_residual_hedge(
                     reason=f"{probe_reason_prefix}_probe_before_cancel",
                 ),
             )
+            log_progress("probe_before_cancel")
             if outstanding_qty() > eps:
                 await cancel_if_open(exchange, symbol, hedge_result)
                 await asyncio.sleep(config.action_settle_wait_sec)
@@ -145,6 +220,7 @@ async def execute_residual_hedge(
                         reason=f"{probe_reason_prefix}_after_cancel",
                     ),
                 )
+                log_progress("after_cancel_probe")
                 if outstanding_qty() > eps:
                     hedged_qty = max(
                         hedged_qty,
@@ -157,7 +233,17 @@ async def execute_residual_hedge(
                             settle_grace_sec(config),
                         ),
                     )
+                    log_progress("final_settle")
 
+    if outstanding_qty() <= eps:
+        log_hedge_done(
+            symbol=symbol,
+            exchange=exchange_name,
+            filled_qty=hedged_qty,
+            remaining_qty=outstanding_qty(),
+            stage_label=stage_label,
+            is_close=is_close,
+        )
     return HedgeExecutionResult(
         requested_qty=target_qty,
         filled_qty=hedged_qty,

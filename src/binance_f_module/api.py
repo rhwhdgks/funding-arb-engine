@@ -1,8 +1,11 @@
+import json
 import os
+import re
 import time
 import hmac
 import hashlib
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -17,15 +20,112 @@ BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 
 _TIME_OFFSET_MS = 0
 _TICKER_LIST_CACHE: tuple[int, tuple[list[str], dict[str, dict[str, Any]]]] | None = None
+_REST_PAUSE_UNTIL_MS = 0
+_REST_PAUSE_REASON = ""
+_REST_PAUSE_LAST_LOG_MS = 0
+_REST_RATE_LIMIT_STATE: dict[str, Any] = {}
 
 
 def _ticker_list_cache_ttl_sec() -> int:
     return int(float(os.getenv("BINANCE_TICKER_LIST_CACHE_SEC", "21600")))
 
 
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _ticker_list_disk_cache_enabled() -> bool:
+    return _env_bool("BINANCE_TICKER_LIST_DISK_CACHE", True)
+
+
+def _ticker_list_stale_on_failure_enabled() -> bool:
+    return _env_bool("BINANCE_TICKER_LIST_STALE_ON_FAILURE", True)
+
+
+def _ticker_list_cache_path() -> Path:
+    raw = os.getenv("BINANCE_TICKER_LIST_CACHE_FILE", "runtime/cache/binance_futures_exchange_info.json")
+    return Path(raw).expanduser()
+
+
 def _clone_ticker_list_cache(payload: tuple[list[str], dict[str, dict[str, Any]]]) -> tuple[list[str], dict[str, dict[str, Any]]]:
     ticker_list, info = payload
     return list(ticker_list), {symbol: dict(row) for symbol, row in info.items()}
+
+
+def _read_ticker_list_disk_cache(*, allow_expired: bool = False) -> tuple[int, tuple[list[str], dict[str, dict[str, Any]]]] | None:
+    if not _ticker_list_disk_cache_enabled():
+        return None
+
+    path = _ticker_list_cache_path()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        print(f"[binance][get_ticker_list][cache_warn] failed_to_read path={path} error={exc}")
+        return None
+
+    if raw.get("base_url") != BASE_URL:
+        return None
+
+    try:
+        cached_at_ms = int(raw.get("cached_at_ms") or 0)
+    except Exception:
+        cached_at_ms = 0
+    ticker_list = raw.get("ticker_list")
+    info = raw.get("info")
+    if cached_at_ms <= 0 or not isinstance(ticker_list, list) or not isinstance(info, dict):
+        return None
+
+    ttl_sec = _ticker_list_cache_ttl_sec()
+    if ttl_sec > 0 and not allow_expired and (_now_ms() - cached_at_ms) >= ttl_sec * 1000:
+        return None
+
+    payload = ([str(symbol).upper() for symbol in ticker_list], {str(symbol).upper(): dict(row) for symbol, row in info.items() if isinstance(row, dict)})
+    if not payload[0] or not payload[1]:
+        return None
+    return cached_at_ms, payload
+
+
+def _write_ticker_list_disk_cache(cached_at_ms: int, payload: tuple[list[str], dict[str, dict[str, Any]]]) -> None:
+    if not _ticker_list_disk_cache_enabled():
+        return
+
+    path = _ticker_list_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f"{path.name}.tmp")
+        ticker_list, info = payload
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "base_url": BASE_URL,
+                    "cached_at_ms": int(cached_at_ms),
+                    "ticker_list": list(ticker_list),
+                    "info": info,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+    except Exception as exc:
+        print(f"[binance][get_ticker_list][cache_warn] failed_to_write path={path} error={exc}")
+
+
+def _restore_ticker_list_disk_cache(*, allow_expired: bool = False) -> tuple[list[str], dict[str, dict[str, Any]]] | None:
+    global _TICKER_LIST_CACHE
+
+    cached = _read_ticker_list_disk_cache(allow_expired=allow_expired)
+    if cached is None:
+        return None
+    cached_at_ms, payload = cached
+    _TICKER_LIST_CACHE = (cached_at_ms, payload)
+    return _clone_ticker_list_cache(payload)
 
 
 # ---------- numeric helpers ----------
@@ -131,6 +231,168 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return default
 
 
+def _rest_circuit_breaker_enabled() -> bool:
+    return _env_bool("BINANCE_REST_CIRCUIT_BREAKER", True)
+
+
+def _rate_limit_cooldown_ms() -> int:
+    return int(float(os.getenv("BINANCE_REST_RATE_LIMIT_COOLDOWN_SEC", "60")) * 1000)
+
+
+def _parse_ban_until_ms(data: Any) -> int | None:
+    message = ""
+    if isinstance(data, dict):
+        message = str(data.get("msg") or data.get("message") or "")
+    elif data is not None:
+        message = str(data)
+    match = re.search(r"banned\s+until\s+(\d+)", message, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _binance_error_code(data: Any) -> int | None:
+    if not isinstance(data, dict):
+        return None
+    try:
+        return int(data.get("code"))
+    except Exception:
+        return None
+
+
+def _classify_rate_limit_response(status: int, data: Any) -> tuple[str, int] | None:
+    code = _binance_error_code(data)
+    if status not in {418, 429} and code != -1003:
+        return None
+
+    now_ms = _now_ms()
+    until_ms = _parse_ban_until_ms(data)
+    if until_ms is None or until_ms <= now_ms:
+        until_ms = now_ms + max(_rate_limit_cooldown_ms(), 1000)
+
+    reason = f"http_{status}"
+    if code is not None:
+        reason = f"{reason}:code_{code}"
+    return reason, until_ms
+
+
+def _max_rate_limit_usage(rate_limits: list[dict[str, Any]]) -> float:
+    max_usage = 0.0
+    for item in rate_limits:
+        try:
+            count = float(item.get("count") or 0.0)
+            limit = float(item.get("limit") or 0.0)
+        except Exception:
+            continue
+        if limit <= 0:
+            continue
+        max_usage = max(max_usage, count / limit)
+    return max_usage
+
+
+def _update_rest_rate_limit_state(
+    *,
+    path: str,
+    status: int,
+    data: Any,
+    headers: dict[str, str],
+) -> None:
+    global _REST_RATE_LIMIT_STATE
+
+    now_ms = _now_ms()
+    rate_limits = _build_rate_limits(headers)
+    pause = _classify_rate_limit_response(status, data)
+    pause_reason = ""
+    pause_until_ms = 0
+    if pause is not None:
+        pause_reason, pause_until_ms = pause
+
+    max_usage = _max_rate_limit_usage(rate_limits)
+    blocked = bool(pause_until_ms and pause_until_ms > now_ms)
+    if not blocked and _REST_PAUSE_UNTIL_MS > now_ms:
+        blocked = True
+        pause_reason = _REST_PAUSE_REASON
+        pause_until_ms = _REST_PAUSE_UNTIL_MS
+
+    _REST_RATE_LIMIT_STATE = {
+        "last": rate_limits,
+        "rate_limits": rate_limits,
+        "max_usage": max_usage,
+        "blocked": blocked,
+        "reason": pause_reason,
+        "pause_until_ms": pause_until_ms,
+        "cooldown_until_ms": pause_until_ms,
+        "last_status": status,
+        "last_path": path,
+        "last_error_code": _binance_error_code(data),
+        "last_update_ms": now_ms,
+    }
+
+
+def get_rest_rate_limit_state() -> dict[str, Any]:
+    state = dict(_REST_RATE_LIMIT_STATE)
+    now_ms = _now_ms()
+    if _REST_PAUSE_UNTIL_MS > now_ms:
+        state["blocked"] = True
+        state["reason"] = _REST_PAUSE_REASON
+        state["pause_until_ms"] = _REST_PAUSE_UNTIL_MS
+        state["cooldown_until_ms"] = _REST_PAUSE_UNTIL_MS
+    return state
+
+
+def _set_rest_pause(until_ms: int, reason: str, path: str) -> None:
+    global _REST_PAUSE_UNTIL_MS, _REST_PAUSE_REASON, _REST_PAUSE_LAST_LOG_MS
+
+    if not _rest_circuit_breaker_enabled():
+        return
+
+    now_ms = _now_ms()
+    if until_ms <= now_ms:
+        return
+
+    should_log = until_ms > _REST_PAUSE_UNTIL_MS or (now_ms - _REST_PAUSE_LAST_LOG_MS) >= 60000
+    _REST_PAUSE_UNTIL_MS = max(_REST_PAUSE_UNTIL_MS, until_ms)
+    _REST_PAUSE_REASON = reason
+    if should_log:
+        _REST_PAUSE_LAST_LOG_MS = now_ms
+        print(
+            f"[binance][rest_circuit_breaker][pause] until_ms={_REST_PAUSE_UNTIL_MS} "
+            f"reason={reason} path={path}"
+        )
+
+
+def _local_rest_pause_response(path: str) -> tuple[int, Any, dict[str, str]] | None:
+    global _REST_PAUSE_LAST_LOG_MS
+
+    if not _rest_circuit_breaker_enabled():
+        return None
+
+    now_ms = _now_ms()
+    if now_ms >= _REST_PAUSE_UNTIL_MS:
+        return None
+
+    if now_ms - _REST_PAUSE_LAST_LOG_MS >= 60000:
+        _REST_PAUSE_LAST_LOG_MS = now_ms
+        print(
+            f"[binance][rest_circuit_breaker][skip] until_ms={_REST_PAUSE_UNTIL_MS} "
+            f"reason={_REST_PAUSE_REASON} path={path}"
+        )
+
+    return (
+        418,
+        {
+            "code": -1003,
+            "msg": f"local Binance REST pause active until {_REST_PAUSE_UNTIL_MS}; reason={_REST_PAUSE_REASON}",
+            "local_rest_pause": True,
+            "pause_until_ms": _REST_PAUSE_UNTIL_MS,
+        },
+        {"x-local-binance-rest-paused": "1"},
+    )
+
+
 # ---------- signing / request helpers ----------
 def create_signature(query_string: str, secret_key: str | None = None) -> str:
     secret = secret_key or BINANCE_SECRET_KEY or ""
@@ -162,6 +424,10 @@ async def _request(
 ) -> tuple[int, Any, dict[str, str]]:
     params = dict(params or {})
 
+    paused = _local_rest_pause_response(path)
+    if paused is not None:
+        return paused
+
     headers = {"Content-Type": "application/json"}
     if BINANCE_API_KEY:
         headers["X-MBX-APIKEY"] = BINANCE_API_KEY
@@ -184,7 +450,18 @@ async def _request(
                 data = await response.json(content_type=None)
             except Exception:
                 data = await response.text()
-            return response.status, data, dict(response.headers)
+            response_headers = dict(response.headers)
+            _update_rest_rate_limit_state(
+                path=path,
+                status=response.status,
+                data=data,
+                headers=response_headers,
+            )
+            rate_limit_pause = _classify_rate_limit_response(response.status, data)
+            if rate_limit_pause is not None:
+                reason, until_ms = rate_limit_pause
+                _set_rest_pause(until_ms, reason, path)
+            return response.status, data, response_headers
 
 
 # ---------- time sync ----------
@@ -330,17 +607,26 @@ async def get_ticker_list() -> tuple[list[str], dict[str, dict[str, Any]]]:
     global _TICKER_LIST_CACHE
 
     ttl_sec = _ticker_list_cache_ttl_sec()
-    now_ms = int(time.time() * 1000)
+    now_ms = _now_ms()
     if _TICKER_LIST_CACHE is not None:
         cached_at_ms, cached_payload = _TICKER_LIST_CACHE
         if ttl_sec > 0 and (now_ms - cached_at_ms) < ttl_sec * 1000:
             return _clone_ticker_list_cache(cached_payload)
+
+    disk_payload = _restore_ticker_list_disk_cache(allow_expired=False)
+    if disk_payload is not None:
+        return disk_payload
 
     status, data, _ = await _request("GET", "/fapi/v1/exchangeInfo")
     if status != 200:
         if _TICKER_LIST_CACHE is not None:
             print(f"[binance][get_ticker_list][warn] using stale cache after fetch failure: status={status}, data={data}")
             return _clone_ticker_list_cache(_TICKER_LIST_CACHE[1])
+        if _ticker_list_stale_on_failure_enabled():
+            disk_payload = _restore_ticker_list_disk_cache(allow_expired=True)
+            if disk_payload is not None:
+                print(f"[binance][get_ticker_list][warn] using stale disk cache after fetch failure: status={status}, data={data}")
+                return disk_payload
         raise RuntimeError(f"Failed to fetch exchangeInfo: status={status}, data={data}")
 
     ticker_list: list[str] = []
@@ -359,6 +645,7 @@ async def get_ticker_list() -> tuple[list[str], dict[str, dict[str, Any]]]:
 
     payload = (ticker_list, info)
     _TICKER_LIST_CACHE = (now_ms, payload)
+    _write_ticker_list_disk_cache(now_ms, payload)
     return _clone_ticker_list_cache(payload)
 
 
@@ -750,14 +1037,21 @@ async def get_my_trades(
     start_time: int | None = None,
     end_time: int | None = None,
     limit: int = 100,
-    option: dict[str, Any] = {},
+    option: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
+    option = option or {}
     normalized = normalize_symbol(symbol)
     params: dict[str, Any] = {"symbol": normalized, "limit": limit}
     if start_time is not None:
         params["startTime"] = start_time
     if end_time is not None:
         params["endTime"] = end_time
+    order_id = option.get("order_id") or option.get("orderId")
+    if order_id not in (None, ""):
+        try:
+            params["orderId"] = int(order_id)
+        except (TypeError, ValueError):
+            pass
     if option.get("from_id") is not None:
         params["fromId"] = int(option["from_id"])
     if option.get("recv_window"):

@@ -1044,6 +1044,9 @@ class Exchange:
                     self.rate_limit_state["reason"] = f"rate_limit_{interval}_{interval_num}"
                     break
 
+    def get_rate_limit_state(self) -> dict[str, Any]:
+        return deepcopy(self.rate_limit_state)
+
     def _order_key(self, order: dict) -> str:
         return str(
             order.get("order_id")

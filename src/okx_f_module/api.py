@@ -27,6 +27,14 @@ OKX_FORCE_IPV4 = os.getenv("OKX_FORCE_IPV4", "1") == "1"
 _TIME_OFFSET_MS = 0
 _TICKER_LIST_CACHE: tuple[int, tuple[list[str], dict[str, dict[str, Any]]]] | None = None
 _LOG_THROTTLE_MS: dict[str, int] = {}
+_PRIVATE_READ_TRANSIENT_STREAK = 0
+_PRIVATE_READ_PAUSED_UNTIL_MS = 0
+
+_PRIVATE_READ_PAUSE_PATHS = {
+    "/api/v5/account/balance",
+    "/api/v5/account/positions",
+    "/api/v5/trade/orders-pending",
+}
 
 
 def _now_ms() -> int:
@@ -87,6 +95,10 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(float(v))
     except Exception:
         return default
+
+
+def _env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -197,6 +209,24 @@ def _transient_backoff_jitter() -> float:
         return 0.2
 
 
+def _private_read_pause_enabled() -> bool:
+    return _env_bool("OKX_PRIVATE_READ_PAUSE_ON_TRANSIENT", "0")
+
+
+def _private_read_pause_threshold() -> int:
+    try:
+        return max(1, int(os.getenv("OKX_PRIVATE_READ_PAUSE_THRESHOLD", "3")))
+    except Exception:
+        return 3
+
+
+def _private_read_pause_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("OKX_PRIVATE_READ_PAUSE_SEC", "45")))
+    except Exception:
+        return 45.0
+
+
 def _classify_okx_transient(status: int, data: Any) -> str | None:
     if status in _TRANSIENT_HTTP_STATUSES:
         return f"http_{status}"
@@ -205,6 +235,65 @@ def _classify_okx_transient(status: int, data: Any) -> str | None:
         if code in _TRANSIENT_BUSY_CODES:
             return f"code_{code}"
     return None
+
+
+def _is_private_read_pause_path(method: str, path: str, auth: bool) -> bool:
+    return auth and method.upper() == "GET" and path in _PRIVATE_READ_PAUSE_PATHS
+
+
+def _private_read_pause_response(path: str) -> tuple[int, dict[str, Any], dict[str, str]]:
+    remaining_ms = max(_PRIVATE_READ_PAUSED_UNTIL_MS - _now_ms(), 0)
+    _log_throttled(
+        "okx_private_read_paused",
+        f"[okx][private_read_pause] skip path={path} remaining_sec={remaining_ms / 1000:.1f}",
+        cooldown_sec=5.0,
+    )
+    return (
+        503,
+        {
+            "code": "OKX_PRIVATE_READ_PAUSED",
+            "msg": "OKX private read paused after transient failures",
+            "data": [],
+            "paused_until_ms": _PRIVATE_READ_PAUSED_UNTIL_MS,
+        },
+        {},
+    )
+
+
+def _record_private_read_success(path: str) -> None:
+    global _PRIVATE_READ_TRANSIENT_STREAK
+    if _PRIVATE_READ_TRANSIENT_STREAK:
+        _log_throttled(
+            "okx_private_read_recovered",
+            f"[okx][private_read_pause][recovered] path={path} streak={_PRIVATE_READ_TRANSIENT_STREAK}",
+            cooldown_sec=5.0,
+        )
+    _PRIVATE_READ_TRANSIENT_STREAK = 0
+
+
+def _record_private_read_transient(path: str, reason: str) -> None:
+    global _PRIVATE_READ_PAUSED_UNTIL_MS, _PRIVATE_READ_TRANSIENT_STREAK
+    if not _private_read_pause_enabled():
+        return
+
+    _PRIVATE_READ_TRANSIENT_STREAK += 1
+    threshold = _private_read_pause_threshold()
+    if _PRIVATE_READ_TRANSIENT_STREAK < threshold:
+        return
+
+    pause_ms = int(_private_read_pause_sec() * 1000)
+    if pause_ms <= 0:
+        return
+
+    now_ms = _now_ms()
+    _PRIVATE_READ_PAUSED_UNTIL_MS = max(_PRIVATE_READ_PAUSED_UNTIL_MS, now_ms + pause_ms)
+    _log_throttled(
+        "okx_private_read_pause_started",
+        f"[okx][private_read_pause][started] path={path} reason={reason} "
+        f"streak={_PRIVATE_READ_TRANSIENT_STREAK} pause_sec={pause_ms / 1000:.1f}",
+        cooldown_sec=1.0,
+    )
+    _PRIVATE_READ_TRANSIENT_STREAK = 0
 
 
 async def _request(
@@ -220,6 +309,14 @@ async def _request(
     query = urlencode(params, doseq=True)
     request_path = path if not query else f"{path}?{query}"
     url = f"{BASE_URL}{request_path}"
+    private_read_pause_path = _is_private_read_pause_path(method, path, auth)
+
+    if (
+        private_read_pause_path
+        and _private_read_pause_enabled()
+        and _now_ms() < _PRIVATE_READ_PAUSED_UNTIL_MS
+    ):
+        return _private_read_pause_response(path)
 
     body = json.dumps(payload, separators=(",", ":")) if payload is not None else ""
 
@@ -265,13 +362,19 @@ async def _request(
             transient_reason = _classify_okx_transient(status, data)
         except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as exc:
             if is_last:
+                if private_read_pause_path:
+                    _record_private_read_transient(path, f"exc:{type(exc).__name__}")
                 raise
             transient_reason = f"exc:{type(exc).__name__}"
 
         if transient_reason is None:
+            if private_read_pause_path:
+                _record_private_read_success(path)
             return status, data, headers_out
 
         if is_last:
+            if private_read_pause_path:
+                _record_private_read_transient(path, transient_reason)
             _log_throttled(
                 f"okx_request_retry_exhausted:{path}",
                 f"[okx][_request][retry_exhausted] path={path} reason={transient_reason} "
@@ -1019,8 +1122,9 @@ async def get_my_trades(
     start_time: int | None = None,
     end_time: int | None = None,
     limit: int = 100,
-    option: dict[str, Any] = {},
+    option: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
+    option = option or {}
     params: dict[str, Any] = {"instType": "SWAP", "limit": limit}
     if symbol:
         params["instId"] = normalize_symbol(symbol)
@@ -1028,6 +1132,12 @@ async def get_my_trades(
         params["after"] = int(start_time)
     if end_time is not None:
         params["before"] = int(end_time)
+    # OKX /trade/fills supports ordId lookup. Prefer this for event-based
+    # trade_history sync because recent-fill polling can miss older fills when
+    # many orders are active on the same symbol.
+    order_id = option.get("order_id") or option.get("ordId")
+    if order_id not in (None, ""):
+        params["ordId"] = str(order_id)
 
     status, data, _ = await _request("GET", "/api/v5/trade/fills", params=params, auth=True)
     if status != 200 or not isinstance(data, dict) or data.get("code") != "0":

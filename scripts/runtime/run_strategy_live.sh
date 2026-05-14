@@ -67,14 +67,25 @@ RUN_META_FILE="${STRATEGY_LIVE_RUN_META_FILE:-$LOG_DIR/strategy_live.run.json}"
 RUN_DURATION="${STRATEGY_RUN_DURATION:-24h}"
 
 ACTION="${1:-start}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
 
 : "${STRATEGY_ENABLE_LIVE:=1}"
 : "${STRATEGY_APPROVAL_MODE:=auto}"
 : "${STRATEGY_AUTO_ENTER_ENABLED:=1}"
 : "${STRATEGY_AUTO_CLOSE_ENABLED:=1}"
+: "${STRATEGY_ACCOUNT_LABEL:=real}"
+: "${STRATEGY_LOGIC:=funding fee}"
 : "${STRATEGY_EXCHANGES:=binance,okx}"
 : "${STRATEGY_ALLOWED_PAIRS:=binance-okx}"
 : "${STRATEGY_SYMBOLS:=ETH,SOL,XRP,DOGE,SEI,PENGU,ARB,LINK}"
+: "${STRATEGY_LEVERAGE:=1}"
+: "${STRATEGY_MAX_GROSS_LEVERAGE:=0}"
+: "${STRATEGY_MAX_LONG_LEVERAGE:=0}"
+: "${STRATEGY_MAX_SHORT_LEVERAGE:=0}"
+: "${STRATEGY_RATE_LIMIT_GUARD_ENABLED:=1}"
+: "${STRATEGY_RATE_LIMIT_USAGE_THRESHOLD:=0.85}"
 : "${STRATEGY_ORDER_NOTIONAL_USD:=50}"
 : "${STRATEGY_MIN_EXPECTED_NET_EDGE_USD:=0.04}"
 : "${STRATEGY_MIN_EXPECTED_NET_EDGE_BPS:=4}"
@@ -86,6 +97,9 @@ ACTION="${1:-start}"
 : "${STRATEGY_MAX_HOLD_SEC:=14400}"
 : "${STRATEGY_TAKE_PROFIT_USD:=0.18}"
 : "${STRATEGY_STOP_LOSS_USD:=-0.12}"
+: "${STRATEGY_TAKE_PROFIT_BPS:=}"
+: "${STRATEGY_STOP_LOSS_BPS:=}"
+: "${STRATEGY_HOLD_BUFFER_BPS:=}"
 : "${STRATEGY_MAX_OPEN_PAIRS:=2}"
 : "${STRATEGY_POSITION_STALE_IGNORE_SEC:=20}"
 : "${STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC:=15}"
@@ -97,7 +111,7 @@ ACTION="${1:-start}"
 
 usage() {
   cat <<'EOF'
-usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report]
+usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report|final-report]
 
 commands:
   start   start background live strategy runtime
@@ -107,6 +121,7 @@ commands:
   jsonl   tail -f structured live event jsonl
   summary print current-run live event summary
   report  show current exchange report snapshot
+  final-report  write final PASS/FAIL report for the latest run
 EOF
 }
 
@@ -187,7 +202,18 @@ PY
   "stdout_log": "${STDOUT_LOG}",
   "jsonl_log": "${JSONL_LOG}",
   "symbols": "${STRATEGY_SYMBOLS}",
-  "exchanges": "${STRATEGY_EXCHANGES}"
+  "exchanges": "${STRATEGY_EXCHANGES}",
+  "account_label": "${STRATEGY_ACCOUNT_LABEL}",
+  "logic": "${STRATEGY_LOGIC}",
+  "leverage": "${STRATEGY_LEVERAGE}",
+  "max_gross_leverage": "${STRATEGY_MAX_GROSS_LEVERAGE}",
+  "max_long_leverage": "${STRATEGY_MAX_LONG_LEVERAGE}",
+  "max_short_leverage": "${STRATEGY_MAX_SHORT_LEVERAGE}",
+  "rate_limit_guard_enabled": "${STRATEGY_RATE_LIMIT_GUARD_ENABLED}",
+  "rate_limit_usage_threshold": "${STRATEGY_RATE_LIMIT_USAGE_THRESHOLD}",
+  "take_profit_bps": "${STRATEGY_TAKE_PROFIT_BPS}",
+  "stop_loss_bps": "${STRATEGY_STOP_LOSS_BPS}",
+  "hold_buffer_bps": "${STRATEGY_HOLD_BUFFER_BPS}"
 }
 EOF
 
@@ -202,9 +228,17 @@ EOF
       STRATEGY_APPROVAL_MODE="$STRATEGY_APPROVAL_MODE" \
       STRATEGY_AUTO_ENTER_ENABLED="$STRATEGY_AUTO_ENTER_ENABLED" \
       STRATEGY_AUTO_CLOSE_ENABLED="$STRATEGY_AUTO_CLOSE_ENABLED" \
+      STRATEGY_ACCOUNT_LABEL="$STRATEGY_ACCOUNT_LABEL" \
+      STRATEGY_LOGIC="$STRATEGY_LOGIC" \
       STRATEGY_EXCHANGES="$STRATEGY_EXCHANGES" \
       STRATEGY_ALLOWED_PAIRS="$STRATEGY_ALLOWED_PAIRS" \
       STRATEGY_SYMBOLS="$STRATEGY_SYMBOLS" \
+      STRATEGY_LEVERAGE="$STRATEGY_LEVERAGE" \
+      STRATEGY_MAX_GROSS_LEVERAGE="$STRATEGY_MAX_GROSS_LEVERAGE" \
+      STRATEGY_MAX_LONG_LEVERAGE="$STRATEGY_MAX_LONG_LEVERAGE" \
+      STRATEGY_MAX_SHORT_LEVERAGE="$STRATEGY_MAX_SHORT_LEVERAGE" \
+      STRATEGY_RATE_LIMIT_GUARD_ENABLED="$STRATEGY_RATE_LIMIT_GUARD_ENABLED" \
+      STRATEGY_RATE_LIMIT_USAGE_THRESHOLD="$STRATEGY_RATE_LIMIT_USAGE_THRESHOLD" \
       STRATEGY_ORDER_NOTIONAL_USD="$STRATEGY_ORDER_NOTIONAL_USD" \
       STRATEGY_MIN_EXPECTED_NET_EDGE_USD="$STRATEGY_MIN_EXPECTED_NET_EDGE_USD" \
       STRATEGY_MIN_EXPECTED_NET_EDGE_BPS="$STRATEGY_MIN_EXPECTED_NET_EDGE_BPS" \
@@ -216,6 +250,9 @@ EOF
       STRATEGY_MAX_HOLD_SEC="$STRATEGY_MAX_HOLD_SEC" \
       STRATEGY_TAKE_PROFIT_USD="$STRATEGY_TAKE_PROFIT_USD" \
       STRATEGY_STOP_LOSS_USD="$STRATEGY_STOP_LOSS_USD" \
+      STRATEGY_TAKE_PROFIT_BPS="$STRATEGY_TAKE_PROFIT_BPS" \
+      STRATEGY_STOP_LOSS_BPS="$STRATEGY_STOP_LOSS_BPS" \
+      STRATEGY_HOLD_BUFFER_BPS="$STRATEGY_HOLD_BUFFER_BPS" \
       STRATEGY_MAX_OPEN_PAIRS="$STRATEGY_MAX_OPEN_PAIRS" \
       STRATEGY_POSITION_STALE_IGNORE_SEC="$STRATEGY_POSITION_STALE_IGNORE_SEC" \
       STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC="$STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC" \
@@ -301,6 +338,11 @@ show_report() {
   TARGET_EXCHANGES="$STRATEGY_EXCHANGES" SYMBOLS="$STRATEGY_SYMBOLS" STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/report.py --wait-ws-sec 1 --trade-limit 3
 }
 
+show_final_report() {
+  ensure_runtime
+  STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/final_run_report.py --env-file "$STRATEGY_ENV_FILE" --meta "$RUN_META_FILE" "$@"
+}
+
 show_summary() {
   ensure_runtime
   if [[ ! -f "$RUN_META_FILE" ]]; then
@@ -357,6 +399,9 @@ case "$ACTION" in
     ;;
   report)
     show_report
+    ;;
+  final-report)
+    show_final_report "$@"
     ;;
   *)
     usage

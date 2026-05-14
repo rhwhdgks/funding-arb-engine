@@ -101,6 +101,10 @@ def check(status: str, name: str, detail: str) -> dict[str, str]:
 
 
 def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, Any]:
+    from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
+
+    account_label = resolve_account_label()
+    logic = resolve_logic_name()
     open_placeholders = placeholders(OPEN_ORDER_STATUSES)
     open_params = tuple(OPEN_ORDER_STATUSES)
 
@@ -109,23 +113,27 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         f"""
         SELECT exchange_name, symbol, status, COUNT(*) AS row_count
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
           AND UPPER(status) IN ({open_placeholders})
         GROUP BY exchange_name, symbol, status
         ORDER BY exchange_name, symbol, status
         """,
-        (since_ms, *open_params),
+        (account_label, logic, since_ms, *open_params),
     )
     all_open_like = query_dicts(
         conn,
         f"""
         SELECT exchange_name, symbol, status, COUNT(*) AS row_count
         FROM order_history
-        WHERE UPPER(status) IN ({open_placeholders})
+        WHERE account_label = ?
+          AND logic = ?
+          AND UPPER(status) IN ({open_placeholders})
         GROUP BY exchange_name, symbol, status
         ORDER BY exchange_name, symbol, status
         """,
-        open_params,
+        (account_label, logic, *open_params),
     )
 
     order_status_counts = query_dicts(
@@ -133,11 +141,13 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         """
         SELECT exchange_name, status, COUNT(*) AS row_count
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
         GROUP BY exchange_name, status
         ORDER BY exchange_name, status
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     trade_counts = query_dicts(
         conn,
@@ -150,15 +160,17 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             MIN(desktop_time_ms) AS first_trade_ms,
             MAX(desktop_time_ms) AS last_trade_ms
         FROM trade_history
-        WHERE desktop_time_ms >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND desktop_time_ms >= ?
         GROUP BY exchange_name, symbol
         ORDER BY symbol, exchange_name
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
 
-    order_rows = query_scalar(conn, "SELECT COUNT(*) FROM order_history WHERE order_start >= ?", (since_ms,))
-    trade_rows = query_scalar(conn, "SELECT COUNT(*) FROM trade_history WHERE desktop_time_ms >= ?", (since_ms,))
+    order_rows = query_scalar(conn, "SELECT COUNT(*) FROM order_history WHERE account_label = ? AND logic = ? AND order_start >= ?", (account_label, logic, since_ms))
+    trade_rows = query_scalar(conn, "SELECT COUNT(*) FROM trade_history WHERE account_label = ? AND logic = ? AND desktop_time_ms >= ?", (account_label, logic, since_ms))
     run_open_like_count = sum(int(row["row_count"] or 0) for row in run_open_like)
     all_open_like_count = sum(int(row["row_count"] or 0) for row in all_open_like)
 
@@ -167,88 +179,137 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         """
         SELECT COUNT(*)
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
           AND COALESCE(order_id, '') = ''
           AND COALESCE(client_order_id, '') = ''
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     duplicate_order_ids = query_dicts(
         conn,
         """
         SELECT exchange_name, order_id, COUNT(*) AS row_count
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
           AND COALESCE(order_id, '') <> ''
         GROUP BY exchange_name, order_id
         HAVING COUNT(*) > 1
         ORDER BY row_count DESC, exchange_name, order_id
         LIMIT 20
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     duplicate_client_order_ids = query_dicts(
         conn,
         """
         SELECT exchange_name, client_order_id, COUNT(*) AS row_count
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
           AND COALESCE(client_order_id, '') <> ''
         GROUP BY exchange_name, client_order_id
         HAVING COUNT(*) > 1
         ORDER BY row_count DESC, exchange_name, client_order_id
         LIMIT 20
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     executed_qty_over_qty = query_dicts(
         conn,
         """
         SELECT uuid, exchange_name, symbol, side, qty, executed_qty, status
         FROM order_history
-        WHERE order_start >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND order_start >= ?
           AND executed_qty > qty + 0.000000000001
         ORDER BY order_end DESC
         LIMIT 20
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
+    filled_orders_missing_trade_rows = query_dicts(
+        conn,
+        """
+        SELECT
+            o.exchange_name,
+            o.symbol,
+            COUNT(*) AS row_count,
+            ROUND(SUM(ABS(COALESCE(o.avg_price, o.price, 0) * o.executed_qty)), 8) AS exec_notional_sum,
+            ROUND(SUM(ABS(o.executed_qty)), 8) AS executed_qty_sum
+        FROM order_history o
+        WHERE o.account_label = ?
+          AND o.logic = ?
+          AND o.order_start >= ?
+          AND o.executed_qty > 0
+          AND NOT EXISTS (
+              SELECT 1
+              FROM trade_history t
+              WHERE t.account_label = o.account_label
+                AND t.logic = o.logic
+                AND t.exchange_name = o.exchange_name
+                AND t.symbol = o.symbol
+                AND t.desktop_time_ms >= ?
+                AND (
+                    (t.order_uuid IS NOT NULL AND t.order_uuid <> '' AND t.order_uuid = o.uuid)
+                    OR (t.order_id IS NOT NULL AND t.order_id <> '' AND o.order_id IS NOT NULL AND o.order_id <> '' AND t.order_id = o.order_id)
+                    OR (t.client_order_id IS NOT NULL AND t.client_order_id <> '' AND o.client_order_id IS NOT NULL AND o.client_order_id <> '' AND t.client_order_id = o.client_order_id)
+                )
+          )
+        GROUP BY o.exchange_name, o.symbol
+        ORDER BY exec_notional_sum DESC, o.exchange_name, o.symbol
+        LIMIT 40
+        """,
+        (account_label, logic, since_ms, since_ms),
+    )
+    filled_orders_missing_trade_count = sum(int(row["row_count"] or 0) for row in filled_orders_missing_trade_rows)
 
     trades_missing_order_ref = query_scalar(
         conn,
         """
         SELECT COUNT(*)
         FROM trade_history
-        WHERE desktop_time_ms >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND desktop_time_ms >= ?
           AND COALESCE(order_uuid, '') = ''
           AND COALESCE(order_id, '') = ''
           AND COALESCE(client_order_id, '') = ''
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     trades_missing_trade_id = query_scalar(
         conn,
         """
         SELECT COUNT(*)
         FROM trade_history
-        WHERE desktop_time_ms >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND desktop_time_ms >= ?
           AND COALESCE(trade_id, '') = ''
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     duplicate_trade_ids = query_dicts(
         conn,
         """
         SELECT exchange_name, symbol, trade_id, COUNT(*) AS row_count
         FROM trade_history
-        WHERE desktop_time_ms >= ?
+        WHERE account_label = ?
+          AND logic = ?
+          AND desktop_time_ms >= ?
           AND COALESCE(trade_id, '') <> ''
         GROUP BY exchange_name, symbol, trade_id
         HAVING COUNT(*) > 1
         ORDER BY row_count DESC, exchange_name, symbol, trade_id
         LIMIT 20
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
     trades_unlinked_to_order = query_scalar(
         conn,
@@ -258,23 +319,31 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         LEFT JOIN order_history ou
           ON t.order_uuid IS NOT NULL
          AND t.order_uuid <> ''
+         AND t.account_label = ou.account_label
+         AND t.logic = ou.logic
          AND t.order_uuid = ou.uuid
         LEFT JOIN order_history oo
           ON t.order_id IS NOT NULL
          AND t.order_id <> ''
+         AND t.account_label = oo.account_label
+         AND t.logic = oo.logic
          AND t.exchange_name = oo.exchange_name
          AND t.order_id = oo.order_id
         LEFT JOIN order_history oc
           ON t.client_order_id IS NOT NULL
          AND t.client_order_id <> ''
+         AND t.account_label = oc.account_label
+         AND t.logic = oc.logic
          AND t.exchange_name = oc.exchange_name
          AND t.client_order_id = oc.client_order_id
-        WHERE t.desktop_time_ms >= ?
+        WHERE t.account_label = ?
+          AND t.logic = ?
+          AND t.desktop_time_ms >= ?
           AND ou.uuid IS NULL
           AND oo.uuid IS NULL
           AND oc.uuid IS NULL
         """,
-        (since_ms,),
+        (account_label, logic, since_ms),
     )
 
     symbol_exchange_notional: dict[str, dict[str, float]] = defaultdict(dict)
@@ -322,6 +391,11 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             f"rows={len(executed_qty_over_qty)}",
         ),
         check(
+            "PASS" if filled_orders_missing_trade_count == 0 else "WARN",
+            "filled_orders_have_trade_rows",
+            f"rows={filled_orders_missing_trade_count}",
+        ),
+        check(
             "PASS" if trades_missing_order_ref == 0 else "WARN",
             "trades_have_order_reference",
             f"rows={trades_missing_order_ref}",
@@ -356,6 +430,8 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         "since_ms": since_ms,
         "since_utc": iso_utc(since_ms),
         "run_meta": run_meta,
+        "account_label": account_label,
+        "logic": logic,
         "verdict": verdict,
         "fail_count": fail_count,
         "warn_count": warn_count,
@@ -366,6 +442,7 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             "run_open_like_order_rows": run_open_like_count,
             "all_open_like_order_rows": all_open_like_count,
             "orders_missing_external_id": orders_missing_external_id,
+            "filled_orders_missing_trade_rows": filled_orders_missing_trade_count,
             "trades_missing_order_ref": trades_missing_order_ref,
             "trades_unlinked_to_order": trades_unlinked_to_order,
         },
@@ -376,6 +453,7 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         "duplicate_order_ids": duplicate_order_ids,
         "duplicate_client_order_ids": duplicate_client_order_ids,
         "executed_qty_over_qty": executed_qty_over_qty,
+        "filled_orders_missing_trade_rows": filled_orders_missing_trade_rows,
         "duplicate_trade_ids": duplicate_trade_ids,
         "notional_balance_warnings": notional_balance_warnings,
     }
@@ -438,6 +516,9 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Executed Qty Greater Than Qty")
     lines.extend(markdown_table(report["executed_qty_over_qty"], ["uuid", "exchange_name", "symbol", "side", "qty", "executed_qty", "status"]))
+    lines.append("")
+    lines.append("## Filled Orders Missing Trade Rows")
+    lines.extend(markdown_table(report["filled_orders_missing_trade_rows"], ["exchange_name", "symbol", "row_count", "exec_notional_sum", "executed_qty_sum"]))
     lines.append("")
     lines.append("## Duplicate Trade IDs")
     lines.extend(markdown_table(report["duplicate_trade_ids"], ["exchange_name", "symbol", "trade_id", "row_count"]))

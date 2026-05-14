@@ -1382,13 +1382,19 @@ def fetch_balance_snapshot_before_after(
     exchange_name: str,
     event_time_ms: int,
 ) -> dict[str, dict[str, Any] | None]:
+    from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
+
+    account_label = resolve_account_label()
+    logic = resolve_logic_name()
     base_sql = """
     SELECT
-        exchange_name, bucket_start_ms, desktop_time_ms, server_time_ms,
+        account_label, logic, exchange_name, bucket_start_ms, desktop_time_ms, server_time_ms,
         cash_usdt, available_cash_usdt, locked_cash_usdt, total_equity_usdt, unrealized_pnl_usdt,
         raw_json
     FROM balance_snapshot
-    WHERE exchange_name = ?
+    WHERE account_label = ?
+      AND logic = ?
+      AND exchange_name = ?
       AND desktop_time_ms {operator} ?
     ORDER BY desktop_time_ms {direction}, bucket_start_ms {direction}
     LIMIT 1
@@ -1397,7 +1403,10 @@ def fetch_balance_snapshot_before_after(
     def _fetch(operator: str, direction: str) -> dict[str, Any] | None:
         cur = conn.cursor()
         try:
-            cur.execute(base_sql.format(operator=operator, direction=direction), (exchange_name, int(event_time_ms)))
+            cur.execute(
+                base_sql.format(operator=operator, direction=direction),
+                (account_label, logic, exchange_name, int(event_time_ms)),
+            )
             raw_row = cur.fetchone()
             if raw_row is None:
                 return None

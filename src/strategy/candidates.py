@@ -1,0 +1,486 @@
+import time
+from dataclasses import dataclass
+from typing import Any, Callable
+
+from src.strategy.models import PairCandidate, StrategyConfig
+
+
+EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class CandidateBuildHooks:
+    compute_common_executable_qty: Callable[..., float]
+    exchange_min_order_notional_usd: Callable[..., float]
+    effective_position_qty: Callable[..., float]
+    extract_health_can_trade: Callable[..., bool]
+    extract_health_block_reasons: Callable[..., list[str]]
+    has_open_orders: Callable[..., bool]
+    pair_entry_margin_guard_reasons: Callable[..., list[str]]
+
+
+@dataclass(frozen=True)
+class CandidateCollectionHooks:
+    collect_balance_reports_by_exchange: Callable[..., dict[str, dict[str, Any]]]
+    apply_open_pair_capacity_blocks: Callable[..., list[PairCandidate]]
+    apply_recent_symbol_close_blocks: Callable[..., list[PairCandidate]]
+    apply_risk_gate_blocks: Callable[..., list[PairCandidate]]
+    candidate_build_hooks: CandidateBuildHooks
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def extract_best_bid(snapshot: dict[str, Any]) -> float:
+    orderbook = snapshot.get("orderbook", {}) or {}
+    tick = snapshot.get("tick", {}) or {}
+    for source in (orderbook, tick):
+        for key in ("best_bid", "bid", "bid_price"):
+            value = _safe_float(source.get(key), 0.0)
+            if value > 0:
+                return value
+    return 0.0
+
+
+def extract_best_ask(snapshot: dict[str, Any]) -> float:
+    orderbook = snapshot.get("orderbook", {}) or {}
+    tick = snapshot.get("tick", {}) or {}
+    for source in (orderbook, tick):
+        for key in ("best_ask", "ask", "ask_price"):
+            value = _safe_float(source.get(key), 0.0)
+            if value > 0:
+                return value
+    return 0.0
+
+
+def extract_mid_price(snapshot: dict[str, Any]) -> float:
+    bid = extract_best_bid(snapshot)
+    ask = extract_best_ask(snapshot)
+    if bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+    tick = snapshot.get("tick", {}) or {}
+    for key in ("last", "last_price", "price"):
+        value = _safe_float(tick.get(key), 0.0)
+        if value > 0:
+            return value
+    position = snapshot.get("position", {}) or {}
+    for key in ("mark_price", "avg_price", "entry_price"):
+        value = _safe_float(position.get(key), 0.0)
+        if value > 0:
+            return value
+    return 0.0
+
+
+def extract_funding_rate(snapshot: dict[str, Any]) -> float:
+    funding = snapshot.get("funding", {}) or {}
+    for key in ("funding_rate", "fundingRate", "rate"):
+        value = funding.get(key)
+        if value is not None:
+            return _safe_float(value, 0.0)
+    return 0.0
+
+
+def extract_next_funding_ms(snapshot: dict[str, Any]) -> int:
+    funding = snapshot.get("funding", {}) or {}
+    for key in ("funding_next_apply", "next_funding_time", "nextFundingTime"):
+        value = funding.get(key)
+        if value is not None:
+            try:
+                return int(float(value))
+            except Exception:
+                return 0
+    return 0
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def seconds_until(timestamp_ms: int, now_ms: int | None = None) -> float:
+    if timestamp_ms <= 0:
+        return 0.0
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    return max((timestamp_ms - now_ms) / 1000.0, 0.0)
+
+
+def compute_funding_confidence(
+    long_next_funding_ms: int,
+    short_next_funding_ms: int,
+    config: StrategyConfig,
+) -> float:
+    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
+        return clamp(config.funding_missing_confidence, 0.0, 1.0)
+    return 1.0
+
+
+def compute_funding_alignment_factor(
+    long_next_funding_ms: int,
+    short_next_funding_ms: int,
+    config: StrategyConfig,
+) -> float:
+    min_factor = clamp(config.funding_alignment_min_factor, 0.0, 1.0)
+    penalty_window_sec = max(config.funding_alignment_full_penalty_sec, 1.0)
+    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
+        return min_factor
+    gap_sec = abs(long_next_funding_ms - short_next_funding_ms) / 1000.0
+    penalty_ratio = clamp(gap_sec / penalty_window_sec, 0.0, 1.0)
+    return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
+
+
+def compute_funding_time_decay_factor(
+    long_next_funding_ms: int,
+    short_next_funding_ms: int,
+    config: StrategyConfig,
+    now_ms: int | None = None,
+) -> float:
+    min_factor = clamp(config.funding_time_decay_min_factor, 0.0, 1.0)
+    penalty_window_sec = max(config.funding_time_decay_full_penalty_sec, 1.0)
+    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
+        return min_factor
+    farthest_event_sec = max(
+        seconds_until(long_next_funding_ms, now_ms=now_ms),
+        seconds_until(short_next_funding_ms, now_ms=now_ms),
+    )
+    penalty_ratio = clamp(farthest_event_sec / penalty_window_sec, 0.0, 1.0)
+    return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
+
+
+def compute_effective_funding_components(
+    *,
+    long_rate: float,
+    short_rate: float,
+    long_notional: float,
+    short_notional: float,
+    long_next_funding_ms: int,
+    short_next_funding_ms: int,
+    config: StrategyConfig,
+    now_ms: int | None = None,
+) -> tuple[float, float, float, float, float]:
+    raw_funding_pnl_usd = (-long_rate * long_notional) + (short_rate * short_notional)
+    funding_confidence = compute_funding_confidence(long_next_funding_ms, short_next_funding_ms, config)
+    funding_alignment_factor = compute_funding_alignment_factor(long_next_funding_ms, short_next_funding_ms, config)
+    funding_time_decay_factor = compute_funding_time_decay_factor(
+        long_next_funding_ms,
+        short_next_funding_ms,
+        config,
+        now_ms=now_ms,
+    )
+    effective_funding_pnl_usd = (
+        raw_funding_pnl_usd
+        * funding_confidence
+        * funding_alignment_factor
+        * funding_time_decay_factor
+    )
+    return (
+        raw_funding_pnl_usd,
+        funding_confidence,
+        funding_alignment_factor,
+        funding_time_decay_factor,
+        effective_funding_pnl_usd,
+    )
+
+
+def compute_open_cost_usd(
+    long_exchange: str,
+    short_exchange: str,
+    long_notional: float,
+    short_notional: float,
+    config: StrategyConfig,
+) -> float:
+    return (
+        long_notional * config.entry_fee_bps.get(long_exchange, 0.0) / 10000.0
+        + short_notional * config.entry_fee_bps.get(short_exchange, 0.0) / 10000.0
+    )
+
+
+def compute_expected_close_cost_usd(
+    long_exchange: str,
+    short_exchange: str,
+    reference_notional: float,
+    config: StrategyConfig,
+) -> float:
+    close_fee_cost_usd = (
+        reference_notional * config.close_fee_bps.get(long_exchange, 0.0) / 10000.0
+        + reference_notional * config.close_fee_bps.get(short_exchange, 0.0) / 10000.0
+    )
+    close_slippage_cost_usd = reference_notional * (config.close_slippage_bps * 2.0) / 10000.0
+    return close_fee_cost_usd + close_slippage_cost_usd
+
+
+def compute_stale_data_penalty_usd(
+    reference_notional: float,
+    funding_confidence: float,
+    funding_alignment_factor: float,
+    funding_time_decay_factor: float,
+    config: StrategyConfig,
+) -> float:
+    quality = clamp(
+        funding_confidence * funding_alignment_factor * funding_time_decay_factor,
+        0.0,
+        1.0,
+    )
+    return reference_notional * config.stale_data_penalty_bps / 10000.0 * (1.0 - quality)
+
+
+def compute_pair_candidate(
+    symbol: str,
+    long_exchange: str,
+    short_exchange: str,
+    snapshots_by_exchange: dict[str, dict[str, Any]],
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+    hooks: CandidateBuildHooks,
+    balance_reports_by_exchange: dict[str, dict[str, Any]] | None = None,
+    assumed_flat_until_ms: dict[tuple[str, str], int] | None = None,
+) -> PairCandidate:
+    long_snapshot = snapshots_by_exchange[long_exchange][symbol]
+    short_snapshot = snapshots_by_exchange[short_exchange][symbol]
+    long_exchange_obj = exchanges[long_exchange]
+    short_exchange_obj = exchanges[short_exchange]
+
+    long_ask = extract_best_ask(long_snapshot)
+    short_bid = extract_best_bid(short_snapshot)
+    mid_reference = (long_ask + short_bid) / 2.0 if long_ask > 0 and short_bid > 0 else max(long_ask, short_bid, 0.0)
+    target_qty = (config.order_notional_usd / mid_reference) if mid_reference > 0 else 0.0
+    executable_qty = hooks.compute_common_executable_qty(
+        long_exchange_obj,
+        short_exchange_obj,
+        symbol,
+        target_qty,
+        left_price=long_ask,
+        right_price=short_bid,
+    )
+    notional_long = executable_qty * long_ask
+    notional_short = executable_qty * short_bid
+    reference_notional = max((notional_long + notional_short) / 2.0, 0.0)
+    long_min_order_notional_usd = hooks.exchange_min_order_notional_usd(long_exchange_obj, symbol, long_ask)
+    short_min_order_notional_usd = hooks.exchange_min_order_notional_usd(short_exchange_obj, symbol, short_bid)
+
+    funding_long_rate = extract_funding_rate(long_snapshot)
+    funding_short_rate = extract_funding_rate(short_snapshot)
+    long_next_funding_ms = extract_next_funding_ms(long_snapshot)
+    short_next_funding_ms = extract_next_funding_ms(short_snapshot)
+    current_ms = int(time.time() * 1000)
+
+    entry_unit_edge = short_bid - long_ask
+    entry_open_edge_usd = executable_qty * entry_unit_edge
+    entry_open_edge_bps = (entry_unit_edge / mid_reference * 10000.0) if mid_reference > 0 else 0.0
+
+    open_fee_cost_usd = compute_open_cost_usd(
+        long_exchange,
+        short_exchange,
+        notional_long,
+        notional_short,
+        config,
+    )
+    expected_close_cost_usd = compute_expected_close_cost_usd(
+        long_exchange,
+        short_exchange,
+        reference_notional,
+        config,
+    )
+    risk_buffer_usd = reference_notional * config.risk_buffer_bps / 10000.0
+    (
+        raw_funding_pnl_usd,
+        funding_confidence,
+        funding_alignment_factor,
+        funding_time_decay_factor,
+        effective_funding_pnl_usd,
+    ) = compute_effective_funding_components(
+        long_rate=funding_long_rate,
+        short_rate=funding_short_rate,
+        long_notional=notional_long,
+        short_notional=notional_short,
+        long_next_funding_ms=long_next_funding_ms,
+        short_next_funding_ms=short_next_funding_ms,
+        config=config,
+        now_ms=current_ms,
+    )
+    stale_data_penalty_usd = compute_stale_data_penalty_usd(
+        reference_notional,
+        funding_confidence,
+        funding_alignment_factor,
+        funding_time_decay_factor,
+        config,
+    )
+
+    expected_net_edge_usd = (
+        entry_open_edge_usd
+        + effective_funding_pnl_usd
+        - open_fee_cost_usd
+        - expected_close_cost_usd
+        - risk_buffer_usd
+        - stale_data_penalty_usd
+    )
+    expected_net_edge_bps = (expected_net_edge_usd / reference_notional * 10000.0) if reference_notional > 0 else 0.0
+
+    block_reasons: list[str] = []
+    if long_ask <= 0:
+        block_reasons.append(f"{long_exchange}:ask_missing")
+    if short_bid <= 0:
+        block_reasons.append(f"{short_exchange}:bid_missing")
+    if not hooks.extract_health_can_trade(long_snapshot):
+        reasons = hooks.extract_health_block_reasons(long_snapshot) or ["cannot_trade"]
+        block_reasons.append(f"{long_exchange}:{'|'.join(reasons)}")
+    if not hooks.extract_health_can_trade(short_snapshot):
+        reasons = hooks.extract_health_block_reasons(short_snapshot) or ["cannot_trade"]
+        block_reasons.append(f"{short_exchange}:{'|'.join(reasons)}")
+    if abs(hooks.effective_position_qty(long_snapshot, long_exchange_obj, symbol, config, assumed_flat_until_ms)) > EPS:
+        block_reasons.append(f"{long_exchange}:existing_position")
+    if abs(hooks.effective_position_qty(short_snapshot, short_exchange_obj, symbol, config, assumed_flat_until_ms)) > EPS:
+        block_reasons.append(f"{short_exchange}:existing_position")
+    if hooks.has_open_orders(long_snapshot):
+        block_reasons.append(f"{long_exchange}:open_orders_exist")
+    if hooks.has_open_orders(short_snapshot):
+        block_reasons.append(f"{short_exchange}:open_orders_exist")
+    if target_qty <= EPS:
+        block_reasons.append("target_qty_zero")
+    if executable_qty <= EPS:
+        block_reasons.append("common_executable_qty_zero")
+    block_reasons.extend(
+        hooks.pair_entry_margin_guard_reasons(
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            long_exchange_obj=long_exchange_obj,
+            short_exchange_obj=short_exchange_obj,
+            long_notional_usd=notional_long,
+            short_notional_usd=notional_short,
+            config=config,
+            balance_reports_by_exchange=balance_reports_by_exchange,
+        )
+    )
+    if (
+        config.min_effective_funding_usd is not None
+        and effective_funding_pnl_usd < config.min_effective_funding_usd
+    ):
+        block_reasons.append("effective_funding_below_usd_threshold")
+    if config.require_funding_payment and raw_funding_pnl_usd >= -EPS:
+        block_reasons.append("funding_payment_required")
+    if expected_net_edge_usd < config.min_expected_net_edge_usd:
+        block_reasons.append("net_edge_below_usd_threshold")
+    if expected_net_edge_bps < config.min_expected_net_edge_bps:
+        block_reasons.append("net_edge_below_bps_threshold")
+
+    can_enter = len(block_reasons) == 0
+    return PairCandidate(
+        symbol=symbol,
+        long_exchange=long_exchange,
+        short_exchange=short_exchange,
+        long_ask=long_ask,
+        short_bid=short_bid,
+        mid_reference=mid_reference,
+        target_qty=target_qty,
+        executable_qty=executable_qty,
+        notional_usd=reference_notional,
+        long_min_order_notional_usd=long_min_order_notional_usd,
+        short_min_order_notional_usd=short_min_order_notional_usd,
+        entry_open_edge_usd=entry_open_edge_usd,
+        entry_open_edge_bps=entry_open_edge_bps,
+        open_fee_cost_usd=open_fee_cost_usd,
+        raw_funding_pnl_usd=raw_funding_pnl_usd,
+        effective_funding_pnl_usd=effective_funding_pnl_usd,
+        funding_confidence=funding_confidence,
+        funding_alignment_factor=funding_alignment_factor,
+        funding_time_decay_factor=funding_time_decay_factor,
+        expected_close_cost_usd=expected_close_cost_usd,
+        risk_buffer_usd=risk_buffer_usd,
+        stale_data_penalty_usd=stale_data_penalty_usd,
+        expected_net_edge_usd=expected_net_edge_usd,
+        expected_net_edge_bps=expected_net_edge_bps,
+        funding_long_rate=funding_long_rate,
+        funding_short_rate=funding_short_rate,
+        long_next_funding_ms=long_next_funding_ms,
+        short_next_funding_ms=short_next_funding_ms,
+        can_enter=can_enter,
+        block_reasons=block_reasons,
+    )
+
+
+def rank_candidates(candidates: list[PairCandidate]) -> list[PairCandidate]:
+    return sorted(
+        candidates,
+        key=lambda item: (
+            0 if item.can_enter else 1,
+            -item.expected_net_edge_usd,
+            -item.effective_funding_pnl_usd,
+            item.symbol,
+            item.long_exchange,
+            item.short_exchange,
+        ),
+    )
+
+
+def collect_pair_candidates(
+    symbols: list[str],
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+    hooks: CandidateCollectionHooks,
+    open_pairs: dict[str, Any] | None = None,
+    entry_control_store: Any | None = None,
+    assumed_flat_until_ms: dict[tuple[str, str], int] | None = None,
+    symbol_recent_close_ms: dict[str, int] | None = None,
+    recent_close_block_logged_ms: dict[str, int] | None = None,
+    startup_block_reasons: tuple[str, ...] = (),
+) -> list[PairCandidate]:
+    snapshots_by_exchange: dict[str, dict[str, Any]] = {
+        exchange_name: {symbol: exchange.get_symbol_snapshot(symbol) for symbol in symbols}
+        for exchange_name, exchange in exchanges.items()
+    }
+    balance_reports_by_exchange = hooks.collect_balance_reports_by_exchange(exchanges)
+    candidates: list[PairCandidate] = []
+    for left, right in config.allowed_pairs:
+        for symbol in symbols:
+            candidates.append(
+                compute_pair_candidate(
+                    symbol,
+                    left,
+                    right,
+                    snapshots_by_exchange,
+                    exchanges,
+                    config,
+                    hooks.candidate_build_hooks,
+                    balance_reports_by_exchange=balance_reports_by_exchange,
+                    assumed_flat_until_ms=assumed_flat_until_ms,
+                )
+            )
+            candidates.append(
+                compute_pair_candidate(
+                    symbol,
+                    right,
+                    left,
+                    snapshots_by_exchange,
+                    exchanges,
+                    config,
+                    hooks.candidate_build_hooks,
+                    balance_reports_by_exchange=balance_reports_by_exchange,
+                    assumed_flat_until_ms=assumed_flat_until_ms,
+                )
+            )
+
+    ranked = rank_candidates(candidates)
+    if open_pairs is not None:
+        ranked = hooks.apply_open_pair_capacity_blocks(ranked, open_pairs, config)
+    ranked = hooks.apply_recent_symbol_close_blocks(
+        ranked,
+        exchanges,
+        config,
+        symbol_recent_close_ms,
+        recent_close_block_logged_ms,
+        assumed_flat_until_ms,
+    )
+    return hooks.apply_risk_gate_blocks(
+        ranked,
+        open_pairs,
+        exchanges,
+        config,
+        entry_control_store,
+        balance_reports_by_exchange,
+        startup_block_reasons,
+    )

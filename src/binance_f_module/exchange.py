@@ -30,6 +30,7 @@ from .api import (
     delete_order,
     get_ticker_list,
     get_open_orders,
+    get_rest_rate_limit_state as api_get_rest_rate_limit_state,
     get_funding_rate,
     get_funding_rate_history,
     get_ohlcv_1m,
@@ -46,6 +47,13 @@ from .websocket_manager import WebSocketManager
 
 def simple_stdout_enabled() -> bool:
     return os.getenv("STRATEGY_STDOUT_LOG_STYLE", "verbose").strip().lower() == "simple"
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off", ""}
 
 
 class Exchange:
@@ -124,6 +132,9 @@ class Exchange:
         self.account_interval = float(os.getenv("BINANCE_ACCOUNT_INTERVAL_SEC", str(account_interval)))
         self.order_interval = order_interval
         self.open_orders_interval = open_orders_interval
+        self.open_orders_symbol_scoped = _env_bool("BINANCE_OPEN_ORDERS_SYMBOL_SCOPED", True)
+        self.open_orders_symbol_scoped_max_symbols = int(float(os.getenv("BINANCE_OPEN_ORDERS_SYMBOL_SCOPED_MAX_SYMBOLS", "30")))
+        self.open_orders_symbol_sleep_sec = float(os.getenv("BINANCE_OPEN_ORDERS_SYMBOL_SLEEP_SEC", "0.02"))
         self.funding_interval = funding_interval
         self.health_interval = health_interval
         self.order_cooldown_sec = order_cooldown_sec
@@ -456,6 +467,36 @@ class Exchange:
     async def get_margin_mode(self, symbol: str, expected_mode: str | None = None) -> dict[str, Any]:
         return await api_get_margin_mode(symbol)
 
+    def get_margin_mode_from_account_snapshot(self, symbol: str) -> dict[str, Any]:
+        ticker = str(symbol or "").upper()
+        entry = (self.account_dict or {}).get(ticker) or {}
+        raw_mode = entry.get("margin_type") or entry.get("marginType")
+        if raw_mode:
+            return {
+                "ok": True,
+                "symbol": ticker,
+                "margin_mode": raw_mode,
+                "source": "account_snapshot",
+                "error": "",
+                "fallback_allowed": False,
+            }
+        return {
+            "ok": False,
+            "symbol": ticker,
+            "margin_mode": None,
+            "source": "account_snapshot",
+            "error": (
+                "margin_mode_missing_in_account_snapshot"
+                if self.account_snapshot_last_sync_ms
+                else "account_snapshot_never_synced"
+            ),
+            # Binance account snapshots already contain per-symbol marginType.
+            # Falling back to /positionRisk per symbol creates startup request
+            # bursts, so fail closed instead of fanning out private REST calls.
+            "fallback_allowed": False,
+            "non_blocking": True,
+        }
+
     async def reconcile_state(
         self,
         *,
@@ -702,7 +743,7 @@ class Exchange:
     async def run_check_open_orders(self):
         while self._running:
             try:
-                order_list = await get_open_orders({})
+                order_list = await self._fetch_open_orders_snapshot()
                 if order_list is None:
                     await asyncio.sleep(self.open_orders_interval)
                     continue
@@ -718,6 +759,25 @@ class Exchange:
                 self._refresh_runtime_summary(refresh_source="run_check_open_orders", error=str(e), touch_attempt=False)
 
             await asyncio.sleep(self.open_orders_interval)
+
+    async def _fetch_open_orders_snapshot(self) -> list[dict[str, Any]] | None:
+        symbol_scoped = (
+            self.open_orders_symbol_scoped
+            and bool(self.ticker_list)
+            and len(self.ticker_list) <= self.open_orders_symbol_scoped_max_symbols
+        )
+        if not symbol_scoped:
+            return await get_open_orders({})
+
+        merged: list[dict[str, Any]] = []
+        for ticker in self.ticker_list:
+            order_list = await get_open_orders({"symbol": ticker})
+            if order_list is None:
+                return None
+            merged.extend(order_list)
+            if self.open_orders_symbol_sleep_sec > 0:
+                await asyncio.sleep(self.open_orders_symbol_sleep_sec)
+        return merged
 
     async def run_funding(self):
         while self._running:
@@ -1077,8 +1137,8 @@ class Exchange:
     async def get_ohlcv_snapshot(self, ticker: str, limit: int = 120):
         return await get_ohlcv_1m(ticker.upper(), limit=limit)
 
-    async def get_trades(self, ticker: str | None = None, limit: int = 100):
-        return await get_my_trades(ticker.upper() if ticker else None, limit=limit)
+    async def get_trades(self, ticker: str | None = None, limit: int = 100, option: dict[str, Any] | None = None):
+        return await get_my_trades(ticker.upper() if ticker else None, limit=limit, option=option)
 
     async def get_trade_history(self, ticker: str | None = None, limit: int = 100):
         return await self.get_trades(ticker=ticker, limit=limit)
@@ -1148,6 +1208,7 @@ class Exchange:
                 "mark_price": entry.get("markPrice", 0.0),
                 "unrealized_profit": entry.get("unrealized_profit", entry.get("unrealizedProfit", 0.0)),
                 "position_side": entry.get("positionSide", "BOTH"),
+                "margin_type": entry.get("margin_type", entry.get("marginType")),
                 "timestamp": timestamp,
             }
             self.net_exposure[ticker] = qty
@@ -1235,6 +1296,22 @@ class Exchange:
         try:
             retry_count = max(int(os.getenv("TRADE_HISTORY_SYNC_RETRY_COUNT", "4") or 4), 1)
             retry_delay_sec = max(float(os.getenv("TRADE_HISTORY_SYNC_RETRY_DELAY_SEC", "0.5") or 0.5), 0.0)
+            order_id = self._order_id_for_fill_lookup(order_payload)
+            if order_id:
+                direct_trades = await self.get_trades(
+                    ticker,
+                    limit=max(self.market_order_followup_trade_limit, 100),
+                    option={"order_id": order_id},
+                )
+                matched_count = schedule_matched_trade_history_upsert(
+                    self.persist_name,
+                    ticker,
+                    order_payload,
+                    direct_trades or [],
+                )
+                if matched_count > 0:
+                    return
+
             for attempt in range(retry_count):
                 trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
                 matched_count = schedule_matched_trade_history_upsert(
@@ -1250,6 +1327,48 @@ class Exchange:
             print(f"[{self.name}][trade_history_sync][warn] no matched trades ticker={ticker}")
         except Exception as exc:
             print(f"[{self.name}][trade_history_sync][error] {exc}")
+
+    def _order_id_for_fill_lookup(self, order: dict | None) -> str | None:
+        if not isinstance(order, dict):
+            return None
+        value = order.get("order_id")
+        if value in (None, ""):
+            raw = order.get("raw")
+            if isinstance(raw, dict):
+                value = raw.get("orderId")
+        if value in (None, ""):
+            return None
+        text = str(value)
+        return text if text.isdigit() else None
+
+    def _order_payload_executed_qty(self, order: dict | None) -> float:
+        if not isinstance(order, dict):
+            return 0.0
+
+        def as_float(value: Any) -> float:
+            try:
+                if value in (None, ""):
+                    return 0.0
+                return float(value)
+            except Exception:
+                return 0.0
+
+        executed_qty = max(
+            as_float(order.get("executed_qty")),
+            as_float(order.get("filled_qty")),
+            as_float(order.get("filled")),
+        )
+        raw = order.get("raw")
+        if isinstance(raw, dict):
+            executed_qty = max(executed_qty, as_float(raw.get("executedQty")))
+        if executed_qty > 1e-12:
+            return executed_qty
+
+        order_qty = as_float(order.get("qty") or order.get("amount"))
+        left_qty = as_float(order.get("left_qty") or order.get("remaining"))
+        if order_qty > 1e-12 and 0.0 <= left_qty < order_qty:
+            return max(order_qty - left_qty, 0.0)
+        return 0.0
 
     def handle_cancel_result(self, result: Optional[dict], uuid: str):
         if not result:
@@ -1307,6 +1426,25 @@ class Exchange:
                 self.rate_limit_state["blocked"] = True
                 self.rate_limit_state["reason"] = f"rate_limit_{interval}_{interval_num}"
                 break
+
+    def get_rate_limit_state(self) -> dict[str, Any]:
+        base_state = deepcopy(self.rate_limit_state)
+        state = dict(base_state)
+        rest_state = api_get_rest_rate_limit_state()
+        if rest_state:
+            base_blocked = bool(base_state.get("blocked"))
+            rest_blocked = bool(rest_state.get("blocked"))
+            base_reason = str(base_state.get("reason") or "")
+            rest_reason = str(rest_state.get("reason") or "")
+            state.update(rest_state)
+            if rest_state.get("rate_limits"):
+                state["last"] = rest_state["rate_limits"]
+            state["blocked"] = base_blocked or rest_blocked
+            if rest_blocked:
+                state["reason"] = rest_reason
+            elif base_blocked:
+                state["reason"] = base_reason
+        return state
 
     def _order_key(self, order: dict) -> str:
         return str(
@@ -1445,7 +1583,7 @@ class Exchange:
                         event_source="rest_poll_market",
                     )
 
-                    if latest_status in {"FILLED", "FINISHED"}:
+                    if latest_status in {"FILLED", "FINISHED"} or self._order_payload_executed_qty(merged_status) > 1e-12:
                         self._schedule_trade_history_sync(ticker, merged_status)
 
                     return emitted
@@ -1618,11 +1756,12 @@ class Exchange:
                 if latest_state == "exist" or (is_open_like and latest_state != "not_exist"):
                     self._replace_waiting_order(current_status)
                     self._remember_order_status(current_status)
-                    print(
-                        f"[{self.name}][open_orders_reconcile][restore_live] "
-                        f"ticker={ticker} order_key={order_key or '-'} "
-                        f"status={latest_status or '-'} state={latest_state or '-'}"
-                    )
+                    if not simple_stdout_enabled():
+                        print(
+                            f"[{self.name}][open_orders_reconcile][restore_live] "
+                            f"ticker={ticker} order_key={order_key or '-'} "
+                            f"status={latest_status or '-'} state={latest_state or '-'}"
+                        )
                     return None
 
                 polled_event = schedule_polled_order_status(
@@ -1632,14 +1771,15 @@ class Exchange:
                     current_status,
                     event_source="open_orders_reconcile",
                 )
-                if polled_event in {"partial_fill", "fill"}:
+                if polled_event in {"partial_fill", "fill"} or self._order_payload_executed_qty(current_status) > 1e-12:
                     self._schedule_trade_history_sync(ticker, current_status)
                 if polled_event in {"fill", "order_canceled", "order_rejected", "order_expired", "order_missing"}:
                     self._forget_order_status(order)
-                    print(
-                        f"[{self.name}][open_orders_reconcile][finalized] "
-                        f"ticker={ticker} order_key={order_key or '-'} event={polled_event}"
-                    )
+                    if not simple_stdout_enabled():
+                        print(
+                            f"[{self.name}][open_orders_reconcile][finalized] "
+                            f"ticker={ticker} order_key={order_key or '-'} event={polled_event}"
+                        )
                     return polled_event
         except Exception as exc:
             print(
@@ -1658,10 +1798,11 @@ class Exchange:
             )
             if progress_event == "fill":
                 self._forget_order_status(order)
-                print(
-                    f"[{self.name}][open_orders_reconcile][finalized] "
-                    f"ticker={ticker} order_key={order_key or '-'} event=fill"
-                )
+                if not simple_stdout_enabled():
+                    print(
+                        f"[{self.name}][open_orders_reconcile][finalized] "
+                        f"ticker={ticker} order_key={order_key or '-'} event=fill"
+                    )
                 return progress_event
             if progress_event == "partial_fill" and isinstance(progress_payload, dict):
                 terminal_payload = deepcopy(progress_payload)
@@ -1674,11 +1815,13 @@ class Exchange:
                     terminal_payload,
                     event_source="open_orders_reconcile",
                 )
+                self._schedule_trade_history_sync(ticker, terminal_payload)
                 self._forget_order_status(order)
-                print(
-                    f"[{self.name}][open_orders_reconcile][finalized] "
-                    f"ticker={ticker} order_key={order_key or '-'} event={terminal_event or 'order_canceled'}"
-                )
+                if not simple_stdout_enabled():
+                    print(
+                        f"[{self.name}][open_orders_reconcile][finalized] "
+                        f"ticker={ticker} order_key={order_key or '-'} event={terminal_event or 'order_canceled'}"
+                    )
                 return terminal_event or "order_canceled"
         except Exception as exc:
             print(
@@ -1696,10 +1839,11 @@ class Exchange:
             event_source="open_orders_reconcile",
         )
         self._forget_order_status(order)
-        print(
-            f"[{self.name}][open_orders_reconcile][finalized] "
-            f"ticker={ticker} order_key={order_key or '-'} event={missing_event or 'order_missing'}"
-        )
+        if not simple_stdout_enabled():
+            print(
+                f"[{self.name}][open_orders_reconcile][finalized] "
+                f"ticker={ticker} order_key={order_key or '-'} event={missing_event or 'order_missing'}"
+            )
         return missing_event or "order_missing"
 
     def _get_merged_open_order_map(self) -> dict[str, list[dict]]:

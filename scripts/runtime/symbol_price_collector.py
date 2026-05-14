@@ -32,6 +32,26 @@ def _normalize_symbol(value: str) -> str:
     return value.strip().upper()
 
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value in (None, ""):
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _has_full_price_fields(row: dict[str, Any]) -> bool:
+    return all(
+        _safe_float(row.get(field)) not in (None, 0.0)
+        for field in ("best_bid", "best_ask", "bid", "ask")
+    )
+
+
 def _requested_symbols() -> list[str] | None:
     raw = os.getenv("SYMBOL_PRICE_SYMBOLS", os.getenv("STRATEGY_SYMBOLS", "ALL")).strip()
     if not raw or raw.upper() == "ALL":
@@ -143,6 +163,22 @@ class ExchangeCollector:
             filtered[symbol] = row
         return filtered, stale_count
 
+    def ws_prefill_rows(self, filtered_impact: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        target_symbols = set(self.symbols)
+        rows: dict[str, dict[str, Any]] = {}
+        for symbol, row in filtered_impact.items():
+            normalized_symbol = _normalize_symbol(symbol)
+            if normalized_symbol not in target_symbols:
+                continue
+            if not _has_full_price_fields(row):
+                continue
+            rows[normalized_symbol] = dict(row)
+        return rows
+
+    def ws_prefill_is_complete(self, ws_rows: dict[str, dict[str, Any]]) -> bool:
+        target_symbols = set(self.symbols)
+        return bool(target_symbols) and target_symbols.issubset(set(ws_rows))
+
 
 async def _build_binance_collector(symbols: list[str] | None, impact_notional_usd: float) -> ExchangeCollector:
     from src.binance_f_module.api import get_market_prefill, get_ticker_list
@@ -226,20 +262,30 @@ async def build_collectors(exchange_names: list[str], symbols: list[str] | None,
     return collectors
 
 
-async def persist_symbol_price_once(collectors: list[ExchangeCollector], ws_stale_sec: float) -> dict[str, dict[str, int]]:
+async def persist_symbol_price_once(
+    collectors: list[ExchangeCollector],
+    ws_stale_sec: float,
+    *,
+    ws_first: bool,
+) -> dict[str, dict[str, int | str]]:
     now_ms = current_utc_ms()
     stale_ms = max(int(ws_stale_sec * 1000), 0)
-    api_results = await asyncio.gather(*(collector.fetch_api() for collector in collectors))
 
     conn = await asyncio.to_thread(get_db_connection)
     try:
-        summary: dict[str, dict[str, int]] = {}
-        for collector, api_rows in zip(collectors, api_results):
-            api_rows = api_rows or {}
+        summary: dict[str, dict[str, int | str]] = {}
+        for collector in collectors:
             filtered_impact, stale_count = collector.filtered_impact_state(now_ms, stale_ms)
+            ws_rows = collector.ws_prefill_rows(filtered_impact)
+            if ws_first and collector.ws_prefill_is_complete(ws_rows):
+                prefill_rows = ws_rows
+                prefill_source = "ws"
+            else:
+                prefill_rows = await collector.fetch_api() or {}
+                prefill_source = "rest"
             rows = build_symbol_price_rows(
                 collector.exchange_name,
-                api_rows,
+                prefill_rows,
                 filtered_impact,
                 snapshot_time_ms=now_ms,
             )
@@ -247,11 +293,13 @@ async def persist_symbol_price_once(collectors: list[ExchangeCollector], ws_stal
             missing_impact = max(len(rows) - len(filtered_impact), 0)
             summary[collector.exchange_name] = {
                 "symbols": len(collector.symbols),
-                "api_rows": len(api_rows),
+                "api_rows": 0 if prefill_source == "ws" else len(prefill_rows),
+                "ws_prefill_rows": len(ws_rows),
                 "impact_rows": len(filtered_impact),
                 "stale_impact_rows": stale_count,
                 "missing_impact_rows": missing_impact,
                 "inserted": inserted,
+                "prefill_source": prefill_source,
             }
         return summary
     finally:
@@ -264,6 +312,7 @@ async def run_collector(*, once: bool = False) -> None:
     impact_notional_usd = float(os.getenv("SYMBOL_PRICE_IMPACT_NOTIONAL_USD", "20000") or 20000)
     interval_sec = max(int(float(os.getenv("SYMBOL_PRICE_INTERVAL_SEC", "60") or 60)), 1)
     ws_stale_sec = float(os.getenv("SYMBOL_PRICE_WS_STALE_SEC", "15") or 15)
+    ws_first = _env_bool("SYMBOL_PRICE_WS_FIRST", "1")
 
     schema_conn = await asyncio.to_thread(get_db_connection)
     try:
@@ -276,14 +325,16 @@ async def run_collector(*, once: bool = False) -> None:
     try:
         await asyncio.sleep(3.0)
         while True:
-            summary = await persist_symbol_price_once(collectors, ws_stale_sec=ws_stale_sec)
+            summary = await persist_symbol_price_once(collectors, ws_stale_sec=ws_stale_sec, ws_first=ws_first)
             now_ms = current_utc_ms()
             for exchange_name, item in summary.items():
                 print(
                     "[symbol-price]"
                     f" exchange={exchange_name}"
                     f" inserted={item['inserted']}"
+                    f" prefill_source={item['prefill_source']}"
                     f" api_rows={item['api_rows']}"
+                    f" ws_prefill_rows={item['ws_prefill_rows']}"
                     f" impact_rows={item['impact_rows']}"
                     f" stale_impact_rows={item['stale_impact_rows']}"
                     f" missing_impact_rows={item['missing_impact_rows']}"

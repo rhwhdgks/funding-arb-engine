@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Iterable
 
 
 RISK_SYMBOL_PAIR_EXISTS = "risk:symbol_pair_exists"
@@ -11,6 +11,9 @@ RISK_INSUFFICIENT_MARGIN = "risk:insufficient_margin"
 RISK_MARGIN_MODE_NOT_CROSS = "risk:margin_mode_not_cross"
 RISK_MARGIN_MODE_UNKNOWN = "risk:margin_mode_unknown"
 RISK_MARGIN_MODE_CHECK_FAILED = "risk:margin_mode_check_failed"
+RISK_EXPOSURE_CAP_EXCEEDED = "risk:exposure_cap_exceeded"
+RISK_EXPOSURE_EQUITY_UNAVAILABLE = "risk:exposure_equity_unavailable"
+RISK_RATE_LIMIT_PRESSURE = "risk:rate_limit_pressure"
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class RiskGateContext:
 class RiskGateDecision:
     allowed: bool
     reasons: tuple[str, ...] = ()
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 def _dedupe_reasons(reasons: Iterable[str]) -> tuple[str, ...]:
@@ -68,6 +72,9 @@ def evaluate_entry_risk(
     symbol: str,
     planned_order_slots: Iterable[OrderSlot],
     margin_reasons: Iterable[str] = (),
+    exposure_reasons: Iterable[str] = (),
+    rate_limit_reasons: Iterable[str] = (),
+    details: dict[str, Any] | None = None,
     context: RiskGateContext,
 ) -> RiskGateDecision:
     reasons: list[str] = []
@@ -89,5 +96,8 @@ def evaluate_entry_risk(
     if any(str(reason or "").strip() for reason in margin_reasons):
         reasons.append(RISK_INSUFFICIENT_MARGIN)
 
+    reasons.extend(exposure_reasons)
+    reasons.extend(rate_limit_reasons)
+
     deduped = _dedupe_reasons(reasons)
-    return RiskGateDecision(allowed=not deduped, reasons=deduped)
+    return RiskGateDecision(allowed=not deduped, reasons=deduped, details=dict(details or {}))

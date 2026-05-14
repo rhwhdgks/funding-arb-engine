@@ -33,6 +33,7 @@ ACTION="${1:-start}"
 : "${SYMBOL_PRICE_INTERVAL_SEC:=60}"
 : "${SYMBOL_PRICE_IMPACT_NOTIONAL_USD:=20000}"
 : "${SYMBOL_PRICE_WS_STALE_SEC:=15}"
+: "${SYMBOL_PRICE_WS_FIRST:=1}"
 
 usage() {
   cat <<'EOF'
@@ -82,6 +83,7 @@ run_command() {
     SYMBOL_PRICE_INTERVAL_SEC="$SYMBOL_PRICE_INTERVAL_SEC" \
     SYMBOL_PRICE_IMPACT_NOTIONAL_USD="$SYMBOL_PRICE_IMPACT_NOTIONAL_USD" \
     SYMBOL_PRICE_WS_STALE_SEC="$SYMBOL_PRICE_WS_STALE_SEC" \
+    SYMBOL_PRICE_WS_FIRST="$SYMBOL_PRICE_WS_FIRST" \
     "$PYTHON_BIN" -u "$SCRIPT_PATH_ABS" "$@"
 }
 
@@ -95,39 +97,50 @@ start_run() {
     exit 1
   fi
 
-  (
-    trap 'rm -f "$PID_FILE"' EXIT
-    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] symbol_price collector start script=${SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
-    if [[ -n "$RUN_DURATION" ]]; then
-      flock -n "$LOCK_FILE" env \
-        STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
-        SYMBOL_PRICE_EXCHANGES="$SYMBOL_PRICE_EXCHANGES" \
-        SYMBOL_PRICE_SYMBOLS="$SYMBOL_PRICE_SYMBOLS" \
-        SYMBOL_PRICE_INTERVAL_SEC="$SYMBOL_PRICE_INTERVAL_SEC" \
-        SYMBOL_PRICE_IMPACT_NOTIONAL_USD="$SYMBOL_PRICE_IMPACT_NOTIONAL_USD" \
-        SYMBOL_PRICE_WS_STALE_SEC="$SYMBOL_PRICE_WS_STALE_SEC" \
-        timeout "$RUN_DURATION" \
-        "$PYTHON_BIN" -u "$SCRIPT_PATH_ABS"
-    else
-      flock -n "$LOCK_FILE" env \
-        STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
-        SYMBOL_PRICE_EXCHANGES="$SYMBOL_PRICE_EXCHANGES" \
-        SYMBOL_PRICE_SYMBOLS="$SYMBOL_PRICE_SYMBOLS" \
-        SYMBOL_PRICE_INTERVAL_SEC="$SYMBOL_PRICE_INTERVAL_SEC" \
-        SYMBOL_PRICE_IMPACT_NOTIONAL_USD="$SYMBOL_PRICE_IMPACT_NOTIONAL_USD" \
-        SYMBOL_PRICE_WS_STALE_SEC="$SYMBOL_PRICE_WS_STALE_SEC" \
-        "$PYTHON_BIN" -u "$SCRIPT_PATH_ABS"
-    fi
-    status=$?
-    ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] symbol_price collector exit status=${status}" >> "$STDOUT_LOG"
-    exit "$status"
-  ) >> "$STDOUT_LOG" 2>&1 &
+  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo "[$ts] symbol_price collector start script=${SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
+
+  detach_cmd=(nohup)
+  if command -v setsid >/dev/null 2>&1; then
+    detach_cmd=(nohup setsid)
+  fi
+
+  if [[ -n "$RUN_DURATION" ]]; then
+    "${detach_cmd[@]}" env \
+      STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
+      SYMBOL_PRICE_EXCHANGES="$SYMBOL_PRICE_EXCHANGES" \
+      SYMBOL_PRICE_SYMBOLS="$SYMBOL_PRICE_SYMBOLS" \
+      SYMBOL_PRICE_INTERVAL_SEC="$SYMBOL_PRICE_INTERVAL_SEC" \
+      SYMBOL_PRICE_IMPACT_NOTIONAL_USD="$SYMBOL_PRICE_IMPACT_NOTIONAL_USD" \
+      SYMBOL_PRICE_WS_STALE_SEC="$SYMBOL_PRICE_WS_STALE_SEC" \
+      SYMBOL_PRICE_WS_FIRST="$SYMBOL_PRICE_WS_FIRST" \
+      flock -n "$LOCK_FILE" \
+      timeout "$RUN_DURATION" \
+      "$PYTHON_BIN" -u "$SCRIPT_PATH_ABS" \
+      >> "$STDOUT_LOG" 2>&1 < /dev/null &
+  else
+    "${detach_cmd[@]}" env \
+      STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
+      SYMBOL_PRICE_EXCHANGES="$SYMBOL_PRICE_EXCHANGES" \
+      SYMBOL_PRICE_SYMBOLS="$SYMBOL_PRICE_SYMBOLS" \
+      SYMBOL_PRICE_INTERVAL_SEC="$SYMBOL_PRICE_INTERVAL_SEC" \
+      SYMBOL_PRICE_IMPACT_NOTIONAL_USD="$SYMBOL_PRICE_IMPACT_NOTIONAL_USD" \
+      SYMBOL_PRICE_WS_STALE_SEC="$SYMBOL_PRICE_WS_STALE_SEC" \
+      SYMBOL_PRICE_WS_FIRST="$SYMBOL_PRICE_WS_FIRST" \
+      flock -n "$LOCK_FILE" \
+      "$PYTHON_BIN" -u "$SCRIPT_PATH_ABS" \
+      >> "$STDOUT_LOG" 2>&1 < /dev/null &
+  fi
 
   pid=$!
   echo "$pid" > "$PID_FILE"
   disown "$pid" 2>/dev/null || true
+  sleep 0.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "[run_symbol_price] failed to start; see $STDOUT_LOG" >&2
+    exit 1
+  fi
   echo "[run_symbol_price] started pid=$pid"
   echo "[run_symbol_price] stdout=$STDOUT_LOG"
 }

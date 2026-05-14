@@ -4,6 +4,8 @@ import asyncio
 import time
 from typing import Any, Awaitable, Callable
 
+from src.strategy.logging import log_entry_partial_fill
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -103,6 +105,100 @@ def emit_order_event(
         recorder(event_type, **payload)
     except Exception as exc:
         print(f"[strategy][order_event][warn] event_type={event_type} error={exc!r}")
+
+
+def market_freshness_payload(exchange: Any, symbol: str, submit_start_ms: int) -> dict[str, Any]:
+    try:
+        snapshot = exchange.get_symbol_snapshot(symbol)
+    except Exception:
+        snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    health = snapshot.get("health", {}) or {}
+    if not isinstance(health, dict):
+        health = {}
+
+    market_state = snapshot.get("market_state", {}) or {}
+    orderbook = snapshot.get("orderbook", {}) or {}
+    tick = snapshot.get("tick", {}) or {}
+
+    ws_desktop_time_last_ms = int(health.get("ws_desktop_time_last_ms") or 0)
+    ws_event_time_last_ms = int(health.get("ws_event_time_last_ms") or 0)
+    ws_server_time_last_ms = int(health.get("ws_server_time_last_ms") or 0)
+    stale_age_ms = int(health.get("stale_age_ms") or 0)
+    submit_market_age_ms = submit_start_ms - ws_desktop_time_last_ms if ws_desktop_time_last_ms > 0 else stale_age_ms
+
+    return {
+        "submit_start_ms": submit_start_ms,
+        "market_age_ms": submit_market_age_ms,
+        "stale_age_ms": stale_age_ms,
+        "ws_last_update_ms": int(health.get("ws_last_update_ms") or 0),
+        "ws_desktop_time_last_ms": ws_desktop_time_last_ms,
+        "ws_event_time_last_ms": ws_event_time_last_ms,
+        "ws_server_time_last_ms": ws_server_time_last_ms,
+        "ws_source_last": health.get("ws_source_last"),
+        "market_source_last": health.get("market_source_last") or market_state.get("source"),
+        "event_lag_ms": health.get("event_lag_ms"),
+        "transport_lag_ms": health.get("transport_lag_ms"),
+        "can_trade": bool(health.get("can_trade", True)),
+        "block_reasons": list(health.get("block_reasons", []) or []),
+        "best_bid": _safe_float(orderbook.get("best_bid") or tick.get("best_bid") or tick.get("bid"), 0.0),
+        "best_ask": _safe_float(orderbook.get("best_ask") or tick.get("best_ask") or tick.get("ask"), 0.0),
+    }
+
+
+def log_entry_first_leg_progress(
+    *,
+    exchange: Any,
+    symbol: str,
+    side: str,
+    target_qty: float,
+    previous_qty: float,
+    resolved_qty: float,
+    order_result: dict[str, Any] | None,
+    pre_qty: float,
+    post_qty: float | None,
+    reason: str,
+    record_order_event: Callable[..., None] | None,
+    is_close: bool,
+    log_prefix: str,
+    eps: float,
+) -> None:
+    if is_close or log_prefix != "enter" or resolved_qty <= previous_qty + eps:
+        return
+    filled_delta = resolved_qty - previous_qty
+    remaining_qty = max(target_qty - resolved_qty, 0.0)
+    exchange_name = exchange_runtime_name(exchange)
+    order_uuid = extract_order_uuid(order_result)
+    log_entry_partial_fill(
+        symbol=symbol,
+        exchange=exchange_name,
+        side=side,
+        filled_delta=filled_delta,
+        filled_total=resolved_qty,
+        target_qty=target_qty,
+        remaining_qty=remaining_qty,
+        reason=reason,
+    )
+    emit_order_event(
+        record_order_event,
+        "entry_first_leg_fill_progress",
+        exchange=exchange_name,
+        symbol=symbol,
+        side=side,
+        target_qty=target_qty,
+        filled_delta=filled_delta,
+        filled_total=resolved_qty,
+        resolved_qty=resolved_qty,
+        remaining_qty=remaining_qty,
+        order_id=order_uuid,
+        client_order_id=order_uuid,
+        pre_qty=pre_qty,
+        post_qty=post_qty,
+        position_delta=resolved_qty,
+        reason=reason,
+    )
 
 
 def entry_order_settle_sec(config: Any) -> float:
@@ -245,10 +341,21 @@ async def resolve_after_cancel_from_account(
                 if extract_position_qty is not None
                 else None
             )
-            print(
-                f"[strategy][{log_prefix}][late_fill_detected] account position changed after cancel "
-                f"symbol={symbol} side={side} filled_delta={resolved_qty - previous_qty:.6f} "
-                f"resolved={resolved_qty:.6f} target={target_qty:.6f}"
+            log_entry_first_leg_progress(
+                exchange=exchange,
+                symbol=symbol,
+                side=side,
+                target_qty=target_qty,
+                previous_qty=previous_qty,
+                resolved_qty=resolved_qty,
+                order_result=order_result,
+                pre_qty=pre_qty,
+                post_qty=post_qty,
+                reason="after_cancel",
+                record_order_event=record_order_event,
+                is_close=is_close,
+                log_prefix=log_prefix,
+                eps=eps,
             )
             emit_order_event(
                 record_order_event,
@@ -343,10 +450,21 @@ async def resolve_after_order_disappeared_from_account(
                 if extract_position_qty is not None
                 else None
             )
-            print(
-                f"[strategy][{log_prefix}][inflight_resolved] disappeared order moved account "
-                f"symbol={symbol} side={side} filled_delta={resolved_qty - previous_qty:.6f} "
-                f"resolved={resolved_qty:.6f} target={target_qty:.6f}"
+            log_entry_first_leg_progress(
+                exchange=exchange,
+                symbol=symbol,
+                side=side,
+                target_qty=target_qty,
+                previous_qty=previous_qty,
+                resolved_qty=resolved_qty,
+                order_result=order_result,
+                pre_qty=pre_qty,
+                post_qty=post_qty,
+                reason=reason,
+                record_order_event=record_order_event,
+                is_close=is_close,
+                log_prefix=log_prefix,
+                eps=eps,
             )
             emit_order_event(
                 record_order_event,
@@ -411,6 +529,7 @@ async def execute_requoting_limit_leg(
 
     while True:
         remaining_time_sec = deadline - time.monotonic()
+        previous_resolved_qty = resolved_qty
         resolved_qty = max(
             resolved_qty,
             await resolve_effective_order_qty(
@@ -424,6 +543,27 @@ async def execute_requoting_limit_leg(
                 reason=f"{probe_reason_prefix}_loop",
             ),
         )
+        if resolved_qty > previous_resolved_qty + eps:
+            log_entry_first_leg_progress(
+                exchange=exchange,
+                symbol=symbol,
+                side=side,
+                target_qty=target_qty,
+                previous_qty=previous_resolved_qty,
+                resolved_qty=resolved_qty,
+                order_result=active_order,
+                pre_qty=pre_qty,
+                post_qty=(
+                    extract_position_qty(exchange.get_symbol_snapshot(symbol))
+                    if extract_position_qty is not None
+                    else None
+                ),
+                reason="loop",
+                record_order_event=entry_event_recorder,
+                is_close=is_close,
+                log_prefix=log_prefix,
+                eps=eps,
+            )
         remaining_qty = max(target_qty - resolved_qty, 0.0)
         if remaining_qty <= eps or remaining_time_sec <= 0:
             break
@@ -463,7 +603,8 @@ async def execute_requoting_limit_leg(
             continue
 
         if active_order and limit_price_changed(exchange, symbol, active_price, target_price):
-            print(
+            print_verbose(
+                config,
                 f"[strategy][{log_prefix}][requote] 재호가 symbol={symbol} side={side} "
                 f"old_price={active_price} new_price={target_price}"
             )
@@ -507,7 +648,8 @@ async def execute_requoting_limit_leg(
                 cur_ms = wall_time_ms()
                 remaining_cooldown_ms = cooldown_ms - (cur_ms - last_submit_ms)
                 if last_submit_ms > 0 and remaining_cooldown_ms > 0:
-                    print(
+                    print_verbose(
+                        config,
                         f"[strategy][{log_prefix}][cooldown] 재주문 대기 "
                         f"exchange={key[0]} symbol={symbol} side={side} "
                         f"remaining_ms={remaining_cooldown_ms} resolved={resolved_qty:.6f} "
@@ -564,7 +706,45 @@ async def execute_requoting_limit_leg(
                 f"side={side} qty={submit_qty:.6f} requested={target_qty:.6f} "
                 f"remaining={remaining_qty:.6f} price={target_price}",
             )
+            submit_start_ms = wall_time_ms()
+            if entry_event_recorder is not None:
+                emit_order_event(
+                    entry_event_recorder,
+                    "entry_limit_order_submit_preflight",
+                    exchange=exchange_runtime_name(exchange),
+                    symbol=symbol,
+                    side=side,
+                    target_qty=target_qty,
+                    submit_qty=submit_qty,
+                    remaining_qty=remaining_qty,
+                    target_price=target_price,
+                    active_price=active_price,
+                    resolved_qty=resolved_qty,
+                    **market_freshness_payload(exchange, symbol, submit_start_ms),
+                )
             order_result = await exchange.order(symbol, side, submit_qty, target_price)
+            submit_end_ms = wall_time_ms()
+            if entry_event_recorder is not None:
+                emit_order_event(
+                    entry_event_recorder,
+                    "entry_limit_order_submit_result",
+                    exchange=exchange_runtime_name(exchange),
+                    symbol=symbol,
+                    side=side,
+                    target_qty=target_qty,
+                    submit_qty=submit_qty,
+                    remaining_qty=remaining_qty,
+                    target_price=target_price,
+                    submit_start_ms=submit_start_ms,
+                    submit_end_ms=submit_end_ms,
+                    submit_latency_ms=submit_end_ms - submit_start_ms,
+                    order_id=extract_order_uuid(order_result),
+                    client_order_id=extract_order_uuid(order_result),
+                    ok=bool(order_result and not order_result.get("error")),
+                    error=order_result.get("error") if isinstance(order_result, dict) else None,
+                    error_code=order_result.get("code") if isinstance(order_result, dict) else None,
+                    error_message=order_result.get("message") if isinstance(order_result, dict) else None,
+                )
             if order_result and not order_result.get("error"):
                 active_order = order_result
                 active_price = target_price
@@ -582,6 +762,7 @@ async def execute_requoting_limit_leg(
 
         await asyncio.sleep(min(action_interval_sec, max(deadline - time.monotonic(), 0.05)))
 
+    previous_resolved_qty = resolved_qty
     resolved_qty = max(
         resolved_qty,
         await resolve_effective_order_qty(
@@ -595,6 +776,27 @@ async def execute_requoting_limit_leg(
             reason=f"{probe_reason_prefix}_before_final_cancel",
         ),
     )
+    if resolved_qty > previous_resolved_qty + eps:
+        log_entry_first_leg_progress(
+            exchange=exchange,
+            symbol=symbol,
+            side=side,
+            target_qty=target_qty,
+            previous_qty=previous_resolved_qty,
+            resolved_qty=resolved_qty,
+            order_result=active_order,
+            pre_qty=pre_qty,
+            post_qty=(
+                extract_position_qty(exchange.get_symbol_snapshot(symbol))
+                if extract_position_qty is not None
+                else None
+            ),
+            reason="before_final_cancel",
+            record_order_event=entry_event_recorder,
+            is_close=is_close,
+            log_prefix=log_prefix,
+            eps=eps,
+        )
     if active_order:
         if is_waiting_order_active(exchange, active_order):
             canceled_order = active_order
@@ -622,6 +824,7 @@ async def execute_requoting_limit_leg(
 
     if resolved_qty + eps < target_qty:
         waiter = wait_for_position_close if is_close else wait_for_position_fill
+        previous_resolved_qty = resolved_qty
         resolved_qty = max(
             resolved_qty,
             await waiter(
@@ -633,5 +836,26 @@ async def execute_requoting_limit_leg(
                 settle_grace_sec(config),
             ),
         )
+        if resolved_qty > previous_resolved_qty + eps:
+            log_entry_first_leg_progress(
+                exchange=exchange,
+                symbol=symbol,
+                side=side,
+                target_qty=target_qty,
+                previous_qty=previous_resolved_qty,
+                resolved_qty=resolved_qty,
+                order_result=active_order,
+                pre_qty=pre_qty,
+                post_qty=(
+                    extract_position_qty(exchange.get_symbol_snapshot(symbol))
+                    if extract_position_qty is not None
+                    else None
+                ),
+                reason="final_settle",
+                record_order_event=entry_event_recorder,
+                is_close=is_close,
+                log_prefix=log_prefix,
+                eps=eps,
+            )
 
     return resolved_qty, active_order, active_price if active_price > 0 else last_order_price_used

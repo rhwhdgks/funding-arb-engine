@@ -5,6 +5,7 @@ import json
 import os
 from typing import Any
 
+from .account_context import current_account_context
 from .db import current_utc_ms, json_dumps
 
 
@@ -177,6 +178,7 @@ def build_trade_history_rows(
     if normalized_symbol is None:
         return []
 
+    account_context = current_account_context()
     rows: list[dict[str, Any]] = []
     for trade in trades or []:
         if not isinstance(trade, dict):
@@ -195,6 +197,7 @@ def build_trade_history_rows(
 
         rows.append(
             {
+                **account_context,
                 "uuid": trade_uuid,
                 "exchange_name": exchange_name,
                 "symbol": normalized_symbol,
@@ -243,6 +246,7 @@ def build_order_history_row(
     )
 
     return {
+        **current_account_context(),
         "uuid": order_uuid,
         "exchange_name": exchange_name,
         "symbol": normalized_symbol,
@@ -294,6 +298,7 @@ def build_balance_snapshot_row(
         }
 
     return {
+        **current_account_context(),
         "exchange_name": exchange_name,
         "bucket_start_ms": bucket_start_ms,
         "desktop_time_ms": captured_at_ms,

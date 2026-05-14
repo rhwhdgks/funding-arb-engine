@@ -4,23 +4,71 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
+from collections import Counter
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
 from src.core.action_gate import ActionGate
 from dotenv import load_dotenv
 from src.ops.persistence.live_snapshot import persist_exchange_snapshots
-from src.core.exchange_registry import SUPPORTED_EXCHANGES, build_exchange
+from src.core.exchange_registry import build_exchange
+from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_csv
+from src.strategy.candidates import (
+    CandidateBuildHooks,
+    CandidateCollectionHooks,
+    collect_pair_candidates,
+    compute_effective_funding_components,
+    compute_stale_data_penalty_usd,
+    extract_best_ask,
+    extract_best_bid,
+    extract_funding_rate,
+    extract_mid_price,
+    extract_next_funding_ms,
+    rank_candidates,
+)
 from src.strategy.control import EntryControlStore
 from src.strategy.hedge import HedgeExecutionResult, execute_residual_hedge
+from src.strategy.logging import (
+    log_danger,
+    log_entry_attempt,
+    log_entry_blocked,
+    log_hedge_incomplete,
+    log_micro_partial,
+    log_overfill,
+    log_pair_close_attempt,
+    log_pair_close_trigger,
+    log_pair_closed,
+    log_pair_closed_detected,
+    log_pair_opened,
+    log_residual_ignored,
+)
 from src.strategy.risk_gate import (
     OrderSlot,
     RiskGateContext,
     RiskGateDecision,
     evaluate_entry_risk,
 )
+from src.strategy.rules import (
+    close_thresholds_usd,
+    close_first_leg_plan,
+    close_hedge_leg_plan,
+    decide_pair_close_reason,
+    first_leg_plan,
+    hedge_leg_plan,
+    pair_entry_reference_notional_usd,
+    required_entry_open_edge_usd,
+)
+from src.strategy.models import (
+    PROJECT_ROOT,
+    FlattenLegResult,
+    OpenPairState,
+    PairCandidate,
+    PairFlattenResult,
+    StrategyConfig,
+)
 from src.strategy.margin_mode_guard import check_startup_margin_mode_guard
+from src.strategy.exposure_guard import ExposureCapConfig, evaluate_exposure_caps
+from src.strategy.rate_limit_guard import RateLimitGuardConfig, evaluate_rate_limit_guard
 from src.strategy.execution import (
     wait_for_position_fill as _execution_wait_for_position_fill,
     wait_for_position_close as _execution_wait_for_position_close,
@@ -34,191 +82,8 @@ from src.strategy.execution import (
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 SUPPORTED_SYMBOLS_CACHE_DIR = PROJECT_ROOT / "logs" / "supported_symbols_cache"
 EPS = 1e-9
-DEFAULT_ALLOWED_PAIRS = [("binance", "okx")]
-DEFAULT_ENTRY_FEE_BPS = {
-    "binance": 2.0,
-    "okx": 2.0,
-    "gateio": 8.0,
-}
-DEFAULT_CLOSE_FEE_BPS = {
-    "binance": 2.0,
-    "okx": 2.0,
-    "gateio": 8.0,
-}
-
-
-@dataclass
-class StrategyConfig:
-    exchange_names: list[str]
-    symbol_input: str
-    allowed_pairs: list[tuple[str, str]]
-    leverage: int = 1
-    margin_mode: str = "cross"
-    order_notional_usd: float = 100.0
-    scan_interval_sec: float = 1.0
-    first_leg_timeout_sec: float = 2.0
-    hedge_market_immediate: bool = True
-    hedge_requote_timeout_sec: float = 0.7
-    hedge_requote_count: int = 2
-    close_first_leg_role: str = "short"
-    close_aggressive_bps: float = 8.0
-    emergency_flatten_bps: float = 20.0
-    action_settle_wait_sec: float = 0.6
-    entry_order_settle_sec: float = 1.2
-    entry_order_cooldown_sec: float = 1.0
-    symbol_recent_close_cooldown_sec: float = 3.0
-    min_recompute_interval_sec: float = 0.2
-    min_expected_net_edge_usd: float = 0.0
-    min_expected_net_edge_bps: float = 0.0
-    min_effective_funding_usd: float | None = None
-    hold_buffer_usd: float = 0.0
-    min_hold_sec: float = 300.0
-    close_candidate_min_age_sec: float = 1800.0
-    max_hold_sec: float = 14400.0
-    take_profit_usd: float = 0.10
-    stop_loss_usd: float = -0.25
-    position_stale_ignore_sec: float = 20.0
-    close_slippage_bps: float = 0.0
-    risk_buffer_bps: float = 1.0
-    margin_guard_enabled: bool = True
-    margin_guard_safety_factor: float = 1.02
-    margin_guard_extra_usd: float = 5.0
-    startup_margin_mode_guard_enabled: bool = True
-    stale_data_penalty_bps: float = 0.5
-    funding_missing_confidence: float = 0.35
-    funding_alignment_min_factor: float = 0.25
-    funding_alignment_full_penalty_sec: float = 14400.0
-    funding_time_decay_min_factor: float = 0.35
-    funding_time_decay_full_penalty_sec: float = 28800.0
-    approval_mode: str = "console"
-    enable_live: bool = False
-    auto_enter_enabled: bool = False
-    auto_close_enabled: bool = False
-    bootstrap_on_entry: bool = True
-    max_candidates_print: int = 10
-    max_open_pairs: int = 1
-    assumed_flat_grace_sec: float = 8.0
-    auto_enter_cooldown_sec: float = 15.0
-    render_interval_sec: float = 30.0
-    recovery_retry_cooldown_sec: float = 15.0
-    auto_close_retry_cooldown_sec: float = 15.0
-    danger_log_cooldown_sec: float = 10.0
-    micro_residual_info_notional_usd: float = 50.0
-    micro_residual_info_ratio: float = 0.02
-    action_account_fresh_sec: float = 2.5
-    account_imbalance_hedge_enabled: bool = True
-    account_imbalance_cooldown_sec: float = 60.0
-    graceful_shutdown_enabled: bool = True
-    graceful_shutdown_cancel_orders: bool = True
-    graceful_shutdown_flatten_positions: bool = True
-    entry_control_file: Path = field(default_factory=lambda: PROJECT_ROOT / "runtime" / "entry_control.json")
-    entry_control_fail_closed: bool = True
-    live_event_log_path: Path = field(default_factory=lambda: PROJECT_ROOT / "logs" / "strategy_live.jsonl")
-    entry_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ENTRY_FEE_BPS))
-    close_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CLOSE_FEE_BPS))
-    first_leg_role: str = "long"
-    stdout_log_style: str = "verbose"
-
-
-@dataclass
-class PairCandidate:
-    symbol: str
-    long_exchange: str
-    short_exchange: str
-    long_ask: float
-    short_bid: float
-    mid_reference: float
-    target_qty: float
-    executable_qty: float
-    notional_usd: float
-    long_min_order_notional_usd: float
-    short_min_order_notional_usd: float
-    entry_open_edge_usd: float
-    entry_open_edge_bps: float
-    open_fee_cost_usd: float
-    raw_funding_pnl_usd: float
-    effective_funding_pnl_usd: float
-    funding_confidence: float
-    funding_alignment_factor: float
-    funding_time_decay_factor: float
-    expected_close_cost_usd: float
-    risk_buffer_usd: float
-    stale_data_penalty_usd: float
-    expected_net_edge_usd: float
-    expected_net_edge_bps: float
-    funding_long_rate: float
-    funding_short_rate: float
-    long_next_funding_ms: int
-    short_next_funding_ms: int
-    can_enter: bool
-    block_reasons: list[str] = field(default_factory=list)
-
-    @property
-    def id(self) -> str:
-        return f"{self.symbol}:{self.long_exchange}:long:{self.short_exchange}:short"
-
-
-@dataclass
-class OpenPairState:
-    pair_id: str
-    symbol: str
-    long_exchange: str
-    short_exchange: str
-    qty: float
-    requested_qty: float
-    long_entry_price: float
-    short_entry_price: float
-    entry_time_ms: int
-    entry_net_edge_usd: float
-    funding_long_rate: float
-    funding_short_rate: float
-    status: str = "open"
-    assumed_flat_exchanges: list[str] = field(default_factory=list)
-    last_hold_decision: str = ""
-    last_hold_pnl_usd: float = 0.0
-    last_close_pnl_usd: float = 0.0
-    last_close_edge_usd: float = 0.0
-    last_close_reason: str = ""
-    last_direction_mismatch_log_ms: int = 0
-    next_recovery_retry_ms: int = 0
-    next_auto_close_retry_ms: int = 0
-
-
-@dataclass
-class FlattenLegResult:
-    exchange_name: str
-    symbol: str
-    role: str
-    side: str = ""
-    requested_qty: float = 0.0
-    start_qty: float = 0.0
-    end_qty: float = 0.0
-    closed_qty: float = 0.0
-    ok: bool = False
-    assumed_flat: bool = False
-    attempted_order: bool = False
-    failure_reason: str = ""
-    error_code: str = ""
-    error_message: str = ""
-    temporarily_unavailable: bool = False
-
-
-@dataclass
-class PairFlattenResult:
-    ok: bool
-    forced_flat_exchanges: set[str] = field(default_factory=set)
-    leg_results: list[FlattenLegResult] = field(default_factory=list)
-    failed_leg: FlattenLegResult | None = None
-    other_leg_action: str = "none"
-    neutralized: bool = False
-    neutralize_payload: dict[str, Any] = field(default_factory=dict)
-
-    def __iter__(self):
-        yield self.ok
-        yield self.forced_flat_exchanges
 
 
 def flatten_leg_result_payload(result: FlattenLegResult | None) -> dict[str, Any] | None:
@@ -241,24 +106,6 @@ def flatten_leg_result_payload(result: FlattenLegResult | None) -> dict[str, Any
         "error_message": result.error_message,
         "temporarily_unavailable": result.temporarily_unavailable,
     }
-
-def parse_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return str(value).strip().lower() in {"1", "true", "y", "yes", "on"}
-
-
-def parse_csv(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [part.strip() for part in str(value).split(",") if part.strip()]
-
-
-def normalize_exchange_name(name: str) -> str:
-    normalized = str(name).strip().lower()
-    if normalized not in SUPPORTED_EXCHANGES:
-        raise ValueError(f"unsupported exchange: {name}")
-    return normalized
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -325,167 +172,6 @@ def simple_stdout_enabled(config: StrategyConfig | None = None) -> bool:
 def print_verbose(config: StrategyConfig | None, *args: Any, **kwargs: Any) -> None:
     if not simple_stdout_enabled(config):
         print(*args, **kwargs)
-
-
-def parse_allowed_pairs(value: str | None, exchange_names: list[str]) -> list[tuple[str, str]]:
-    if not value:
-        pairs = list(DEFAULT_ALLOWED_PAIRS)
-    else:
-        pairs = []
-        for raw in parse_csv(value):
-            token = raw.replace("/", "-").replace(":", "-").lower()
-            if "-" not in token:
-                continue
-            left, right = token.split("-", 1)
-            left = normalize_exchange_name(left)
-            right = normalize_exchange_name(right)
-            if left == right:
-                continue
-            key = tuple(sorted((left, right)))
-            if key not in pairs:
-                pairs.append(key)
-
-    filtered: list[tuple[str, str]] = []
-    selected = set(exchange_names)
-    for left, right in pairs:
-        if left in selected and right in selected:
-            filtered.append((left, right))
-    return filtered
-
-
-def load_fee_bps_map(
-    prefix: str,
-    defaults: dict[str, float],
-    fallback_prefixes: tuple[str, ...] = (),
-) -> dict[str, float]:
-    fee_bps = dict(defaults)
-    for exchange_name in SUPPORTED_EXCHANGES:
-        value = None
-        for env_prefix in (prefix, *fallback_prefixes):
-            env_key = f"{env_prefix}_{exchange_name.upper()}"
-            if os.getenv(env_key):
-                value = float(os.getenv(env_key, "0") or 0.0)
-                break
-        if value is not None:
-            fee_bps[exchange_name] = value
-    return fee_bps
-
-
-def load_strategy_config() -> StrategyConfig:
-    exchange_names = [normalize_exchange_name(name) for name in parse_csv(os.getenv("STRATEGY_EXCHANGES", "binance,okx"))]
-    if len(exchange_names) < 2:
-        raise ValueError("STRATEGY_EXCHANGES must include at least two exchanges")
-
-    symbol_input = os.getenv("STRATEGY_SYMBOLS", "ALL").strip()
-    raw_min_effective_funding_usd = os.getenv("STRATEGY_MIN_EFFECTIVE_FUNDING_USD")
-    entry_fee_bps = load_fee_bps_map(
-        "STRATEGY_ENTRY_FEE_BPS",
-        DEFAULT_ENTRY_FEE_BPS,
-        fallback_prefixes=("STRATEGY_MAKER_FEE_BPS",),
-    )
-    close_fee_bps = load_fee_bps_map(
-        "STRATEGY_CLOSE_FEE_BPS",
-        DEFAULT_CLOSE_FEE_BPS,
-        fallback_prefixes=("STRATEGY_ENTRY_FEE_BPS", "STRATEGY_MAKER_FEE_BPS"),
-    )
-
-    config = StrategyConfig(
-        exchange_names=exchange_names,
-        symbol_input=symbol_input,
-        allowed_pairs=parse_allowed_pairs(os.getenv("STRATEGY_ALLOWED_PAIRS"), exchange_names),
-        leverage=int(os.getenv("STRATEGY_LEVERAGE", "1") or 1),
-        margin_mode=os.getenv("STRATEGY_MARGIN_MODE", "cross").strip().lower(),
-        order_notional_usd=float(os.getenv("STRATEGY_ORDER_NOTIONAL_USD", "100") or 100.0),
-        scan_interval_sec=float(os.getenv("STRATEGY_SCAN_INTERVAL_SEC", "1.0") or 1.0),
-        first_leg_timeout_sec=float(os.getenv("STRATEGY_FIRST_LEG_TIMEOUT_SEC", "2.0") or 2.0),
-        hedge_market_immediate=os.getenv("STRATEGY_HEDGE_MARKET_IMMEDIATE", "1").strip().lower() in {"1", "true", "yes", "on"},
-        hedge_requote_timeout_sec=float(os.getenv("STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC", "0.7") or 0.7),
-        hedge_requote_count=int(os.getenv("STRATEGY_HEDGE_REQUOTE_COUNT", "2") or 2),
-        close_first_leg_role=os.getenv("STRATEGY_CLOSE_FIRST_LEG_ROLE", "short").strip().lower(),
-        close_aggressive_bps=float(os.getenv("STRATEGY_CLOSE_AGGRESSIVE_BPS", "8.0") or 8.0),
-        emergency_flatten_bps=float(os.getenv("STRATEGY_EMERGENCY_FLATTEN_BPS", "20.0") or 20.0),
-        action_settle_wait_sec=float(os.getenv("STRATEGY_ACTION_SETTLE_WAIT_SEC", "0.6") or 0.6),
-        entry_order_settle_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_SETTLE_SEC", "1.2") or 1.2),
-        entry_order_cooldown_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_COOLDOWN_SEC", "1.0") or 1.0),
-        symbol_recent_close_cooldown_sec=float(
-            os.getenv("STRATEGY_SYMBOL_RECENT_CLOSE_COOLDOWN_SEC", "3.0") or 3.0
-        ),
-        min_recompute_interval_sec=float(os.getenv("STRATEGY_MIN_RECOMPUTE_INTERVAL_SEC", "0.2") or 0.2),
-        min_expected_net_edge_usd=float(os.getenv("STRATEGY_MIN_EXPECTED_NET_EDGE_USD", "0.0") or 0.0),
-        min_expected_net_edge_bps=float(os.getenv("STRATEGY_MIN_EXPECTED_NET_EDGE_BPS", "0.0") or 0.0),
-        min_effective_funding_usd=(
-            float(raw_min_effective_funding_usd or 0.0)
-            if raw_min_effective_funding_usd not in (None, "")
-            else None
-        ),
-        hold_buffer_usd=float(os.getenv("STRATEGY_HOLD_BUFFER_USD", "0.0") or 0.0),
-        min_hold_sec=float(os.getenv("STRATEGY_MIN_HOLD_SEC", "300.0") or 300.0),
-        close_candidate_min_age_sec=float(
-            os.getenv("STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC", "1800.0") or 1800.0
-        ),
-        max_hold_sec=float(os.getenv("STRATEGY_MAX_HOLD_SEC", "14400.0") or 14400.0),
-        take_profit_usd=float(os.getenv("STRATEGY_TAKE_PROFIT_USD", "0.10") or 0.10),
-        stop_loss_usd=float(os.getenv("STRATEGY_STOP_LOSS_USD", "-0.25") or -0.25),
-        position_stale_ignore_sec=float(os.getenv("STRATEGY_POSITION_STALE_IGNORE_SEC", "20.0") or 20.0),
-        close_slippage_bps=float(os.getenv("STRATEGY_CLOSE_SLIPPAGE_BPS", "0.0") or 0.0),
-        risk_buffer_bps=float(os.getenv("STRATEGY_RISK_BUFFER_BPS", "1.0") or 1.0),
-        margin_guard_enabled=parse_bool(os.getenv("STRATEGY_MARGIN_GUARD_ENABLED"), True),
-        margin_guard_safety_factor=float(os.getenv("STRATEGY_MARGIN_GUARD_SAFETY_FACTOR", "1.02") or 1.02),
-        margin_guard_extra_usd=float(os.getenv("STRATEGY_MARGIN_GUARD_EXTRA_USD", "5.0") or 5.0),
-        startup_margin_mode_guard_enabled=parse_bool(
-            os.getenv("STRATEGY_MARGIN_MODE_GUARD_ENABLED", os.getenv("STRATEGY_STARTUP_MARGIN_MODE_GUARD_ENABLED")),
-            True,
-        ),
-        stale_data_penalty_bps=float(os.getenv("STRATEGY_STALE_DATA_PENALTY_BPS", "0.5") or 0.5),
-        funding_missing_confidence=float(os.getenv("STRATEGY_FUNDING_MISSING_CONFIDENCE", "0.35") or 0.35),
-        funding_alignment_min_factor=float(os.getenv("STRATEGY_FUNDING_ALIGNMENT_MIN_FACTOR", "0.25") or 0.25),
-        funding_alignment_full_penalty_sec=float(os.getenv("STRATEGY_FUNDING_ALIGNMENT_FULL_PENALTY_SEC", "14400") or 14400.0),
-        funding_time_decay_min_factor=float(os.getenv("STRATEGY_FUNDING_TIME_DECAY_MIN_FACTOR", "0.35") or 0.35),
-        funding_time_decay_full_penalty_sec=float(os.getenv("STRATEGY_FUNDING_TIME_DECAY_FULL_PENALTY_SEC", "28800") or 28800.0),
-        approval_mode=os.getenv("STRATEGY_APPROVAL_MODE", "console").strip().lower(),
-        enable_live=parse_bool(os.getenv("STRATEGY_ENABLE_LIVE"), False),
-        auto_enter_enabled=parse_bool(os.getenv("STRATEGY_AUTO_ENTER_ENABLED"), False),
-        auto_close_enabled=parse_bool(os.getenv("STRATEGY_AUTO_CLOSE_ENABLED"), False),
-        bootstrap_on_entry=parse_bool(os.getenv("STRATEGY_BOOTSTRAP_ON_ENTRY"), True),
-        max_candidates_print=int(os.getenv("STRATEGY_MAX_CANDIDATES_PRINT", "10") or 10),
-        max_open_pairs=int(os.getenv("STRATEGY_MAX_OPEN_PAIRS", "1") or 1),
-        assumed_flat_grace_sec=float(os.getenv("STRATEGY_ASSUMED_FLAT_GRACE_SEC", "8.0") or 8.0),
-        auto_enter_cooldown_sec=float(os.getenv("STRATEGY_AUTO_ENTER_COOLDOWN_SEC", "15.0") or 15.0),
-        render_interval_sec=float(os.getenv("STRATEGY_RENDER_INTERVAL_SEC", "30.0") or 30.0),
-        recovery_retry_cooldown_sec=float(os.getenv("STRATEGY_RECOVERY_RETRY_COOLDOWN_SEC", "15.0") or 15.0),
-        auto_close_retry_cooldown_sec=float(os.getenv("STRATEGY_AUTO_CLOSE_RETRY_COOLDOWN_SEC", "15.0") or 15.0),
-        danger_log_cooldown_sec=float(os.getenv("STRATEGY_DANGER_LOG_COOLDOWN_SEC", "10.0") or 10.0),
-        micro_residual_info_notional_usd=float(
-            os.getenv("STRATEGY_MICRO_RESIDUAL_INFO_NOTIONAL_USD", "50.0") or 50.0
-        ),
-        micro_residual_info_ratio=float(os.getenv("STRATEGY_MICRO_RESIDUAL_INFO_RATIO", "0.02") or 0.02),
-        action_account_fresh_sec=float(os.getenv("STRATEGY_ACTION_ACCOUNT_FRESH_SEC", "2.5") or 2.5),
-        account_imbalance_hedge_enabled=parse_bool(os.getenv("STRATEGY_ACCOUNT_IMBALANCE_HEDGE_ENABLED"), True),
-        account_imbalance_cooldown_sec=float(os.getenv("STRATEGY_ACCOUNT_IMBALANCE_COOLDOWN_SEC", "60.0") or 60.0),
-        graceful_shutdown_enabled=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_ENABLED"), True),
-        graceful_shutdown_cancel_orders=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS"), True),
-        graceful_shutdown_flatten_positions=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS"), True),
-        entry_control_file=Path(
-            os.getenv("STRATEGY_ENTRY_CONTROL_FILE", str(PROJECT_ROOT / "runtime" / "entry_control.json"))
-        ),
-        entry_control_fail_closed=parse_bool(os.getenv("STRATEGY_ENTRY_CONTROL_FAIL_CLOSED"), True),
-        live_event_log_path=Path(
-            os.getenv("STRATEGY_LIVE_EVENT_LOG_PATH", str(PROJECT_ROOT / "logs" / "strategy_live.jsonl"))
-        ),
-        entry_fee_bps=entry_fee_bps,
-        close_fee_bps=close_fee_bps,
-        first_leg_role=os.getenv("STRATEGY_FIRST_LEG_ROLE", "long").strip().lower(),
-        stdout_log_style=os.getenv("STRATEGY_STDOUT_LOG_STYLE", "verbose").strip().lower(),
-    )
-    if not config.allowed_pairs:
-        raise ValueError("no allowed pairs remain after filtering STRATEGY_ALLOWED_PAIRS")
-    if config.first_leg_role not in {"long", "short"}:
-        raise ValueError("STRATEGY_FIRST_LEG_ROLE must be 'long' or 'short'")
-    if config.close_first_leg_role not in {"long", "short"}:
-        raise ValueError("STRATEGY_CLOSE_FIRST_LEG_ROLE must be 'long' or 'short'")
-    if config.stdout_log_style not in {"verbose", "simple"}:
-        raise ValueError("STRATEGY_STDOUT_LOG_STYLE must be 'verbose' or 'simple'")
-    return config
 
 
 async def load_supported_symbols(exchange_name: str) -> set[str]:
@@ -731,156 +417,6 @@ async def run_snapshot_loop(
         sleep_sec = max(interval_sec - elapsed_sec, 1.0)
         await asyncio.sleep(sleep_sec)
 
-def extract_best_bid(snapshot: dict[str, Any]) -> float:
-    orderbook = snapshot.get("orderbook", {}) or {}
-    tick = snapshot.get("tick", {}) or {}
-    for source in (orderbook, tick):
-        for key in ("best_bid", "bid", "bid_price"):
-            value = _safe_float(source.get(key), 0.0)
-            if value > 0:
-                return value
-    return 0.0
-
-
-def extract_best_ask(snapshot: dict[str, Any]) -> float:
-    orderbook = snapshot.get("orderbook", {}) or {}
-    tick = snapshot.get("tick", {}) or {}
-    for source in (orderbook, tick):
-        for key in ("best_ask", "ask", "ask_price"):
-            value = _safe_float(source.get(key), 0.0)
-            if value > 0:
-                return value
-    return 0.0
-
-
-def extract_mid_price(snapshot: dict[str, Any]) -> float:
-    bid = extract_best_bid(snapshot)
-    ask = extract_best_ask(snapshot)
-    if bid > 0 and ask > 0:
-        return (bid + ask) / 2.0
-    tick = snapshot.get("tick", {}) or {}
-    for key in ("last", "last_price", "price"):
-        value = _safe_float(tick.get(key), 0.0)
-        if value > 0:
-            return value
-    position = snapshot.get("position", {}) or {}
-    for key in ("mark_price", "avg_price", "entry_price"):
-        value = _safe_float(position.get(key), 0.0)
-        if value > 0:
-            return value
-    return 0.0
-
-
-def extract_funding_rate(snapshot: dict[str, Any]) -> float:
-    funding = snapshot.get("funding", {}) or {}
-    for key in ("funding_rate", "fundingRate", "rate"):
-        value = funding.get(key)
-        if value is not None:
-            return _safe_float(value, 0.0)
-    return 0.0
-
-
-def extract_next_funding_ms(snapshot: dict[str, Any]) -> int:
-    funding = snapshot.get("funding", {}) or {}
-    for key in ("funding_next_apply", "next_funding_time", "nextFundingTime"):
-        value = funding.get(key)
-        if value is not None:
-            try:
-                return int(float(value))
-            except Exception:
-                return 0
-    return 0
-
-
-def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
-
-
-def seconds_until(timestamp_ms: int, now_ms: int | None = None) -> float:
-    if timestamp_ms <= 0:
-        return 0.0
-    if now_ms is None:
-        now_ms = int(time.time() * 1000)
-    return max((timestamp_ms - now_ms) / 1000.0, 0.0)
-
-
-def compute_funding_confidence(
-    long_next_funding_ms: int,
-    short_next_funding_ms: int,
-    config: StrategyConfig,
-) -> float:
-    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
-        return clamp(config.funding_missing_confidence, 0.0, 1.0)
-    return 1.0
-
-
-def compute_funding_alignment_factor(
-    long_next_funding_ms: int,
-    short_next_funding_ms: int,
-    config: StrategyConfig,
-) -> float:
-    min_factor = clamp(config.funding_alignment_min_factor, 0.0, 1.0)
-    penalty_window_sec = max(config.funding_alignment_full_penalty_sec, 1.0)
-    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
-        return min_factor
-    gap_sec = abs(long_next_funding_ms - short_next_funding_ms) / 1000.0
-    penalty_ratio = clamp(gap_sec / penalty_window_sec, 0.0, 1.0)
-    return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
-
-
-def compute_funding_time_decay_factor(
-    long_next_funding_ms: int,
-    short_next_funding_ms: int,
-    config: StrategyConfig,
-    now_ms: int | None = None,
-) -> float:
-    min_factor = clamp(config.funding_time_decay_min_factor, 0.0, 1.0)
-    penalty_window_sec = max(config.funding_time_decay_full_penalty_sec, 1.0)
-    if long_next_funding_ms <= 0 or short_next_funding_ms <= 0:
-        return min_factor
-    farthest_event_sec = max(
-        seconds_until(long_next_funding_ms, now_ms=now_ms),
-        seconds_until(short_next_funding_ms, now_ms=now_ms),
-    )
-    penalty_ratio = clamp(farthest_event_sec / penalty_window_sec, 0.0, 1.0)
-    return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
-
-
-def compute_effective_funding_components(
-    *,
-    long_rate: float,
-    short_rate: float,
-    long_notional: float,
-    short_notional: float,
-    long_next_funding_ms: int,
-    short_next_funding_ms: int,
-    config: StrategyConfig,
-    now_ms: int | None = None,
-) -> tuple[float, float, float, float, float]:
-    raw_funding_pnl_usd = (-long_rate * long_notional) + (short_rate * short_notional)
-    funding_confidence = compute_funding_confidence(long_next_funding_ms, short_next_funding_ms, config)
-    funding_alignment_factor = compute_funding_alignment_factor(long_next_funding_ms, short_next_funding_ms, config)
-    funding_time_decay_factor = compute_funding_time_decay_factor(
-        long_next_funding_ms,
-        short_next_funding_ms,
-        config,
-        now_ms=now_ms,
-    )
-    effective_funding_pnl_usd = (
-        raw_funding_pnl_usd
-        * funding_confidence
-        * funding_alignment_factor
-        * funding_time_decay_factor
-    )
-    return (
-        raw_funding_pnl_usd,
-        funding_confidence,
-        funding_alignment_factor,
-        funding_time_decay_factor,
-        effective_funding_pnl_usd,
-    )
-
-
 def extract_position_qty(snapshot: dict[str, Any]) -> float:
     position = snapshot.get("position", {}) or {}
     for key in ("qty", "position_amt", "size"):
@@ -1069,19 +605,6 @@ def pair_action_inputs_are_fresh(
     )
 
 
-def compute_open_cost_usd(
-    long_exchange: str,
-    short_exchange: str,
-    long_notional: float,
-    short_notional: float,
-    config: StrategyConfig,
-) -> float:
-    return (
-        long_notional * config.entry_fee_bps.get(long_exchange, 0.0) / 10000.0
-        + short_notional * config.entry_fee_bps.get(short_exchange, 0.0) / 10000.0
-    )
-
-
 def get_exchange_balance_report(exchange: Any) -> dict[str, Any]:
     getter = getattr(exchange, "get_balance_report", None)
     if callable(getter):
@@ -1113,6 +636,13 @@ def get_exchange_balance_report(exchange: Any) -> dict[str, Any]:
         except Exception:
             pass
     return {}
+
+
+def collect_balance_reports_by_exchange(exchanges: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {
+        exchange_name: get_exchange_balance_report(exchange)
+        for exchange_name, exchange in exchanges.items()
+    }
 
 
 def exchange_available_balance_usd(exchange: Any, balance_report: dict[str, Any] | None = None) -> float:
@@ -1168,220 +698,6 @@ def pair_entry_margin_guard_reasons(
     return reasons
 
 
-def compute_expected_close_cost_usd(
-    long_exchange: str,
-    short_exchange: str,
-    reference_notional: float,
-    config: StrategyConfig,
-) -> float:
-    close_fee_cost_usd = (
-        reference_notional * config.close_fee_bps.get(long_exchange, 0.0) / 10000.0
-        + reference_notional * config.close_fee_bps.get(short_exchange, 0.0) / 10000.0
-    )
-    close_slippage_cost_usd = reference_notional * (config.close_slippage_bps * 2.0) / 10000.0
-    return close_fee_cost_usd + close_slippage_cost_usd
-
-
-def compute_stale_data_penalty_usd(
-    reference_notional: float,
-    funding_confidence: float,
-    funding_alignment_factor: float,
-    funding_time_decay_factor: float,
-    config: StrategyConfig,
-) -> float:
-    quality = clamp(
-        funding_confidence * funding_alignment_factor * funding_time_decay_factor,
-        0.0,
-        1.0,
-    )
-    return reference_notional * config.stale_data_penalty_bps / 10000.0 * (1.0 - quality)
-
-
-def compute_pair_candidate(
-    symbol: str,
-    long_exchange: str,
-    short_exchange: str,
-    snapshots_by_exchange: dict[str, dict[str, Any]],
-    exchanges: dict[str, Any],
-    config: StrategyConfig,
-    balance_reports_by_exchange: dict[str, dict[str, Any]] | None = None,
-    assumed_flat_until_ms: dict[tuple[str, str], int] | None = None,
-) -> PairCandidate:
-    long_snapshot = snapshots_by_exchange[long_exchange][symbol]
-    short_snapshot = snapshots_by_exchange[short_exchange][symbol]
-    long_exchange_obj = exchanges[long_exchange]
-    short_exchange_obj = exchanges[short_exchange]
-
-    long_ask = extract_best_ask(long_snapshot)
-    short_bid = extract_best_bid(short_snapshot)
-    mid_reference = (long_ask + short_bid) / 2.0 if long_ask > 0 and short_bid > 0 else max(long_ask, short_bid, 0.0)
-    target_qty = (config.order_notional_usd / mid_reference) if mid_reference > 0 else 0.0
-    executable_qty = compute_common_executable_qty(
-        long_exchange_obj,
-        short_exchange_obj,
-        symbol,
-        target_qty,
-        left_price=long_ask,
-        right_price=short_bid,
-    )
-    notional_long = executable_qty * long_ask
-    notional_short = executable_qty * short_bid
-    reference_notional = max((notional_long + notional_short) / 2.0, 0.0)
-    long_min_order_notional_usd = exchange_min_order_notional_usd(long_exchange_obj, symbol, long_ask)
-    short_min_order_notional_usd = exchange_min_order_notional_usd(short_exchange_obj, symbol, short_bid)
-
-    funding_long_rate = extract_funding_rate(long_snapshot)
-    funding_short_rate = extract_funding_rate(short_snapshot)
-    long_next_funding_ms = extract_next_funding_ms(long_snapshot)
-    short_next_funding_ms = extract_next_funding_ms(short_snapshot)
-    now_ms = int(time.time() * 1000)
-
-    entry_unit_edge = short_bid - long_ask
-    entry_open_edge_usd = executable_qty * entry_unit_edge
-    entry_open_edge_bps = (entry_unit_edge / mid_reference * 10000.0) if mid_reference > 0 else 0.0
-
-    open_fee_cost_usd = compute_open_cost_usd(
-        long_exchange,
-        short_exchange,
-        notional_long,
-        notional_short,
-        config,
-    )
-    expected_close_cost_usd = compute_expected_close_cost_usd(
-        long_exchange,
-        short_exchange,
-        reference_notional,
-        config,
-    )
-    risk_buffer_usd = reference_notional * config.risk_buffer_bps / 10000.0
-    (
-        raw_funding_pnl_usd,
-        funding_confidence,
-        funding_alignment_factor,
-        funding_time_decay_factor,
-        effective_funding_pnl_usd,
-    ) = compute_effective_funding_components(
-        long_rate=funding_long_rate,
-        short_rate=funding_short_rate,
-        long_notional=notional_long,
-        short_notional=notional_short,
-        long_next_funding_ms=long_next_funding_ms,
-        short_next_funding_ms=short_next_funding_ms,
-        config=config,
-        now_ms=now_ms,
-    )
-    stale_data_penalty_usd = compute_stale_data_penalty_usd(
-        reference_notional,
-        funding_confidence,
-        funding_alignment_factor,
-        funding_time_decay_factor,
-        config,
-    )
-
-    expected_net_edge_usd = (
-        entry_open_edge_usd
-        + effective_funding_pnl_usd
-        - open_fee_cost_usd
-        - expected_close_cost_usd
-        - risk_buffer_usd
-        - stale_data_penalty_usd
-    )
-    expected_net_edge_bps = (expected_net_edge_usd / reference_notional * 10000.0) if reference_notional > 0 else 0.0
-
-    block_reasons: list[str] = []
-    if long_ask <= 0:
-        block_reasons.append(f"{long_exchange}:ask_missing")
-    if short_bid <= 0:
-        block_reasons.append(f"{short_exchange}:bid_missing")
-    if not extract_health_can_trade(long_snapshot):
-        reasons = extract_health_block_reasons(long_snapshot) or ["cannot_trade"]
-        block_reasons.append(f"{long_exchange}:{'|'.join(reasons)}")
-    if not extract_health_can_trade(short_snapshot):
-        reasons = extract_health_block_reasons(short_snapshot) or ["cannot_trade"]
-        block_reasons.append(f"{short_exchange}:{'|'.join(reasons)}")
-    if abs(effective_position_qty(long_snapshot, long_exchange_obj, symbol, config, assumed_flat_until_ms)) > EPS:
-        block_reasons.append(f"{long_exchange}:existing_position")
-    if abs(effective_position_qty(short_snapshot, short_exchange_obj, symbol, config, assumed_flat_until_ms)) > EPS:
-        block_reasons.append(f"{short_exchange}:existing_position")
-    if has_open_orders(long_snapshot):
-        block_reasons.append(f"{long_exchange}:open_orders_exist")
-    if has_open_orders(short_snapshot):
-        block_reasons.append(f"{short_exchange}:open_orders_exist")
-    if target_qty <= EPS:
-        block_reasons.append("target_qty_zero")
-    if executable_qty <= EPS:
-        block_reasons.append("common_executable_qty_zero")
-    block_reasons.extend(
-        pair_entry_margin_guard_reasons(
-            long_exchange=long_exchange,
-            short_exchange=short_exchange,
-            long_exchange_obj=long_exchange_obj,
-            short_exchange_obj=short_exchange_obj,
-            long_notional_usd=notional_long,
-            short_notional_usd=notional_short,
-            config=config,
-            balance_reports_by_exchange=balance_reports_by_exchange,
-        )
-    )
-    if (
-        config.min_effective_funding_usd is not None
-        and effective_funding_pnl_usd < config.min_effective_funding_usd
-    ):
-        block_reasons.append("effective_funding_below_usd_threshold")
-    if expected_net_edge_usd < config.min_expected_net_edge_usd:
-        block_reasons.append("net_edge_below_usd_threshold")
-    if expected_net_edge_bps < config.min_expected_net_edge_bps:
-        block_reasons.append("net_edge_below_bps_threshold")
-
-    can_enter = len(block_reasons) == 0
-    return PairCandidate(
-        symbol=symbol,
-        long_exchange=long_exchange,
-        short_exchange=short_exchange,
-        long_ask=long_ask,
-        short_bid=short_bid,
-        mid_reference=mid_reference,
-        target_qty=target_qty,
-        executable_qty=executable_qty,
-        notional_usd=reference_notional,
-        long_min_order_notional_usd=long_min_order_notional_usd,
-        short_min_order_notional_usd=short_min_order_notional_usd,
-        entry_open_edge_usd=entry_open_edge_usd,
-        entry_open_edge_bps=entry_open_edge_bps,
-        open_fee_cost_usd=open_fee_cost_usd,
-        raw_funding_pnl_usd=raw_funding_pnl_usd,
-        effective_funding_pnl_usd=effective_funding_pnl_usd,
-        funding_confidence=funding_confidence,
-        funding_alignment_factor=funding_alignment_factor,
-        funding_time_decay_factor=funding_time_decay_factor,
-        expected_close_cost_usd=expected_close_cost_usd,
-        risk_buffer_usd=risk_buffer_usd,
-        stale_data_penalty_usd=stale_data_penalty_usd,
-        expected_net_edge_usd=expected_net_edge_usd,
-        expected_net_edge_bps=expected_net_edge_bps,
-        funding_long_rate=funding_long_rate,
-        funding_short_rate=funding_short_rate,
-        long_next_funding_ms=long_next_funding_ms,
-        short_next_funding_ms=short_next_funding_ms,
-        can_enter=can_enter,
-        block_reasons=block_reasons,
-    )
-
-
-def rank_candidates(candidates: list[PairCandidate]) -> list[PairCandidate]:
-    return sorted(
-        candidates,
-        key=lambda item: (
-            0 if item.can_enter else 1,
-            -item.expected_net_edge_usd,
-            -item.effective_funding_pnl_usd,
-            item.symbol,
-            item.long_exchange,
-            item.short_exchange,
-        ),
-    )
-
-
 def render_candidate_table(
     candidates: list[PairCandidate],
     max_rows: int,
@@ -1423,6 +739,65 @@ def build_candidate_signature(candidates: list[PairCandidate], top_n: int = 5) -
             )
         )
     return tuple(signature)
+
+
+def normalize_candidate_block_reason(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    if not normalized:
+        return "unknown_block_reason"
+    if "(" in normalized:
+        normalized = normalized.split("(", 1)[0]
+    return normalized
+
+
+def candidate_scan_item(candidate: PairCandidate | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    return {
+        "candidate_id": candidate.id,
+        "symbol": candidate.symbol,
+        "long_exchange": candidate.long_exchange,
+        "short_exchange": candidate.short_exchange,
+        "pair": f"{candidate.long_exchange}L/{candidate.short_exchange}S",
+        "qty": candidate.executable_qty,
+        "notional_usd": candidate.notional_usd,
+        "expected_net_edge_usd": candidate.expected_net_edge_usd,
+        "expected_net_edge_bps": candidate.expected_net_edge_bps,
+        "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
+        "can_enter": candidate.can_enter,
+        "block_reasons": list(candidate.block_reasons[:5]),
+        "normalized_block_reasons": [
+            normalize_candidate_block_reason(reason)
+            for reason in candidate.block_reasons[:5]
+        ],
+    }
+
+
+def build_candidate_scan_summary(candidates: list[PairCandidate]) -> dict[str, Any]:
+    total = len(candidates)
+    enterable = [candidate for candidate in candidates if candidate.can_enter]
+    blocked = [candidate for candidate in candidates if not candidate.can_enter]
+
+    reason_counter: Counter[str] = Counter()
+    for candidate in blocked:
+        reasons = candidate.block_reasons or ["blocked_without_reason"]
+        for reason in reasons:
+            reason_counter[normalize_candidate_block_reason(reason)] += 1
+
+    top_candidate = candidates[0] if candidates else None
+    top_enterable = enterable[0] if enterable else None
+    top_blocked = blocked[0] if blocked else None
+
+    return {
+        "total_candidates": total,
+        "enterable_candidates": len(enterable),
+        "blocked_candidates": len(blocked),
+        "top_candidate": candidate_scan_item(top_candidate),
+        "top_enterable_candidate": candidate_scan_item(top_enterable),
+        "top_blocked_candidate": candidate_scan_item(top_blocked),
+        "top_block_reason": reason_counter.most_common(1)[0][0] if reason_counter else "",
+        "reason_counts": dict(reason_counter.most_common(12)),
+    }
 
 
 async def console_command_reader(command_queue: asyncio.Queue[str]) -> None:
@@ -1547,6 +922,38 @@ def candidate_margin_guard_reasons(
     )
 
 
+def candidate_exposure_guard_result(
+    candidate: PairCandidate,
+    config: StrategyConfig,
+    balance_reports_by_exchange: dict[str, dict[str, Any]] | None = None,
+):
+    return evaluate_exposure_caps(
+        balance_reports_by_exchange=balance_reports_by_exchange,
+        planned_long_notional_usd=candidate.executable_qty * candidate.long_ask,
+        planned_short_notional_usd=candidate.executable_qty * candidate.short_bid,
+        config=ExposureCapConfig(
+            max_gross_leverage=config.max_gross_leverage,
+            max_long_leverage=config.max_long_leverage,
+            max_short_leverage=config.max_short_leverage,
+        ),
+    )
+
+
+def candidate_rate_limit_guard_result(
+    candidate: PairCandidate,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+):
+    return evaluate_rate_limit_guard(
+        exchanges=exchanges,
+        exchange_names=(candidate.long_exchange, candidate.short_exchange),
+        config=RateLimitGuardConfig(
+            enabled=config.rate_limit_guard_enabled,
+            usage_threshold=config.rate_limit_guard_usage_threshold,
+        ),
+    )
+
+
 def build_risk_gate_context(
     open_pairs: dict[str, OpenPairState] | None,
     exchanges: dict[str, Any],
@@ -1586,6 +993,13 @@ def evaluate_candidate_risk_now(
     startup_block_reasons: tuple[str, ...] = (),
 ) -> RiskGateDecision:
     context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons)
+    exposure_result = candidate_exposure_guard_result(candidate, config, balance_reports_by_exchange)
+    rate_limit_result = candidate_rate_limit_guard_result(candidate, exchanges, config)
+    details: dict[str, Any] = {}
+    if exposure_result.metrics:
+        details["exposure"] = exposure_result.metrics
+    if rate_limit_result.metrics:
+        details["rate_limit"] = rate_limit_result.metrics
     return evaluate_entry_risk(
         symbol=candidate.symbol,
         planned_order_slots=planned_entry_order_slots(candidate, config),
@@ -1595,6 +1009,9 @@ def evaluate_candidate_risk_now(
             config,
             balance_reports_by_exchange,
         ),
+        exposure_reasons=exposure_result.reasons,
+        rate_limit_reasons=rate_limit_result.reasons,
+        details=details,
         context=context,
     )
 
@@ -1610,6 +1027,13 @@ def apply_risk_gate_blocks(
 ) -> list[PairCandidate]:
     context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons)
     for candidate in candidates:
+        exposure_result = candidate_exposure_guard_result(candidate, config, balance_reports_by_exchange)
+        rate_limit_result = candidate_rate_limit_guard_result(candidate, exchanges, config)
+        details: dict[str, Any] = {}
+        if exposure_result.metrics:
+            details["exposure"] = exposure_result.metrics
+        if rate_limit_result.metrics:
+            details["rate_limit"] = rate_limit_result.metrics
         decision = evaluate_entry_risk(
             symbol=candidate.symbol,
             planned_order_slots=planned_entry_order_slots(candidate, config),
@@ -1619,6 +1043,9 @@ def apply_risk_gate_blocks(
                 config,
                 balance_reports_by_exchange,
             ),
+            exposure_reasons=exposure_result.reasons,
+            rate_limit_reasons=rate_limit_result.reasons,
+            details=details,
             context=context,
         )
         if decision.allowed:
@@ -1641,14 +1068,23 @@ def record_entry_risk_blocked(
     candidate: PairCandidate,
     decision: RiskGateDecision,
 ) -> None:
+    payload: dict[str, Any] = {
+        "candidate_id": candidate.id,
+        "symbol": candidate.symbol,
+        "long_exchange": candidate.long_exchange,
+        "short_exchange": candidate.short_exchange,
+        "reasons": list(decision.reasons),
+    }
+    if decision.details:
+        payload["details"] = decision.details
+        if decision.details.get("exposure"):
+            payload["exposure"] = decision.details["exposure"]
+        if decision.details.get("rate_limit"):
+            payload["rate_limit"] = decision.details["rate_limit"]
     record_live_event(
         config,
         "entry_risk_blocked",
-        candidate_id=candidate.id,
-        symbol=candidate.symbol,
-        long_exchange=candidate.long_exchange,
-        short_exchange=candidate.short_exchange,
-        reasons=list(decision.reasons),
+        **payload,
     )
 
 
@@ -1798,20 +1234,6 @@ def render_open_pairs(open_pairs: dict[str, OpenPairState]) -> str:
     return "\n".join(lines)
 
 
-def first_leg_plan(candidate: PairCandidate, config: StrategyConfig) -> tuple[str, str]:
-    role = config.first_leg_role
-    if role == "short":
-        return candidate.short_exchange, "sell"
-    return candidate.long_exchange, "buy"
-
-
-def hedge_leg_plan(candidate: PairCandidate, config: StrategyConfig) -> tuple[str, str]:
-    first_exchange, _ = first_leg_plan(candidate, config)
-    if first_exchange == candidate.long_exchange:
-        return candidate.short_exchange, "sell"
-    return candidate.long_exchange, "buy"
-
-
 def marketable_limit_price(exchange: Any, symbol: str, side: str) -> float:
     snapshot = exchange.get_symbol_snapshot(symbol)
     if side.lower() == "buy":
@@ -1838,20 +1260,6 @@ def normalize_limit_price_for_side(exchange: Any, symbol: str, side: str, raw_pr
     if side.lower() == "buy":
         return floor_by_step(raw_price, tick_size)
     return ceil_by_step(raw_price, tick_size)
-
-
-def required_entry_open_edge_usd(candidate: PairCandidate, config: StrategyConfig) -> float:
-    required_net_edge_usd = max(
-        config.min_expected_net_edge_usd,
-        candidate.notional_usd * config.min_expected_net_edge_bps / 10000.0,
-    )
-    cost_stack_usd = (
-        candidate.open_fee_cost_usd
-        + candidate.expected_close_cost_usd
-        + candidate.risk_buffer_usd
-        + candidate.stale_data_penalty_usd
-    )
-    return max(required_net_edge_usd - candidate.effective_funding_pnl_usd + cost_stack_usd, 0.0)
 
 
 def passive_entry_target_price(
@@ -2092,7 +1500,7 @@ def print_emergency_flatten_dust(
     exchange_name = getattr(exchange, "persist_name", getattr(exchange, "name", "unknown"))
     suffix = "" if closed_qty is None else f" closed_qty={closed_qty:.12f}"
     print(
-        f"[strategy][emergency_flatten][dust] 실행 불가능한 소량 잔량으로 flat 간주 "
+        f"[strategy][pair_close][dust] 실행 불가능한 소량 잔량으로 flat 간주 "
         f"reason={reason} exchange={exchange_name} symbol={symbol} side={preview.get('side')} "
         f"qty={_safe_float(preview.get('raw_qty')):.12f} "
         f"close_qty={_safe_float(preview.get('close_qty')):.12f} "
@@ -2215,15 +1623,60 @@ async def bootstrap_candidate_exchanges(
     candidate: PairCandidate,
     exchanges: dict[str, Any],
     config: StrategyConfig,
-) -> None:
+) -> list[dict[str, Any]]:
     if not config.bootstrap_on_entry:
-        return
+        return []
+    failures: list[dict[str, Any]] = []
     for exchange_name in {candidate.long_exchange, candidate.short_exchange}:
-        await exchanges[exchange_name].bootstrap_symbol(
+        result = await exchanges[exchange_name].bootstrap_symbol(
             symbol=candidate.symbol,
             leverage=config.leverage,
             margin_mode=config.margin_mode,
         )
+        failures.extend(
+            bootstrap_result_failures(
+                exchange_name=exchange_name,
+                symbol=candidate.symbol,
+                result=result,
+            )
+        )
+    return failures
+
+
+def bootstrap_result_failures(exchange_name: str, symbol: str, result: Any) -> list[dict[str, Any]]:
+    if not isinstance(result, dict):
+        return [
+            {
+                "exchange": exchange_name,
+                "symbol": symbol,
+                "field": "bootstrap",
+                "error": "invalid_bootstrap_response",
+                "raw": repr(result),
+            }
+        ]
+
+    rows: list[tuple[str, Any]]
+    if "ok" in result:
+        rows = [("bootstrap", result)]
+    else:
+        rows = [(str(key), value) for key, value in result.items()]
+
+    failures: list[dict[str, Any]] = []
+    for field, value in rows:
+        if not isinstance(value, dict):
+            continue
+        if value.get("ok") is not False:
+            continue
+        failures.append(
+            {
+                "exchange": exchange_name,
+                "symbol": symbol,
+                "field": field,
+                "error": value.get("error") or value.get("msg") or value.get("message") or "bootstrap_failed",
+                "raw": value.get("raw", value),
+            }
+        )
+    return failures
 
 
 async def cancel_if_open(exchange: Any, symbol: str, order_result: dict[str, Any] | None) -> None:
@@ -2507,12 +1960,14 @@ async def emergency_flatten_symbol_state_detailed(
             return result
 
         try:
-            print(
-                f"[strategy][emergency_flatten] 강제 청산 시도 attempt={attempt + 1} "
-                f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
-                f"symbol={symbol} side={side} qty={close_qty:.6f} "
-                    f"price_preview={_safe_float(close_preview.get('price')):.8f} "
-                    f"min_executable_qty={_safe_float(close_preview.get('min_executable_qty')):.12f}"
+            log_pair_close_attempt(
+                attempt=attempt + 1,
+                exchange=getattr(exchange, "persist_name", getattr(exchange, "name", "unknown")),
+                symbol=symbol,
+                side=side,
+                qty=close_qty,
+                price_preview=_safe_float(close_preview.get("price")),
+                min_executable_qty=_safe_float(close_preview.get("min_executable_qty")),
             )
             result.attempted_order = True
             market_result = await exchange.market_order(
@@ -2573,7 +2028,7 @@ async def emergency_flatten_symbol_state_detailed(
                 result.error_message = error_message
                 result.temporarily_unavailable = temporarily_unavailable
                 print(
-                    f"[strategy][emergency_flatten][market_warn] 시장가 강제 청산 경고 "
+                    f"[strategy][pair_close][market_warn] 페어 종료 주문 경고 "
                     f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
                     f"symbol={symbol} reason={failure_reason} result={market_result}"
                 )
@@ -2585,7 +2040,7 @@ async def emergency_flatten_symbol_state_detailed(
             result.error_message = error_message
             result.temporarily_unavailable = temporarily_unavailable
             print(
-                f"[strategy][emergency_flatten][market_warn] 시장가 강제 청산 오류 "
+                f"[strategy][pair_close][market_warn] 페어 종료 주문 오류 "
                 f"symbol={symbol} reason={failure_reason} error={exc}"
             )
             await asyncio.sleep(0.8)
@@ -3429,19 +2884,6 @@ async def recover_account_imbalances(
             next_retry_ms_by_key[retry_key] = current_ms + int(config.account_imbalance_cooldown_sec * 1000)
 
 
-def close_first_leg_plan(pair: OpenPairState, config: StrategyConfig) -> tuple[str, str]:
-    if config.close_first_leg_role == "long":
-        return pair.long_exchange, "sell"
-    return pair.short_exchange, "buy"
-
-
-def close_hedge_leg_plan(pair: OpenPairState, config: StrategyConfig) -> tuple[str, str]:
-    first_exchange, _ = close_first_leg_plan(pair, config)
-    if first_exchange == pair.long_exchange:
-        return pair.short_exchange, "buy"
-    return pair.long_exchange, "sell"
-
-
 async def enter_pair_limit_then_hedge(
     candidate: PairCandidate,
     exchanges: dict[str, Any],
@@ -3455,7 +2897,22 @@ async def enter_pair_limit_then_hedge(
     first_exchange = exchanges[first_exchange_name]
     hedge_exchange = exchanges[hedge_exchange_name]
 
-    await bootstrap_candidate_exchanges(candidate, exchanges, config)
+    bootstrap_failures = await bootstrap_candidate_exchanges(candidate, exchanges, config)
+    if bootstrap_failures:
+        record_live_event(
+            config,
+            "entry_bootstrap_failed",
+            candidate_id=candidate.id,
+            symbol=candidate.symbol,
+            long_exchange=candidate.long_exchange,
+            short_exchange=candidate.short_exchange,
+            failures=bootstrap_failures,
+        )
+        print(
+            f"[strategy][enter][abort] bootstrap_failed symbol={symbol} "
+            f"failures={bootstrap_failures}"
+        )
+        return None
 
     first_price = passive_entry_target_price(
         candidate,
@@ -3582,7 +3039,7 @@ async def enter_pair_limit_then_hedge(
             aggressive_bps=config.emergency_flatten_bps,
         )
         if not flattened:
-            print(f"[strategy][danger] 헤지 불가 첫 체결 강제 청산 실패 symbol={symbol}")
+            log_danger("헤지불가첫체결", symbol=symbol, result="페어종료실패")
         return None
     if first_fill_residual_qty > EPS:
         first_residual_preview = exchange_order_execution_preview(
@@ -3594,15 +3051,15 @@ async def enter_pair_limit_then_hedge(
         )
         if _safe_float(first_residual_preview.get("executable_qty"), 0.0) > EPS:
             print(
-                f"[strategy][enter][residual] 후속 정리 대상 symbol={symbol} "
-                f"first_filled={first_filled_qty:.6f} hedgeable={hedgeable_first_fill_qty:.6f} "
-                f"residual={first_fill_residual_qty:.6f}"
+                f"[진입][잔량정리대상] 심볼={symbol} "
+                f"첫체결={first_filled_qty:.6f} 헷지가능={hedgeable_first_fill_qty:.6f} "
+                f"잔량={first_fill_residual_qty:.6f}"
             )
         else:
             print(
-                f"[strategy][enter][residual][ignored] 즉시 무시 가능한 잔량 symbol={symbol} "
-                f"first_filled={first_filled_qty:.6f} hedgeable={hedgeable_first_fill_qty:.6f} "
-                f"residual={first_fill_residual_qty:.6f}"
+                f"[진입][잔량무시] 심볼={symbol} "
+                f"첫체결={first_filled_qty:.6f} 헷지가능={hedgeable_first_fill_qty:.6f} "
+                f"잔량={first_fill_residual_qty:.6f} 사유=최소주문수량미만"
             )
 
     hedge_execution = await execute_residual_hedge(
@@ -3626,6 +3083,7 @@ async def enter_pair_limit_then_hedge(
         wait_for_position_close=wait_for_position_close,
         cancel_if_open=cancel_if_open,
         settle_grace_sec=settle_grace_sec,
+        record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
     hedged_qty = hedge_execution.filled_qty
     hedge_price_used = hedge_execution.avg_price
@@ -3651,11 +3109,11 @@ async def enter_pair_limit_then_hedge(
             )
             if is_micro_residual:
                 print(
-                    f"[strategy][hedge][micro_residual][info] symbol={symbol} "
-                    f"first_filled={first_filled_qty:.6f} hedged={hedged_qty:.6f} "
-                    f"remaining={remaining_qty:.6f} "
-                    f"remaining_notional_usd={micro_payload['notional_usd']:.4f} "
-                    f"remaining_ratio={micro_payload['ratio']:.6f}"
+                    f"[헷지][소량잔량] 심볼={symbol} "
+                    f"첫체결={first_filled_qty:.6f} 헷지완료={hedged_qty:.6f} "
+                    f"잔량={remaining_qty:.6f} "
+                    f"잔량명목USD={micro_payload['notional_usd']:.4f} "
+                    f"잔량비율={micro_payload['ratio']:.6f} 사유=정보성"
                 )
                 record_live_event(
                     config,
@@ -3669,16 +3127,21 @@ async def enter_pair_limit_then_hedge(
                     **micro_payload,
                 )
             else:
-                print(
-                    f"[strategy][danger] 헤지 미완료 symbol={symbol} first_filled={first_filled_qty:.6f} "
-                    f"hedged={hedged_qty:.6f} remaining={remaining_qty:.6f}"
+                log_hedge_incomplete(
+                    symbol=symbol,
+                    first_filled_qty=first_filled_qty,
+                    hedged_qty=hedged_qty,
+                    remaining_qty=remaining_qty,
                 )
                 await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
                 return None
         else:
-            print(
-                f"[strategy][hedge][residual][ignored] 즉시 무시 가능한 잔량 symbol={symbol} "
-                f"first_filled={first_filled_qty:.6f} hedged={hedged_qty:.6f} remaining={remaining_qty:.6f}"
+            log_residual_ignored(
+                symbol=symbol,
+                first_filled_qty=first_filled_qty,
+                hedged_qty=hedged_qty,
+                residual_qty=remaining_qty,
+                reason="min_executable_qty",
             )
 
     await refresh_symbol_state(exchanges[candidate.long_exchange], symbol, "strategy_entry_post_open_long")
@@ -3709,18 +3172,26 @@ async def enter_pair_limit_then_hedge(
         pair_qty = min(long_entry_delta, short_entry_delta)
 
     if long_qty_after <= EPS or short_qty_after >= -EPS:
-        print(
-            f"[strategy][danger] 진입 후 방향 불일치 symbol={symbol} "
-            f"long_exchange={candidate.long_exchange} long_qty={long_qty_after:.6f} "
-            f"short_exchange={candidate.short_exchange} short_qty={short_qty_after:.6f}"
+        log_danger(
+            "진입후방향불일치",
+            symbol=symbol,
+            long_exchange=candidate.long_exchange,
+            long_qty=f"{long_qty_after:.6f}",
+            short_exchange=candidate.short_exchange,
+            short_qty=f"{short_qty_after:.6f}",
         )
         await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
         return None
     if pair_qty <= EPS:
-        print(
-            f"[strategy][danger] 진입 후 delta 수량 없음 symbol={symbol} "
-            f"long_pre={pre_long_qty:.6f} long_after={long_qty_after:.6f} long_delta={long_entry_delta:.6f} "
-            f"short_pre={pre_short_qty:.6f} short_after={short_qty_after:.6f} short_delta={short_entry_delta:.6f}"
+        log_danger(
+            "진입후수량없음",
+            symbol=symbol,
+            long_before=f"{pre_long_qty:.6f}",
+            long_after=f"{long_qty_after:.6f}",
+            long_delta=f"{long_entry_delta:.6f}",
+            short_before=f"{pre_short_qty:.6f}",
+            short_after=f"{short_qty_after:.6f}",
+            short_delta=f"{short_entry_delta:.6f}",
         )
         record_live_event(
             config,
@@ -3769,10 +3240,13 @@ async def enter_pair_limit_then_hedge(
         or extract_mid_price(short_snapshot_after)
     )
     if long_entry_price <= 0 or short_entry_price <= 0:
-        print(
-            f"[strategy][danger] 진입 평단 누락 symbol={symbol} "
-            f"long_exchange={candidate.long_exchange} long_entry={long_entry_price:.8f} "
-            f"short_exchange={candidate.short_exchange} short_entry={short_entry_price:.8f}"
+        log_danger(
+            "진입평단누락",
+            symbol=symbol,
+            long_exchange=candidate.long_exchange,
+            long_entry=f"{long_entry_price:.8f}",
+            short_exchange=candidate.short_exchange,
+            short_entry=f"{short_entry_price:.8f}",
         )
         await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
         return None
@@ -3798,11 +3272,14 @@ async def enter_pair_limit_then_hedge(
         short_overfill_executable = _safe_float(short_overfill_preview.get("executable_qty"), 0.0)
         overfill_actionable = long_overfill_executable > EPS and short_overfill_executable > EPS
         event_name = "pair_entry_overfill_detected" if overfill_actionable else "pair_entry_overfill_dust_ignored"
-        log_level = "danger" if overfill_actionable else "dust_ignored"
-        print(
-            f"[strategy][enter][overfill][{log_level}] symbol={symbol} "
-            f"requested={executable_qty:.6f} pair_qty={pair_qty:.6f} overfill={overfill_qty:.6f} "
-            f"long_executable={long_overfill_executable:.6f} short_executable={short_overfill_executable:.6f}"
+        log_overfill(
+            symbol=symbol,
+            requested_qty=executable_qty,
+            pair_qty=pair_qty,
+            overfill_qty=overfill_qty,
+            long_executable_qty=long_overfill_executable,
+            short_executable_qty=short_overfill_executable,
+            actionable=overfill_actionable,
         )
         record_live_event(
             config,
@@ -3834,8 +3311,8 @@ async def enter_pair_limit_then_hedge(
                 restore_neutrality=True,
             )
             print(
-                f"[strategy][enter][overfill][flatten] symbol={symbol} "
-                f"flatten_ok={flatten_result.ok} neutralized={flatten_result.neutralized}"
+                f"[위험][초과체결정리] 심볼={symbol} "
+                f"정리성공={flatten_result.ok} 중립복구={flatten_result.neutralized}"
             )
             record_live_event(
                 config,
@@ -3853,10 +3330,7 @@ async def enter_pair_limit_then_hedge(
             return None
         pair_qty = min(pair_qty, executable_qty)
     if executable_qty > EPS and pair_qty > EPS and pair_qty / executable_qty < 0.10:
-        print(
-            f"[strategy][enter][micro_partial] symbol={symbol} "
-            f"requested={executable_qty:.6f} pair_qty={pair_qty:.6f} ratio={pair_qty / executable_qty:.6f}"
-        )
+        log_micro_partial(symbol=symbol, requested_qty=executable_qty, pair_qty=pair_qty, ratio=pair_qty / executable_qty)
         record_live_event(
             config,
             "pair_entry_micro_partial_detected",
@@ -3876,9 +3350,12 @@ async def enter_pair_limit_then_hedge(
         )
     pair_id = f"{symbol}:{candidate.long_exchange}:{candidate.short_exchange}:{int(time.time() * 1000)}"
 
-    print(
-        f"[strategy][open] 페어 오픈 pair_id={pair_id} symbol={symbol} qty={pair_qty:.6f} "
-        f"long={candidate.long_exchange} short={candidate.short_exchange}"
+    log_pair_opened(
+        pair_id=pair_id,
+        symbol=symbol,
+        qty=pair_qty,
+        long_exchange=candidate.long_exchange,
+        short_exchange=candidate.short_exchange,
     )
     pair = OpenPairState(
         pair_id=pair_id,
@@ -3976,6 +3453,19 @@ def estimate_hold_pnl_next_funding(
     )
 
 
+def current_pair_reference_notional_usd(
+    pair: OpenPairState,
+    exchanges: dict[str, Any],
+) -> float:
+    long_snapshot = exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol)
+    short_snapshot = exchanges[pair.short_exchange].get_symbol_snapshot(pair.symbol)
+    long_ref = extract_mid_price(long_snapshot)
+    short_ref = extract_mid_price(short_snapshot)
+    if long_ref > 0 and short_ref > 0:
+        return max(pair.qty * ((long_ref + short_ref) / 2.0), 0.0)
+    return pair_entry_reference_notional_usd(pair)
+
+
 def estimate_close_pnl_now(
     pair: OpenPairState,
     exchanges: dict[str, Any],
@@ -3996,29 +3486,6 @@ def estimate_close_pnl_now(
     )
     close_slippage = ((long_notional + short_notional) / 2.0) * (config.close_slippage_bps * 2.0) / 10000.0
     return gross_pnl - close_fee_cost - close_slippage
-
-
-def decide_pair_close_reason(
-    pair: OpenPairState,
-    config: StrategyConfig,
-    hold_pnl: float,
-    entry_age_sec: float,
-) -> str:
-    if entry_age_sec < config.min_hold_sec:
-        return "hold_grace"
-    if pair.last_close_pnl_usd <= config.stop_loss_usd:
-        return "stop_loss"
-    if pair.last_close_pnl_usd >= config.take_profit_usd:
-        return "take_profit"
-    if entry_age_sec >= config.max_hold_sec:
-        return "max_hold"
-    if hold_pnl > config.hold_buffer_usd:
-        return "hold"
-    if pair.last_close_edge_usd > 0:
-        return "hold_spread_support"
-    if entry_age_sec < config.close_candidate_min_age_sec:
-        return "hold_close_age_gate"
-    return "close_candidate"
 
 
 async def close_pair_limit_then_hedge(
@@ -4055,15 +3522,18 @@ async def close_pair_limit_then_hedge(
     pair.qty = balanced_qty_after
     if flatten_result.failed_leg is not None:
         failed_payload = flatten_leg_result_payload(flatten_result.failed_leg)
-        print(
-            f"[strategy][close][leg_failed] pair_id={pair.pair_id} symbol={pair.symbol} "
-            f"failed_exchange={flatten_result.failed_leg.exchange_name} "
-            f"failed_side={flatten_result.failed_leg.side} "
-            f"failed_qty={flatten_result.failed_leg.requested_qty:.6f} "
-            f"reason={flatten_result.failed_leg.failure_reason} "
-            f"other_leg_action={flatten_result.other_leg_action} "
-            f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "
-            f"net_qty_after={(long_qty_after + short_qty_after):.6f}"
+        log_danger(
+            "페어종료레그실패",
+            id=pair.pair_id,
+            symbol=pair.symbol,
+            failed_exchange=flatten_result.failed_leg.exchange_name,
+            failed_side=flatten_result.failed_leg.side,
+            failed_qty=f"{flatten_result.failed_leg.requested_qty:.6f}",
+            reason=flatten_result.failed_leg.failure_reason,
+            other_leg_action=flatten_result.other_leg_action,
+            long_after=f"{long_qty_after:.6f}",
+            short_after=f"{short_qty_after:.6f}",
+            net_qty=f"{(long_qty_after + short_qty_after):.6f}",
         )
         record_live_event(
             config,
@@ -4081,7 +3551,7 @@ async def close_pair_limit_then_hedge(
     if close_state == "closed":
         pair.status = "closed"
         pair.assumed_flat_exchanges = [pair.long_exchange, pair.short_exchange]
-        print(f"[strategy][close] 페어 청산 완료 pair_id={pair.pair_id}")
+        log_pair_closed(pair_id=pair.pair_id)
         record_live_event(config, "pair_closed", pair=pair_event_payload(pair))
         return True
 
@@ -4103,12 +3573,16 @@ async def close_pair_limit_then_hedge(
         return False
 
     pair.status = "close_imbalance"
-    print(
-        f"[strategy][danger] 청산 불균형 pair_id={pair.pair_id} "
-        f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "
-        f"residual_gap={residual_gap:.6f} state={close_state} flattened={flattened} "
-        f"cause={(flatten_result.failed_leg.failure_reason if flatten_result.failed_leg else close_state)} "
-        f"other_leg_action={flatten_result.other_leg_action}"
+    log_danger(
+        "청산불균형",
+        id=pair.pair_id,
+        long_after=f"{long_qty_after:.6f}",
+        short_after=f"{short_qty_after:.6f}",
+        residual_gap=f"{residual_gap:.6f}",
+        state=close_state,
+        flattened=flattened,
+        cause=(flatten_result.failed_leg.failure_reason if flatten_result.failed_leg else close_state),
+        other_leg_action=flatten_result.other_leg_action,
     )
     pair.status = "close_pending"
     print(
@@ -4158,7 +3632,7 @@ async def manage_open_pairs(
         )
         if abs(long_qty) <= EPS and abs(short_qty) <= EPS:
             pair.status = "closed"
-            print(f"[strategy][pair] 페어 종료 감지 pair_id={pair_id}")
+            log_pair_closed_detected(pair_id=pair_id)
             record_live_event(config, "pair_closed_detected", pair=pair_event_payload(pair))
             mark_symbol_recently_closed(symbol_recent_close_ms, pair.symbol)
             del open_pairs[pair_id]
@@ -4186,7 +3660,7 @@ async def manage_open_pairs(
             )
             if abs(long_qty) <= EPS and abs(short_qty) <= EPS:
                 pair.status = "closed"
-                print(f"[strategy][pair] 페어 종료 감지 pair_id={pair_id}")
+                log_pair_closed_detected(pair_id=pair_id)
                 record_live_event(config, "pair_closed_detected", pair=pair_event_payload(pair))
                 mark_symbol_recently_closed(symbol_recent_close_ms, pair.symbol)
                 del open_pairs[pair_id]
@@ -4234,9 +3708,11 @@ async def manage_open_pairs(
                         **micro_payload,
                     )
                 else:
-                    print(
-                        f"[strategy][danger] 페어 방향 불일치 pair_id={pair_id} "
-                        f"long_qty={long_qty:.6f} short_qty={short_qty:.6f}"
+                    log_danger(
+                        "페어방향불일치",
+                        id=pair_id,
+                        long_qty=f"{long_qty:.6f}",
+                        short_qty=f"{short_qty:.6f}",
                     )
                 pair.last_direction_mismatch_log_ms = current_ms
             if current_ms < pair.next_recovery_retry_ms:
@@ -4323,7 +3799,19 @@ async def manage_open_pairs(
 
         hold_pnl = estimate_hold_pnl_next_funding(pair, exchanges, config)
         entry_age_sec = max((now_ms() - pair.entry_time_ms) / 1000.0, 0.0)
-        decision = "await_account_sync" if not action_inputs_fresh else decide_pair_close_reason(pair, config, hold_pnl, entry_age_sec)
+        close_reference_notional_usd = current_pair_reference_notional_usd(pair, exchanges)
+        close_thresholds = close_thresholds_usd(pair, config, close_reference_notional_usd)
+        decision = (
+            "await_account_sync"
+            if not action_inputs_fresh
+            else decide_pair_close_reason(
+                pair,
+                config,
+                hold_pnl,
+                entry_age_sec,
+                reference_notional_usd=close_reference_notional_usd,
+            )
+        )
         pair.last_close_reason = decision
         if pair.last_hold_decision != decision or abs(pair.last_hold_pnl_usd - hold_pnl) >= 0.01:
             pair.last_hold_decision = decision
@@ -4332,7 +3820,10 @@ async def manage_open_pairs(
                 config,
                 f"[strategy][pair] pair_id={pair_id} symbol={pair.symbol} "
                 f"decision={decision} hold_pnl_next_funding={hold_pnl:.4f} "
-                f"hold_buffer_usd={config.hold_buffer_usd:.4f} "
+                f"hold_buffer_usd={close_thresholds['hold_buffer_usd']:.4f} "
+                f"take_profit_usd={close_thresholds['take_profit_usd']:.4f} "
+                f"stop_loss_usd={close_thresholds['stop_loss_usd']:.4f} "
+                f"close_reference_notional_usd={close_reference_notional_usd:.4f} "
                 f"close_pnl_now={pair.last_close_pnl_usd:.4f} "
                 f"close_edge_now={pair.last_close_edge_usd:.4f} "
                 f"entry_age_sec={entry_age_sec:.1f} min_hold_sec={config.min_hold_sec:.1f}"
@@ -4343,13 +3834,14 @@ async def manage_open_pairs(
             if current_ms < pair.next_auto_close_retry_ms:
                 continue
             pair.next_auto_close_retry_ms = current_ms + int(config.auto_close_retry_cooldown_sec * 1000)
-            print(f"[strategy][pair] 자동 청산 트리거 pair_id={pair_id} reason={decision}")
+            log_pair_close_trigger(pair_id=pair_id, symbol=pair.symbol, reason=decision)
             record_live_event(
                 config,
                 "pair_auto_close_trigger",
                 pair=pair_event_payload(pair),
                 reason=decision,
                 entry_age_sec=entry_age_sec,
+                close_thresholds=close_thresholds,
             )
             ok = await close_pair_limit_then_hedge(pair, exchanges, config)
             if ok and pair.status == "closed":
@@ -4459,6 +3951,7 @@ async def handle_command(
             exchanges,
             config,
             entry_control_store,
+            balance_reports_by_exchange=collect_balance_reports_by_exchange(exchanges),
             startup_block_reasons=startup_block_reasons,
         )
         if not risk_decision.allowed:
@@ -4520,59 +4013,32 @@ def collect_candidates(
     recent_close_block_logged_ms: dict[str, int] | None = None,
     startup_block_reasons: tuple[str, ...] = (),
 ) -> list[PairCandidate]:
-    snapshots_by_exchange: dict[str, dict[str, Any]] = {
-        exchange_name: {symbol: exchange.get_symbol_snapshot(symbol) for symbol in symbols}
-        for exchange_name, exchange in exchanges.items()
-    }
-    balance_reports_by_exchange: dict[str, dict[str, Any]] = {
-        exchange_name: get_exchange_balance_report(exchange)
-        for exchange_name, exchange in exchanges.items()
-    }
-    candidates: list[PairCandidate] = []
-    for left, right in config.allowed_pairs:
-        for symbol in symbols:
-            candidates.append(
-                compute_pair_candidate(
-                    symbol,
-                    left,
-                    right,
-                    snapshots_by_exchange,
-                    exchanges,
-                    config,
-                    balance_reports_by_exchange=balance_reports_by_exchange,
-                    assumed_flat_until_ms=assumed_flat_until_ms,
-                )
-            )
-            candidates.append(
-                compute_pair_candidate(
-                    symbol,
-                    right,
-                    left,
-                    snapshots_by_exchange,
-                    exchanges,
-                    config,
-                    balance_reports_by_exchange=balance_reports_by_exchange,
-                    assumed_flat_until_ms=assumed_flat_until_ms,
-                )
-            )
-    ranked = rank_candidates(candidates)
-    if open_pairs is not None:
-        ranked = apply_open_pair_capacity_blocks(ranked, open_pairs, config)
-    ranked = apply_recent_symbol_close_blocks(
-        ranked,
+    candidate_build_hooks = CandidateBuildHooks(
+        compute_common_executable_qty=compute_common_executable_qty,
+        exchange_min_order_notional_usd=exchange_min_order_notional_usd,
+        effective_position_qty=effective_position_qty,
+        extract_health_can_trade=extract_health_can_trade,
+        extract_health_block_reasons=extract_health_block_reasons,
+        has_open_orders=has_open_orders,
+        pair_entry_margin_guard_reasons=pair_entry_margin_guard_reasons,
+    )
+    collection_hooks = CandidateCollectionHooks(
+        collect_balance_reports_by_exchange=collect_balance_reports_by_exchange,
+        apply_open_pair_capacity_blocks=apply_open_pair_capacity_blocks,
+        apply_recent_symbol_close_blocks=apply_recent_symbol_close_blocks,
+        apply_risk_gate_blocks=apply_risk_gate_blocks,
+        candidate_build_hooks=candidate_build_hooks,
+    )
+    return collect_pair_candidates(
+        symbols,
         exchanges,
         config,
+        collection_hooks,
+        open_pairs,
+        entry_control_store,
+        assumed_flat_until_ms,
         symbol_recent_close_ms,
         recent_close_block_logged_ms,
-        assumed_flat_until_ms,
-    )
-    return apply_risk_gate_blocks(
-        ranked,
-        open_pairs,
-        exchanges,
-        config,
-        entry_control_store,
-        balance_reports_by_exchange,
         startup_block_reasons,
     )
 
@@ -4592,8 +4058,12 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
             f"auto_enter={config.auto_enter_enabled} auto_close={config.auto_close_enabled} "
             f"first_leg_role={config.first_leg_role} max_open_pairs={config.max_open_pairs} "
             f"account_imbalance_hedge={config.account_imbalance_hedge_enabled} "
-            f"margin_mode={config.margin_mode} "
+            f"leverage={config.leverage} margin_mode={config.margin_mode} "
             f"margin_mode_guard={config.startup_margin_mode_guard_enabled} "
+            f"max_gross_lev={config.max_gross_leverage} "
+            f"rate_limit_guard={config.rate_limit_guard_enabled} "
+            f"rate_limit_threshold={config.rate_limit_guard_usage_threshold} "
+            f"funding_payment_only={config.require_funding_payment} "
             f"entry_settle={config.entry_order_settle_sec}s "
             f"entry_cooldown={config.entry_order_cooldown_sec}s "
             f"entry_control_file={config.entry_control_file}"
@@ -4635,19 +4105,33 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
     print(
         f"entry_control_file={config.entry_control_file} "
         f"entry_control_fail_closed={config.entry_control_fail_closed} "
+        f"leverage={config.leverage} "
         f"margin_mode={config.margin_mode} "
         f"startup_margin_mode_guard_enabled={config.startup_margin_mode_guard_enabled}"
+    )
+    print(
+        f"max_gross_leverage={config.max_gross_leverage} "
+        f"max_long_leverage={config.max_long_leverage} "
+        f"max_short_leverage={config.max_short_leverage}"
+    )
+    print(
+        f"rate_limit_guard_enabled={config.rate_limit_guard_enabled} "
+        f"rate_limit_guard_usage_threshold={config.rate_limit_guard_usage_threshold}"
     )
     print(
         f"entry_threshold_usd={config.min_expected_net_edge_usd} "
         f"entry_threshold_bps={config.min_expected_net_edge_bps} "
         f"min_effective_funding_usd={effective_funding_floor} "
+        f"require_funding_payment={config.require_funding_payment} "
         f"hold_buffer_usd={config.hold_buffer_usd} "
+        f"hold_buffer_bps={config.hold_buffer_bps} "
         f"min_hold_sec={config.min_hold_sec} "
         f"close_candidate_min_age_sec={config.close_candidate_min_age_sec} "
         f"max_hold_sec={config.max_hold_sec} "
         f"take_profit_usd={config.take_profit_usd} "
+        f"take_profit_bps={config.take_profit_bps} "
         f"stop_loss_usd={config.stop_loss_usd} "
+        f"stop_loss_bps={config.stop_loss_bps} "
         f"position_stale_ignore_sec={config.position_stale_ignore_sec}"
     )
     print(
@@ -4791,6 +4275,11 @@ async def strategy_loop() -> None:
                 last_signature = signature
 
             if (now - last_render_ts) >= config.render_interval_sec:
+                record_live_event(
+                    config,
+                    "candidate_scan_summary",
+                    **build_candidate_scan_summary(candidates),
+                )
                 if not simple_stdout_enabled(config):
                     print(
                         render_candidate_table(
@@ -4849,21 +4338,20 @@ async def strategy_loop() -> None:
                             exchanges,
                             config,
                             entry_control_store,
+                            balance_reports_by_exchange=collect_balance_reports_by_exchange(exchanges),
                             startup_block_reasons=startup_block_reasons,
                         )
                         if not risk_decision.allowed:
                             apply_risk_decision_to_candidate(candidate, risk_decision)
                             record_entry_risk_blocked(config, candidate, risk_decision)
-                            print(
-                                f"[strategy][auto-enter][risk-blocked] candidate_id={candidate.id} "
-                                f"symbol={candidate.symbol} reasons={list(risk_decision.reasons)}"
-                            )
+                            log_entry_blocked(symbol=candidate.symbol, reasons=list(risk_decision.reasons))
                             continue
-                        print(
-                            f"[strategy][auto-enter] 자동 진입 후보 candidate_id={candidate.id} "
-                            f"symbol={candidate.symbol} "
-                            f"net_usd={candidate.expected_net_edge_usd:.4f} "
-                            f"net_bps={candidate.expected_net_edge_bps:.2f}"
+                        log_entry_attempt(
+                            symbol=candidate.symbol,
+                            long_exchange=candidate.long_exchange,
+                            short_exchange=candidate.short_exchange,
+                            expected_net_edge_usd=candidate.expected_net_edge_usd,
+                            expected_net_edge_bps=candidate.expected_net_edge_bps,
                         )
 
                         pair = await enter_pair_limit_then_hedge(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .account_context import resolve_account_label, resolve_logic_name
+
 
 OPEN_ORDER_STATUSES = {
     "ACKNOWLEDGED",
@@ -24,20 +26,33 @@ TERMINAL_ORDER_STATUSES = {
 }
 
 
+def _row_account_label(row: dict[str, Any] | None = None) -> str:
+    value = (row or {}).get("account_label")
+    return str(value).strip().lower() if value else resolve_account_label()
+
+
+def _row_logic(row: dict[str, Any] | None = None) -> str:
+    value = (row or {}).get("logic")
+    return str(value).strip() if value else resolve_logic_name()
+
+
 def upsert_trade_history_rows(conn, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
 
     sql = """
     INSERT INTO trade_history (
+        account_label, logic,
         uuid, exchange_name, symbol,
         order_uuid, order_id, client_order_id, trade_id,
         side, role, position_side,
         price, qty, quote_qty,
         fee, fee_ccy, realized_pnl_usdt,
         desktop_time_ms, server_time_ms, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
+        account_label = VALUES(account_label),
+        logic = VALUES(logic),
         order_uuid = VALUES(order_uuid),
         order_id = VALUES(order_id),
         client_order_id = VALUES(client_order_id),
@@ -58,6 +73,8 @@ def upsert_trade_history_rows(conn, rows: list[dict[str, Any]]) -> int:
 
     values = [
         (
+            _row_account_label(row),
+            _row_logic(row),
             row["uuid"],
             row["exchange_name"],
             row["symbol"],
@@ -96,13 +113,16 @@ def upsert_order_history_rows(conn, rows: list[dict[str, Any]]) -> int:
 
     sql = """
     INSERT INTO order_history (
+        account_label, logic,
         uuid, exchange_name, symbol,
         order_id, client_order_id,
         side, position_side, reduce_only, order_type,
         price, qty, executed_qty, avg_price,
         status, order_start, order_end, desktop_time_ms, server_time_ms, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
+        account_label = VALUES(account_label),
+        logic = VALUES(logic),
         order_id = COALESCE(VALUES(order_id), order_id),
         client_order_id = COALESCE(VALUES(client_order_id), client_order_id),
         side = IF(VALUES(side) <> 'unknown', VALUES(side), side),
@@ -128,6 +148,8 @@ def upsert_order_history_rows(conn, rows: list[dict[str, Any]]) -> int:
 
     values = [
         (
+            _row_account_label(row),
+            _row_logic(row),
             row["uuid"],
             row["exchange_name"],
             row["symbol"],
@@ -176,9 +198,11 @@ def mark_absent_open_order_rows(
 
     normalized_symbol = str(symbol or "").upper()
     terminal_status = str(terminal_status or "NOT_EXIST").upper()
+    account_label = resolve_account_label()
+    logic = resolve_logic_name()
     open_statuses = tuple(sorted(OPEN_ORDER_STATUSES))
     placeholders = ", ".join("?" for _ in open_statuses)
-    params: list[Any] = [terminal_status, timestamp_ms, timestamp_ms, exchange_name, *open_statuses]
+    params: list[Any] = [terminal_status, timestamp_ms, timestamp_ms, account_label, logic, exchange_name, *open_statuses]
     symbol_filter = ""
     if normalized_symbol and normalized_symbol != "ALL":
         symbol_filter = " AND symbol = ?"
@@ -191,7 +215,9 @@ def mark_absent_open_order_rows(
         order_end = GREATEST(order_end, ?),
         desktop_time_ms = ?,
         raw_json = COALESCE(raw_json, '{{}}')
-    WHERE exchange_name = ?
+    WHERE account_label = ?
+      AND logic = ?
+      AND exchange_name = ?
       AND UPPER(status) IN ({placeholders})
       {symbol_filter}
     """
@@ -212,12 +238,15 @@ def upsert_balance_snapshot_rows(conn, rows: list[dict[str, Any]]) -> int:
 
     sql = """
     INSERT INTO balance_snapshot (
+        account_label, logic,
         exchange_name, bucket_start_ms, desktop_time_ms, server_time_ms,
         tracked_symbols_json, symbol_balances_json,
         cash_usdt, available_cash_usdt, locked_cash_usdt, total_equity_usdt, unrealized_pnl_usdt,
         raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
+        account_label = VALUES(account_label),
+        logic = VALUES(logic),
         desktop_time_ms = VALUES(desktop_time_ms),
         server_time_ms = VALUES(server_time_ms),
         tracked_symbols_json = VALUES(tracked_symbols_json),
@@ -232,6 +261,8 @@ def upsert_balance_snapshot_rows(conn, rows: list[dict[str, Any]]) -> int:
 
     values = [
         (
+            _row_account_label(row),
+            _row_logic(row),
             row["exchange_name"],
             row["bucket_start_ms"],
             row["desktop_time_ms"],
