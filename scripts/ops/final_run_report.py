@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,138 @@ def default_artifact_path(meta_path: Path, prefix: str, suffix: str, label: str 
 
 def check(status: str, name: str, detail: str) -> dict[str, str]:
     return {"status": status, "name": name, "detail": detail}
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def load_run_rows_from_meta(run_meta: dict[str, Any]) -> list[dict[str, Any]]:
+    started_at_ms = int(run_meta.get("started_at_ms") or 0)
+    jsonl_path = resolve_path(run_meta.get("jsonl_log"))
+    if not jsonl_path or not jsonl_path.exists():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for line in jsonl_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if int(row.get("ts_ms") or 0) >= started_at_ms:
+            rows.append(row)
+    return rows
+
+
+def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any]:
+    run_rows = load_run_rows_from_meta(run_meta)
+    event_counts = Counter(str(row.get("event_type") or "unknown") for row in run_rows)
+    opened_by_pair_id: dict[str, dict[str, Any]] = {}
+    close_trigger_by_pair_id: dict[str, dict[str, Any]] = {}
+    pair_rows: list[dict[str, Any]] = []
+    block_reason_counts: Counter[str] = Counter()
+    top_symbol_counts: Counter[str] = Counter()
+    top_enterable_symbol_counts: Counter[str] = Counter()
+    enterable_scan_count = 0
+    max_enterable_candidates = 0
+
+    for row in run_rows:
+        event_type = str(row.get("event_type") or "")
+        if event_type == "candidate_scan_summary":
+            enterable_count = int(row.get("enterable_candidates") or 0)
+            enterable_scan_count += 1 if enterable_count > 0 else 0
+            max_enterable_candidates = max(max_enterable_candidates, enterable_count)
+            block_reason_counts.update(row.get("reason_counts") or {})
+
+            top_candidate = row.get("top_candidate") or {}
+            top_symbol = top_candidate.get("symbol")
+            if top_symbol:
+                top_symbol_counts[str(top_symbol).upper()] += 1
+
+            top_enterable = row.get("top_enterable_candidate") or {}
+            top_enterable_symbol = top_enterable.get("symbol")
+            if top_enterable_symbol:
+                top_enterable_symbol_counts[str(top_enterable_symbol).upper()] += 1
+            continue
+
+        pair = row.get("pair") or {}
+        pair_id = pair.get("pair_id")
+        if not pair_id:
+            continue
+
+        if event_type == "pair_opened":
+            opened_by_pair_id[str(pair_id)] = row
+        elif event_type == "pair_auto_close_trigger":
+            close_trigger_by_pair_id[str(pair_id)] = row
+        elif event_type == "pair_closed":
+            opened_row = opened_by_pair_id.get(str(pair_id)) or {}
+            opened_pair = opened_row.get("pair") or {}
+            candidate = opened_row.get("candidate") or {}
+            trigger = close_trigger_by_pair_id.get(str(pair_id)) or {}
+            trigger_pair = trigger.get("pair") or {}
+            entry_time_ms = int(pair.get("entry_time_ms") or opened_pair.get("entry_time_ms") or 0)
+            close_time_ms = int(row.get("ts_ms") or 0)
+            hold_ms = max(close_time_ms - entry_time_ms, 0) if entry_time_ms and close_time_ms else 0
+            pair_rows.append(
+                {
+                    "pair_id": pair_id,
+                    "symbol": str(pair.get("symbol") or opened_pair.get("symbol") or "").upper(),
+                    "long_exchange": pair.get("long_exchange") or opened_pair.get("long_exchange"),
+                    "short_exchange": pair.get("short_exchange") or opened_pair.get("short_exchange"),
+                    "requested_qty": safe_float(pair.get("requested_qty") or opened_pair.get("requested_qty")),
+                    "opened_qty": safe_float(opened_pair.get("qty") or pair.get("requested_qty")),
+                    "entry_time_ms": entry_time_ms,
+                    "entry_time_utc": iso_utc(entry_time_ms),
+                    "close_time_ms": close_time_ms,
+                    "close_time_utc": iso_utc(close_time_ms),
+                    "hold_ms": hold_ms,
+                    "hold_duration": format_duration_ms(hold_ms),
+                    "entry_expected_net_edge_usd": safe_float(candidate.get("expected_net_edge_usd")),
+                    "entry_expected_net_edge_bps": safe_float(candidate.get("expected_net_edge_bps")),
+                    "entry_open_edge_usd": safe_float(candidate.get("entry_open_edge_usd")),
+                    "entry_open_edge_bps": safe_float(candidate.get("entry_open_edge_bps")),
+                    "close_reason": pair.get("last_close_reason") or trigger.get("reason") or trigger_pair.get("last_close_reason") or "",
+                    "close_pnl_usd": safe_float(pair.get("last_close_pnl_usd")),
+                    "close_edge_usd": safe_float(pair.get("last_close_edge_usd")),
+                    "hold_pnl_usd": safe_float(pair.get("last_hold_pnl_usd")),
+                    "auto_close_reason": trigger.get("reason") or "",
+                }
+            )
+
+    closed_count = len(pair_rows)
+    total_close_pnl = sum(row["close_pnl_usd"] for row in pair_rows)
+    total_entry_expected_edge = sum(row["entry_expected_net_edge_usd"] for row in pair_rows)
+    total_hold_ms = sum(int(row["hold_ms"] or 0) for row in pair_rows)
+    avg_hold_ms = int(total_hold_ms / closed_count) if closed_count else 0
+    close_reason_counts = Counter(str(row.get("close_reason") or "unknown") for row in pair_rows)
+
+    return {
+        "run_rows": len(run_rows),
+        "pair_opened": int(event_counts.get("pair_opened", 0)),
+        "pair_closed": closed_count,
+        "pair_close_reasons": dict(close_reason_counts.most_common()),
+        "total_close_pnl_usd": total_close_pnl,
+        "total_entry_expected_edge_usd": total_entry_expected_edge,
+        "realized_minus_expected_usd": total_close_pnl - total_entry_expected_edge,
+        "avg_close_pnl_usd": total_close_pnl / closed_count if closed_count else 0.0,
+        "avg_hold_ms": avg_hold_ms,
+        "avg_hold_duration": format_duration_ms(avg_hold_ms),
+        "entry_submit_attempts": int(event_counts.get("entry_limit_order_submit_preflight", 0)),
+        "candidate_scan_count": int(event_counts.get("candidate_scan_summary", 0)),
+        "enterable_scan_count": enterable_scan_count,
+        "max_enterable_candidates": max_enterable_candidates,
+        "top_block_reasons": dict(block_reason_counts.most_common(10)),
+        "top_candidate_symbols": dict(top_symbol_counts.most_common(10)),
+        "top_enterable_symbols": dict(top_enterable_symbol_counts.most_common(10)),
+        "pairs": pair_rows,
+    }
 
 
 def verdict_to_check(name: str, report: dict[str, Any]) -> dict[str, str]:
@@ -360,6 +493,7 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     db_report = payload.get("order_trade_reconcile") or {}
     live_report = payload.get("live_flat") or {}
     symbol_price_report = payload.get("symbol_price") or {}
+    performance = payload.get("strategy_performance") or {}
     artifacts = payload.get("artifacts") or {}
     event_counts = afterrun.get("event_counts") or {}
     submit_telemetry = afterrun.get("submit_telemetry") or {}
@@ -404,6 +538,47 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
         "pair_neutralized_after_close_failure",
     ):
         lines.append(f"- {key}: {event_counts.get(key, 0)}")
+    lines.append("")
+    lines.append("## Strategy Performance")
+    lines.append(f"- pair_opened: {performance.get('pair_opened', 0)}")
+    lines.append(f"- pair_closed: {performance.get('pair_closed', 0)}")
+    lines.append(f"- total_close_pnl_usd: {float(performance.get('total_close_pnl_usd') or 0):.6f}")
+    lines.append(f"- total_entry_expected_edge_usd: {float(performance.get('total_entry_expected_edge_usd') or 0):.6f}")
+    lines.append(f"- realized_minus_expected_usd: {float(performance.get('realized_minus_expected_usd') or 0):.6f}")
+    lines.append(f"- avg_close_pnl_usd: {float(performance.get('avg_close_pnl_usd') or 0):.6f}")
+    lines.append(f"- avg_hold_duration: {performance.get('avg_hold_duration') or '-'}")
+    lines.append(f"- entry_submit_attempts: {performance.get('entry_submit_attempts', 0)}")
+    lines.append(f"- candidate_scan_count: {performance.get('candidate_scan_count', 0)}")
+    lines.append(f"- enterable_scan_count: {performance.get('enterable_scan_count', 0)}")
+    lines.append(f"- max_enterable_candidates: {performance.get('max_enterable_candidates', 0)}")
+    close_reasons = performance.get("pair_close_reasons") or {}
+    if close_reasons:
+        lines.append("- close_reasons: " + ", ".join(f"{key}={value}" for key, value in close_reasons.items()))
+    top_block_reasons = performance.get("top_block_reasons") or {}
+    if top_block_reasons:
+        lines.append("- top_block_reasons: " + ", ".join(f"{key}={value}" for key, value in top_block_reasons.items()))
+    top_symbols = performance.get("top_candidate_symbols") or {}
+    if top_symbols:
+        lines.append("- top_candidate_symbols: " + ", ".join(f"{key}={value}" for key, value in top_symbols.items()))
+    pairs = performance.get("pairs") or []
+    if pairs:
+        lines.append("")
+        lines.append("| symbol | pair | qty | entry_edge_bps | close_pnl_usd | hold | close_reason |")
+        lines.append("| --- | --- | ---: | ---: | ---: | --- | --- |")
+        for row in pairs:
+            pair_name = f"{row.get('long_exchange') or '-'}L/{row.get('short_exchange') or '-'}S"
+            lines.append(
+                "| "
+                f"{row.get('symbol') or '-'} | "
+                f"{pair_name} | "
+                f"{float(row.get('opened_qty') or 0):.8g} | "
+                f"{float(row.get('entry_expected_net_edge_bps') or 0):.2f} | "
+                f"{float(row.get('close_pnl_usd') or 0):.6f} | "
+                f"{row.get('hold_duration') or '-'} | "
+                f"{row.get('close_reason') or '-'} |"
+            )
+    else:
+        lines.append("- no closed pairs in this run")
     lines.append("")
     lines.append("## Entry Submit Price Age")
     if int(submit_telemetry.get("preflight_count") or 0) <= 0:
@@ -533,6 +708,7 @@ def main() -> int:
         )
     except Exception as exc:
         symbol_price = symbol_price_error_report(exc)
+    strategy_performance = build_strategy_performance_report(run_meta)
 
     component_checks = [
         verdict_to_check("afterrun_summary_passed", afterrun_payload.get("verdict") or {}),
@@ -554,6 +730,7 @@ def main() -> int:
         "order_trade_reconcile": db_report,
         "live_flat": live_flat,
         "symbol_price": symbol_price,
+        "strategy_performance": strategy_performance,
         "artifacts": {
             "afterrun_summary_md": str(afterrun_output),
             "order_trade_reconcile_md": str(reconcile_output),

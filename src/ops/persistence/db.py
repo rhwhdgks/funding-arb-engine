@@ -26,6 +26,30 @@ def resolve_default_schema_path() -> Path:
 DEFAULT_SCHEMA_PATH = resolve_default_schema_path()
 
 
+def _env_flag(key: str, default: str = "0") -> bool:
+    return os.getenv(key, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def db_env_configured() -> bool:
+    return any(
+        os.getenv(key) not in (None, "")
+        for key in (
+            "MARIADB_HOST",
+            "MARIADB_PORT",
+            "MARIADB_USER",
+            "MARIADB_PASSWORD",
+            "MARIADB_DATABASE",
+        )
+    )
+
+
+def db_persistence_enabled() -> bool:
+    raw = os.getenv("ENABLE_DB_PERSISTENCE")
+    if raw is not None:
+        return _env_flag("ENABLE_DB_PERSISTENCE", "0")
+    return db_env_configured()
+
+
 @dataclass
 class DbConfig:
     host: str

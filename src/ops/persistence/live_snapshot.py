@@ -4,7 +4,7 @@ import asyncio
 from typing import Any
 
 from src.ops.persistence.balance_report import build_balance_report
-from src.ops.persistence.db import current_utc_ms, get_db_connection
+from src.ops.persistence.db import current_utc_ms, db_persistence_enabled, get_db_connection
 from src.ops.persistence.trading_dev_normalizers import (
     build_balance_snapshot_row,
     build_funding_rate_rows,
@@ -33,6 +33,15 @@ async def persist_exchange_snapshots(
     """
     normalized_exchange = str(exchange_name).strip().lower()
     normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+
+    if not db_persistence_enabled():
+        return {
+            "exchange": normalized_exchange,
+            "funding": {},
+            "balance": {},
+            "positions": {},
+            "skipped": "db_disabled",
+        }
 
     if not normalized_symbols:
         return {

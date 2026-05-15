@@ -12,6 +12,9 @@
 - `MARIADB_USER`
 - `MARIADB_PASSWORD`
 - `MARIADB_DATABASE`
+- `ENABLE_DB_PERSISTENCE`
+
+DB 설정은 선택값이다. `MARIADB_*`가 하나도 없으면 runtime DB writer는 자동 비활성화되고, 전략 실행은 DB 없이 계속 진행한다. 강제로 켜거나 끄고 싶으면 `ENABLE_DB_PERSISTENCE=1/0`을 사용한다.
 
 ### Exchange Credentials
 - `BINANCE_ACCESS_KEY`

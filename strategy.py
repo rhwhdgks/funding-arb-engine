@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from src.core.action_gate import ActionGate
 from dotenv import load_dotenv
-from src.ops.persistence.live_snapshot import persist_exchange_snapshots
+from src.ops.persistence.runtime import build_runtime_persistence_from_env
 from src.core.exchange_registry import build_exchange
 from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_csv
 from src.strategy.candidates import (
@@ -48,14 +48,12 @@ from src.strategy.risk_gate import (
     RiskGateDecision,
     evaluate_entry_risk,
 )
+from src.strategy.close_policy import evaluate_close_policy, pair_entry_reference_notional_usd
 from src.strategy.rules import (
-    close_thresholds_usd,
     close_first_leg_plan,
     close_hedge_leg_plan,
-    decide_pair_close_reason,
     first_leg_plan,
     hedge_leg_plan,
-    pair_entry_reference_notional_usd,
     required_entry_open_edge_usd,
 )
 from src.strategy.models import (
@@ -345,77 +343,7 @@ def ceil_by_step(value: float, step: float) -> float:
     step_dec = Decimal(str(step))
     units = (value_dec / step_dec).to_integral_value(rounding=ROUND_UP)
     return float(units * step_dec)
-def _env_flag(key: str, default: str = "0") -> bool:
-    return os.getenv(key, default).strip().lower() in {"1", "true", "yes", "y", "on"}
 
-
-def load_snapshot_config() -> dict[str, Any]:
-    interval_sec = float(os.getenv("SNAPSHOT_INTERVAL_SEC", "120").strip())
-    funding_limit = int(os.getenv("SNAPSHOT_FUNDING_LIMIT", "30").strip())
-
-    return {
-        "enabled": _env_flag("ENABLE_DB_SNAPSHOTS", "1"),
-        "interval_sec": max(interval_sec, 10.0),
-        "funding_limit": max(funding_limit, 1),
-        "persist_funding": _env_flag("SNAPSHOT_PERSIST_FUNDING", "1"),
-        "persist_balance": _env_flag("SNAPSHOT_PERSIST_BALANCE", "1"),
-        "persist_positions": _env_flag("SNAPSHOT_PERSIST_POSITIONS", "1"),
-    }
-
-
-async def run_snapshot_loop(
-    exchanges: dict[str, Any],
-    symbols: list[str],
-    *,
-    config: dict[str, Any],
-) -> None:
-    if not config.get("enabled", False):
-        print_verbose(None, "[snapshot-loop] disabled")
-        return
-
-    interval_sec = float(config["interval_sec"])
-    funding_limit = int(config["funding_limit"])
-    persist_funding = bool(config["persist_funding"])
-    persist_balance = bool(config["persist_balance"])
-    persist_positions = bool(config["persist_positions"])
-
-    print_verbose(
-        None,
-        "[snapshot-loop] start",
-        {
-            "interval_sec": interval_sec,
-            "funding_limit": funding_limit,
-            "persist_funding": persist_funding,
-            "persist_balance": persist_balance,
-            "persist_positions": persist_positions,
-            "symbols": symbols,
-            "exchanges": sorted(exchanges.keys()),
-        },
-    )
-
-    while True:
-        started_ms = int(time.time() * 1000)
-
-        for exchange_name, exchange in exchanges.items():
-            try:
-                summary = await persist_exchange_snapshots(
-                    exchange_name=exchange_name,
-                    exchange=exchange,
-                    symbols=symbols,
-                    funding_limit=funding_limit,
-                    persist_funding=persist_funding,
-                    persist_balance=persist_balance,
-                    persist_positions=persist_positions,
-                )
-                print_verbose(None, f"[snapshot-loop][{exchange_name}] {summary}")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                print(f"[snapshot-loop][{exchange_name}][error] {exc}")
-
-        elapsed_sec = max((int(time.time() * 1000) - started_ms) / 1000.0, 0.0)
-        sleep_sec = max(interval_sec - elapsed_sec, 1.0)
-        await asyncio.sleep(sleep_sec)
 
 def extract_position_qty(snapshot: dict[str, Any]) -> float:
     position = snapshot.get("position", {}) or {}
@@ -3794,24 +3722,26 @@ async def manage_open_pairs(
 
         balanced_qty = min(abs(long_qty), abs(short_qty))
         pair.qty = balanced_qty
-        pair.last_close_pnl_usd = estimate_close_pnl_now(pair, exchanges, config)
-        _, _, pair.last_close_edge_usd = current_pair_close_edge(pair, exchanges)
-
+        close_pnl_now = estimate_close_pnl_now(pair, exchanges, config)
+        _, _, close_edge_now = current_pair_close_edge(pair, exchanges)
         hold_pnl = estimate_hold_pnl_next_funding(pair, exchanges, config)
         entry_age_sec = max((now_ms() - pair.entry_time_ms) / 1000.0, 0.0)
         close_reference_notional_usd = current_pair_reference_notional_usd(pair, exchanges)
-        close_thresholds = close_thresholds_usd(pair, config, close_reference_notional_usd)
-        decision = (
-            "await_account_sync"
-            if not action_inputs_fresh
-            else decide_pair_close_reason(
-                pair,
-                config,
-                hold_pnl,
-                entry_age_sec,
-                reference_notional_usd=close_reference_notional_usd,
-            )
+        close_evaluation = evaluate_close_policy(
+            pair,
+            config,
+            hold_pnl_usd=hold_pnl,
+            entry_age_sec=entry_age_sec,
+            close_pnl_usd=close_pnl_now,
+            close_edge_usd=close_edge_now,
+            reference_notional_usd=close_reference_notional_usd,
+            action_inputs_fresh=action_inputs_fresh,
         )
+        decision = close_evaluation.decision
+        close_thresholds = close_evaluation.thresholds
+        close_reference_notional_usd = close_evaluation.reference_notional_usd
+        pair.last_close_pnl_usd = close_evaluation.close_pnl_usd
+        pair.last_close_edge_usd = close_evaluation.close_edge_usd
         pair.last_close_reason = decision
         if pair.last_hold_decision != decision or abs(pair.last_hold_pnl_usd - hold_pnl) >= 0.01:
             pair.last_hold_decision = decision
@@ -3829,7 +3759,7 @@ async def manage_open_pairs(
                 f"entry_age_sec={entry_age_sec:.1f} min_hold_sec={config.min_hold_sec:.1f}"
             )
 
-        if config.auto_close_enabled and decision in {"stop_loss", "take_profit", "max_hold", "close_candidate"}:
+        if config.auto_close_enabled and close_evaluation.should_auto_close:
             current_ms = now_ms()
             if current_ms < pair.next_auto_close_retry_ms:
                 continue
@@ -4152,7 +4082,11 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
 
 async def strategy_loop() -> None:
     config = load_strategy_config()
-    snapshot_config = load_snapshot_config()
+
+    def _persistence_log(message: str, payload: Any | None = None) -> None:
+        print_verbose(None, message if payload is None else f"{message} {payload}")
+
+    runtime_persistence = build_runtime_persistence_from_env(log=_persistence_log)
 
     symbols = await resolve_strategy_symbols(config)
     exchanges = build_strategy_exchanges(config, symbols)
@@ -4200,12 +4134,11 @@ async def strategy_loop() -> None:
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         )
 
-        if snapshot_config.get("enabled", False):
+        if runtime_persistence.enabled:
             snapshot_task = asyncio.create_task(
-                run_snapshot_loop(
+                runtime_persistence.run_snapshot_loop(
                     exchanges,
                     symbols,
-                    config=snapshot_config,
                 ),
                 name="strategy-snapshot-loop",
             )

@@ -4,7 +4,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .db import get_db_connection
+from .db import db_persistence_enabled, get_db_connection
 from .trading_dev_normalizers import build_order_history_row, build_trade_history_rows
 from .trading_dev_store import mark_absent_open_order_rows, upsert_order_history_rows, upsert_trade_history_rows
 
@@ -14,7 +14,7 @@ def _env_flag(key: str, default: str = "1") -> bool:
 
 
 def _event_enabled() -> bool:
-    return _env_flag("ENABLE_ORDER_EVENTS", "1")
+    return db_persistence_enabled() and _env_flag("ENABLE_ORDER_EVENTS", "1")
 
 _BG_MAX_WORKERS = max(int(os.getenv("EVENT_HOOKS_MAX_WORKERS", "4") or 4), 1)
 _BG_EXECUTOR = ThreadPoolExecutor(max_workers=_BG_MAX_WORKERS, thread_name_prefix="event-hooks")
@@ -168,6 +168,9 @@ def _cleanup_absent_open_orders_sync(exchange_name: str, symbol: str, event_time
 
 
 def schedule_trade_history_upsert(exchange_name: str, symbol: str, trades: list[dict[str, Any]] | None) -> int:
+    if not db_persistence_enabled():
+        return 0
+
     normalized_symbol = str(symbol or "").upper()
     normalized_trades = [dict(trade) for trade in (trades or []) if isinstance(trade, dict)]
     if not normalized_symbol or not normalized_trades:
@@ -193,6 +196,9 @@ def schedule_matched_trade_history_upsert(
 
 
 def schedule_order_event(exchange_name: str, symbol: str, event_type: str, event_source: str, payload: dict[str, Any]) -> None:
+    if not _event_enabled():
+        return
+
     normalized_symbol = str(symbol or "").upper()
     normalized_payload = _with_event_context(payload, event_type=event_type, event_source=event_source)
     normalized_payload.setdefault("symbol", normalized_symbol)
