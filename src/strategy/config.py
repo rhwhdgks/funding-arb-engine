@@ -10,6 +10,10 @@ from src.strategy.models import (
     StrategyConfig,
 )
 
+DEFAULT_HOLD_BUFFER_BPS = 2.0
+DEFAULT_TAKE_PROFIT_BPS = 6.0
+DEFAULT_STOP_LOSS_BPS = 8.0
+
 
 def parse_bool(value: str | None, default: bool = False) -> bool:
     if value is None:
@@ -105,6 +109,9 @@ def load_strategy_config() -> StrategyConfig:
     raw_hold_buffer_bps = parse_optional_float_env("STRATEGY_HOLD_BUFFER_BPS")
     raw_take_profit_bps = parse_optional_float_env("STRATEGY_TAKE_PROFIT_BPS")
     raw_stop_loss_bps = parse_optional_float_env("STRATEGY_STOP_LOSS_BPS")
+    hold_buffer_bps = abs(raw_hold_buffer_bps if raw_hold_buffer_bps is not None else DEFAULT_HOLD_BUFFER_BPS)
+    take_profit_bps = abs(raw_take_profit_bps if raw_take_profit_bps is not None else DEFAULT_TAKE_PROFIT_BPS)
+    stop_loss_bps = -abs(raw_stop_loss_bps if raw_stop_loss_bps is not None else DEFAULT_STOP_LOSS_BPS)
     entry_fee_bps = load_fee_bps_map(
         "STRATEGY_ENTRY_FEE_BPS",
         DEFAULT_ENTRY_FEE_BPS,
@@ -147,7 +154,7 @@ def load_strategy_config() -> StrategyConfig:
         ),
         require_funding_payment=parse_bool(os.getenv("STRATEGY_REQUIRE_FUNDING_PAYMENT"), False),
         hold_buffer_usd=float(os.getenv("STRATEGY_HOLD_BUFFER_USD", "0.0") or 0.0),
-        hold_buffer_bps=(abs(raw_hold_buffer_bps) if raw_hold_buffer_bps is not None else None),
+        hold_buffer_bps=hold_buffer_bps,
         min_hold_sec=float(os.getenv("STRATEGY_MIN_HOLD_SEC", "300.0") or 300.0),
         close_candidate_min_age_sec=float(
             os.getenv("STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC", "1800.0") or 1800.0
@@ -155,8 +162,8 @@ def load_strategy_config() -> StrategyConfig:
         max_hold_sec=float(os.getenv("STRATEGY_MAX_HOLD_SEC", "14400.0") or 14400.0),
         take_profit_usd=float(os.getenv("STRATEGY_TAKE_PROFIT_USD", "0.10") or 0.10),
         stop_loss_usd=float(os.getenv("STRATEGY_STOP_LOSS_USD", "-0.25") or -0.25),
-        take_profit_bps=(abs(raw_take_profit_bps) if raw_take_profit_bps is not None else None),
-        stop_loss_bps=(-abs(raw_stop_loss_bps) if raw_stop_loss_bps is not None else None),
+        take_profit_bps=take_profit_bps,
+        stop_loss_bps=stop_loss_bps,
         position_stale_ignore_sec=float(os.getenv("STRATEGY_POSITION_STALE_IGNORE_SEC", "20.0") or 20.0),
         close_slippage_bps=float(os.getenv("STRATEGY_CLOSE_SLIPPAGE_BPS", "0.0") or 0.0),
         risk_buffer_bps=float(os.getenv("STRATEGY_RISK_BUFFER_BPS", "1.0") or 1.0),

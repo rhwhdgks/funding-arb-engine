@@ -79,11 +79,11 @@ DB 설정은 선택값이다. `MARIADB_*`가 하나도 없으면 runtime DB writ
 - `STRATEGY_REQUIRE_FUNDING_PAYMENT`
 - `STRATEGY_MIN_HOLD_SEC`
 - `STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC`
-- `STRATEGY_TAKE_PROFIT_BPS`
-- `STRATEGY_STOP_LOSS_BPS`
-- `STRATEGY_HOLD_BUFFER_BPS`
-- `STRATEGY_TAKE_PROFIT_USD`
-- `STRATEGY_STOP_LOSS_USD`
+- `STRATEGY_TAKE_PROFIT_BPS` 기본 `6`. 비워도 bps 기준으로 동작한다.
+- `STRATEGY_STOP_LOSS_BPS` 기본 `8`. 내부 threshold는 `-8bps`로 정규화한다.
+- `STRATEGY_HOLD_BUFFER_BPS` 기본 `2`. 비워도 bps 기준으로 동작한다.
+- `STRATEGY_TAKE_PROFIT_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
+- `STRATEGY_STOP_LOSS_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
 
 ## Removed From Main Env
 

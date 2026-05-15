@@ -44,14 +44,14 @@ class StrategyConfig:
     min_effective_funding_usd: float | None = None
     require_funding_payment: bool = False
     hold_buffer_usd: float = 0.0
-    hold_buffer_bps: float | None = None
+    hold_buffer_bps: float | None = 2.0
     min_hold_sec: float = 300.0
     close_candidate_min_age_sec: float = 1800.0
     max_hold_sec: float = 14400.0
     take_profit_usd: float = 0.10
     stop_loss_usd: float = -0.25
-    take_profit_bps: float | None = None
-    stop_loss_bps: float | None = None
+    take_profit_bps: float | None = 6.0
+    stop_loss_bps: float | None = -8.0
     position_stale_ignore_sec: float = 20.0
     close_slippage_bps: float = 0.0
     risk_buffer_bps: float = 1.0
