@@ -238,11 +238,13 @@ EOF
     cd "$STRATEGY_WORKDIR_ABS"
     run_cmd=()
     if is_forever_duration "$RUN_DURATION"; then
-      run_cmd=("$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS")
+      # Keep the same process wrapper as timed runs, but avoid operationally meaningful forced exits.
+      run_cmd=(timeout 3650d "$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS")
     else
       run_cmd=(timeout "$RUN_DURATION" "$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS")
     fi
 
+    set +e
     flock -n "$LOCK_FILE" env \
       STRATEGY_ENABLE_LIVE="$STRATEGY_ENABLE_LIVE" \
       STRATEGY_APPROVAL_MODE="$STRATEGY_APPROVAL_MODE" \
@@ -285,6 +287,7 @@ EOF
       "${run_cmd[@]}" >> "$STDOUT_LOG" 2>&1
 
     status=$?
+    set -e
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     echo "[$ts] strategy live runtime exit status=${status}" >> "$STDOUT_LOG"
     exit "$status"
@@ -293,6 +296,12 @@ EOF
   pid=$!
   echo "$pid" > "$PID_FILE"
   disown "$pid" 2>/dev/null || true
+  sleep 0.5
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "[run_strategy_live] failed to start; see $STDOUT_LOG" >&2
+    exit 1
+  fi
   echo "[run_strategy_live] started pid=$pid"
   echo "[run_strategy_live] stdout=$STDOUT_LOG"
   echo "[run_strategy_live] jsonl=$JSONL_LOG"
