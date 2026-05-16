@@ -71,6 +71,8 @@
 - CLI 리포트/운영용 진입점입니다.
 - 자주 쓰는 파일:
   - [report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/report.py)
+  - [final_run_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/final_run_report.py)
+  - [order_trade_reconcile_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/order_trade_reconcile_report.py)
   - [web.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/web.py)
 
 ### [scripts/db](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/db)
@@ -127,3 +129,8 @@
 1. [scripts/runtime/run_strategy_live.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_strategy_live.sh)
 2. [scripts/runtime/run_fx_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_fx_collector.sh)
 3. [scripts/runtime/run_symbol_price_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_symbol_price_collector.sh)
+
+### 운영 절차를 볼 때
+1. [README.md](/home/jonghan/findalpha/arbitrage/funding%20fee/README.md)
+2. [docs/runbook.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/runbook.md)
+3. [docs/env_vars.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/env_vars.md)

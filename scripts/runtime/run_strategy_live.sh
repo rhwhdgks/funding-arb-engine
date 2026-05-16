@@ -66,6 +66,19 @@ JSONL_LOG="${STRATEGY_LIVE_EVENT_LOG_PATH:-$LOG_DIR/strategy_live.jsonl}"
 RUN_META_FILE="${STRATEGY_LIVE_RUN_META_FILE:-$LOG_DIR/strategy_live.run.json}"
 RUN_DURATION="${STRATEGY_RUN_DURATION:-24h}"
 
+is_forever_duration() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    0|forever|infinite|infinity|none|unlimited)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 ACTION="${1:-start}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -223,6 +236,13 @@ EOF
     echo "[$ts] strategy live runtime start duration=${RUN_DURATION} script=${STRATEGY_SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
 
     cd "$STRATEGY_WORKDIR_ABS"
+    run_cmd=()
+    if is_forever_duration "$RUN_DURATION"; then
+      run_cmd=("$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS")
+    else
+      run_cmd=(timeout "$RUN_DURATION" "$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS")
+    fi
+
     flock -n "$LOCK_FILE" env \
       STRATEGY_ENABLE_LIVE="$STRATEGY_ENABLE_LIVE" \
       STRATEGY_APPROVAL_MODE="$STRATEGY_APPROVAL_MODE" \
@@ -262,8 +282,7 @@ EOF
       STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS="$STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS" \
       STRATEGY_LIVE_EVENT_LOG_PATH="$JSONL_LOG" \
       STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
-      timeout "$RUN_DURATION" \
-      "$PYTHON_BIN" -u "$STRATEGY_SCRIPT_PATH_ABS" >> "$STDOUT_LOG" 2>&1
+      "${run_cmd[@]}" >> "$STDOUT_LOG" 2>&1
 
     status=$?
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

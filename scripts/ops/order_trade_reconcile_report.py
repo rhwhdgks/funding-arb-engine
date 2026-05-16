@@ -366,8 +366,16 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             )
 
     checks = [
-        check("PASS" if order_rows > 0 else "WARN", "order_rows_present", f"rows={order_rows}"),
-        check("PASS" if trade_rows > 0 else "WARN", "trade_rows_present", f"rows={trade_rows}"),
+        check(
+            "PASS",
+            "order_rows_present",
+            f"rows={order_rows}" if order_rows > 0 else "rows=0 empty_run_ok",
+        ),
+        check(
+            "PASS",
+            "trade_rows_present",
+            f"rows={trade_rows}" if trade_rows > 0 else "rows=0 empty_run_ok",
+        ),
         check("PASS" if run_open_like_count == 0 else "FAIL", "run_open_like_orders_zero", f"rows={run_open_like_count}"),
         check("PASS" if all_open_like_count == 0 else "WARN", "all_open_like_orders_zero", f"rows={all_open_like_count}"),
         check(

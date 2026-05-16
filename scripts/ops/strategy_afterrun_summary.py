@@ -60,6 +60,10 @@ def parse_duration_ms(value: str) -> int:
     return int(amount * factor)
 
 
+def is_forever_duration(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"0", "forever", "infinite", "infinity", "none", "unlimited"}
+
+
 def run_cmd(root: Path, cmd: str, timeout: int = 60) -> str:
     try:
         completed = subprocess.run(
@@ -348,11 +352,16 @@ def collect_open_order_rows(root: Path, env_file: Path, started_at_ms: int) -> t
 def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     started_at_ms = int(meta.get("started_at_ms") or 0)
-    duration_ms = parse_duration_ms(meta.get("duration")) or 3 * 3_600_000
+    forever_run = is_forever_duration(meta.get("duration"))
+    duration_ms = parse_duration_ms(meta.get("duration")) or (0 if forever_run else 3 * 3_600_000)
     end_ms = started_at_ms + duration_ms
     env_file = root / str(meta.get("env_file") or "test_server/logs/strategy_live.3h.env")
 
-    if wait:
+    if wait and forever_run:
+        print("duration is forever; --wait is ignored until the run is stopped", flush=True)
+        status_cmd = f"STRATEGY_ENV_FILE={shlex.quote(str(env_file))} scripts/runtime/run_strategy_live.sh status"
+        status = run_cmd(root, status_cmd, timeout=20)
+    elif wait:
         sleep_sec = max((end_ms - int(time.time() * 1000)) / 1000.0 + 30.0, 0.0)
         if sleep_sec > 0:
             print(f"sleeping {sleep_sec:.1f}s until after strategy end", flush=True)

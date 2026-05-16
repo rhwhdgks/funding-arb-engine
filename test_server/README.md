@@ -1,84 +1,49 @@
-# Test Server Runtime
+# Test Server
 
-`test_server`는 이제 로직 복사본을 들고 있지 않습니다.
-
-분리되는 건 딱 두 가지입니다.
-- `test_server/.env`
-- `test_server/main.py`
-
-나머지 실행 로직, DB 초기화, 리포트, persistence는 모두 루트 코드를 공유합니다.
+테스트 서버는 루트 코드를 그대로 공유하고, `test_server/.env`만 별도로 사용합니다.
 
 ## 실행
 
 ```bash
 cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh start
+STRATEGY_ENV_FILE=test_server/.env STRATEGY_RUN_DURATION=30m scripts/runtime/run_strategy_live.sh start
 ```
 
 ## 상태 확인
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh status
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh status
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh summary
 ```
 
-```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh logs
-```
+## 로그 확인
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh jsonl
-```
-
-```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh report
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh logs
 ```
 
 ## 중지
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-STRATEGY_SCRIPT_PATH=test_server/main.py \
-scripts/runtime/run_strategy_live.sh stop
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh stop
 ```
 
-## 신규 진입 일시정지
-
-실행 중 신규 진입만 막고, 기존 pair close / recovery / shutdown cleanup은 계속 허용합니다.
+## 최종 리포트
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh final-report --label test_smoke
+```
+
+## 신규 진입 pause/resume
+
+```bash
 STRATEGY_ENV_FILE=test_server/.env scripts/runtime/entry_pause.sh on manual_pause
-```
-
-```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env scripts/runtime/entry_pause.sh off manual_resume
-```
-
-```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
 STRATEGY_ENV_FILE=test_server/.env scripts/runtime/entry_pause.sh status
 ```
 
-## DB 스키마 초기화
+## 참고
 
-```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
-STRATEGY_ENV_FILE=test_server/.env \
-.venv/bin/python -u scripts/db/init_db_schema.py
-```
+- 자세한 운영 절차는 [../docs/runbook.md](../docs/runbook.md)를 봅니다.
+- 환경변수 설명은 [../docs/env_vars.md](../docs/env_vars.md)를 봅니다.
+- 체결이 없는 테스트 run은 정상입니다. final report에서 open order, position, danger, overfill이 없으면 운영 안정성은 PASS입니다.
