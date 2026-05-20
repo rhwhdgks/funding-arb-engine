@@ -1,4 +1,5 @@
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -415,6 +416,65 @@ def rank_candidates(candidates: list[PairCandidate]) -> list[PairCandidate]:
             item.short_exchange,
         ),
     )
+
+
+def normalize_candidate_block_reason(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    if not normalized:
+        return "unknown_block_reason"
+    if "(" in normalized:
+        normalized = normalized.split("(", 1)[0]
+    return normalized
+
+
+def candidate_scan_item(candidate: PairCandidate | None) -> dict[str, Any] | None:
+    if candidate is None:
+        return None
+    return {
+        "candidate_id": candidate.id,
+        "symbol": candidate.symbol,
+        "long_exchange": candidate.long_exchange,
+        "short_exchange": candidate.short_exchange,
+        "pair": f"{candidate.long_exchange}L/{candidate.short_exchange}S",
+        "qty": candidate.executable_qty,
+        "notional_usd": candidate.notional_usd,
+        "expected_net_edge_usd": candidate.expected_net_edge_usd,
+        "expected_net_edge_bps": candidate.expected_net_edge_bps,
+        "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
+        "can_enter": candidate.can_enter,
+        "block_reasons": list(candidate.block_reasons[:5]),
+        "normalized_block_reasons": [
+            normalize_candidate_block_reason(reason)
+            for reason in candidate.block_reasons[:5]
+        ],
+    }
+
+
+def build_candidate_scan_summary(candidates: list[PairCandidate]) -> dict[str, Any]:
+    total = len(candidates)
+    enterable = [candidate for candidate in candidates if candidate.can_enter]
+    blocked = [candidate for candidate in candidates if not candidate.can_enter]
+
+    reason_counter: Counter[str] = Counter()
+    for candidate in blocked:
+        reasons = candidate.block_reasons or ["blocked_without_reason"]
+        for reason in reasons:
+            reason_counter[normalize_candidate_block_reason(reason)] += 1
+
+    top_candidate = candidates[0] if candidates else None
+    top_enterable = enterable[0] if enterable else None
+    top_blocked = blocked[0] if blocked else None
+
+    return {
+        "total_candidates": total,
+        "enterable_candidates": len(enterable),
+        "blocked_candidates": len(blocked),
+        "top_candidate": candidate_scan_item(top_candidate),
+        "top_enterable_candidate": candidate_scan_item(top_enterable),
+        "top_blocked_candidate": candidate_scan_item(top_blocked),
+        "top_block_reason": reason_counter.most_common(1)[0][0] if reason_counter else "",
+        "reason_counts": dict(reason_counter.most_common(12)),
+    }
 
 
 def collect_pair_candidates(

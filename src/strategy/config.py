@@ -122,6 +122,9 @@ def load_strategy_config() -> StrategyConfig:
         DEFAULT_CLOSE_FEE_BPS,
         fallback_prefixes=("STRATEGY_ENTRY_FEE_BPS", "STRATEGY_MAKER_FEE_BPS"),
     )
+    raw_entry_spread_bps = os.getenv("STRATEGY_ENTRY_SPREAD_BPS")
+    if raw_entry_spread_bps in (None, ""):
+        raw_entry_spread_bps = os.getenv("STRATEGY_MIN_EXPECTED_NET_EDGE_BPS", "0.0")
 
     config = StrategyConfig(
         exchange_names=exchange_names,
@@ -136,8 +139,16 @@ def load_strategy_config() -> StrategyConfig:
         hedge_requote_timeout_sec=float(os.getenv("STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC", "0.7") or 0.7),
         hedge_requote_count=int(os.getenv("STRATEGY_HEDGE_REQUOTE_COUNT", "2") or 2),
         close_first_leg_role=os.getenv("STRATEGY_CLOSE_FIRST_LEG_ROLE", "short").strip().lower(),
+        close_execution_mode=os.getenv("STRATEGY_CLOSE_EXECUTION_MODE", "safe_taker").strip().lower(),
+        close_maker_timeout_sec=float(os.getenv("STRATEGY_CLOSE_MAKER_TIMEOUT_SEC", "2.0") or 2.0),
+        close_maker_price_bps=float(os.getenv("STRATEGY_CLOSE_MAKER_PRICE_BPS", "0.0") or 0.0),
+        close_maker_reasons=parse_csv(os.getenv("STRATEGY_CLOSE_MAKER_REASONS", "close_candidate,take_profit")),
         close_aggressive_bps=float(os.getenv("STRATEGY_CLOSE_AGGRESSIVE_BPS", "8.0") or 8.0),
         emergency_flatten_bps=float(os.getenv("STRATEGY_EMERGENCY_FLATTEN_BPS", "20.0") or 20.0),
+        entry_first_leg_price_mode=os.getenv("STRATEGY_ENTRY_FIRST_LEG_PRICE_MODE", "passive").strip().lower(),
+        entry_first_leg_marketable_bps=float(os.getenv("STRATEGY_ENTRY_FIRST_LEG_MARKETABLE_BPS", "0.0") or 0.0),
+        entry_spread_bps=float(raw_entry_spread_bps or 0.0),
+        entry_cancel_buffer_bps=float(os.getenv("STRATEGY_ENTRY_CANCEL_BUFFER_BPS", "0.0") or 0.0),
         action_settle_wait_sec=float(os.getenv("STRATEGY_ACTION_SETTLE_WAIT_SEC", "0.6") or 0.6),
         entry_order_settle_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_SETTLE_SEC", "1.2") or 1.2),
         entry_order_cooldown_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_COOLDOWN_SEC", "1.0") or 1.0),
@@ -226,6 +237,18 @@ def load_strategy_config() -> StrategyConfig:
         raise ValueError("STRATEGY_FIRST_LEG_ROLE must be 'long' or 'short'")
     if config.close_first_leg_role not in {"long", "short"}:
         raise ValueError("STRATEGY_CLOSE_FIRST_LEG_ROLE must be 'long' or 'short'")
+    if config.close_execution_mode not in {"safe_taker", "maker_then_taker"}:
+        raise ValueError("STRATEGY_CLOSE_EXECUTION_MODE must be 'safe_taker' or 'maker_then_taker'")
+    if config.close_maker_timeout_sec < 0:
+        raise ValueError("STRATEGY_CLOSE_MAKER_TIMEOUT_SEC must be >= 0")
+    if config.close_maker_price_bps < 0:
+        raise ValueError("STRATEGY_CLOSE_MAKER_PRICE_BPS must be >= 0")
+    if config.entry_first_leg_price_mode not in {"passive", "marketable", "spread_buffer"}:
+        raise ValueError("STRATEGY_ENTRY_FIRST_LEG_PRICE_MODE must be 'passive', 'marketable', or 'spread_buffer'")
+    if config.entry_first_leg_marketable_bps < 0:
+        raise ValueError("STRATEGY_ENTRY_FIRST_LEG_MARKETABLE_BPS must be >= 0")
+    if config.entry_spread_bps < 0 or config.entry_cancel_buffer_bps < 0:
+        raise ValueError("STRATEGY_ENTRY_SPREAD_BPS and STRATEGY_ENTRY_CANCEL_BUFFER_BPS must be >= 0")
     if config.stdout_log_style not in {"verbose", "simple"}:
         raise ValueError("STRATEGY_STDOUT_LOG_STYLE must be 'verbose' or 'simple'")
     if config.max_gross_leverage < 0 or config.max_long_leverage < 0 or config.max_short_leverage < 0:

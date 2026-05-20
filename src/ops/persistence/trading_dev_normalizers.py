@@ -86,16 +86,8 @@ def _resolve_order_type(payload: dict[str, Any] | None, event_type: str | None =
 def _resolve_order_status(payload: dict[str, Any] | None, event_type: str | None = None) -> str:
     payload = payload or {}
     raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
-    for key in ("status", "state"):
-        value = _string_or_none(payload.get(key))
-        if value:
-            return value.upper()
-    if isinstance(raw, dict):
-        for key in ("status", "state"):
-            value = _string_or_none(raw.get(key))
-            if value:
-                return value.upper()
-    mapping = {
+
+    event_mapping = {
         "order_submit": "SUBMITTED",
         "order_ack": "ACKNOWLEDGED",
         "order_rejected": "REJECTED",
@@ -109,7 +101,45 @@ def _resolve_order_status(payload: dict[str, Any] | None, event_type: str | None
         "order_expired": "EXPIRED",
         "cancel_rejected": "CANCEL_REJECTED",
     }
-    return mapping.get(str(event_type or "").lower(), "UNKNOWN")
+    event_status = event_mapping.get(str(event_type or "").lower())
+
+    status = _string_or_none(payload.get("status"))
+    raw_status = _string_or_none(raw.get("status")) if isinstance(raw, dict) else None
+    state = _string_or_none(payload.get("state"))
+    raw_state = _string_or_none(raw.get("state")) if isinstance(raw, dict) else None
+    error = _string_or_none(payload.get("error"))
+    raw_error = _string_or_none(raw.get("error") or raw.get("msg")) if isinstance(raw, dict) else None
+
+    terminal_statuses = {"FILLED", "FINISHED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED"}
+    for value in (status, raw_status):
+        normalized = value.upper() if value else None
+        if normalized in terminal_statuses:
+            return normalized
+
+    # Terminal lifecycle events must win over stale exchange payloads such as
+    # status=NEW + state=not_exist. Otherwise missing/canceled orders remain
+    # open-like in order_history.
+    if event_status in {"FILLED", "CANCELED", "MISSING", "EXPIRED", "REJECTED", "FAILED"}:
+        return event_status
+
+    not_exist_markers = {
+        str(value or "").strip().lower()
+        for value in (state, raw_state, error, raw_error)
+        if value not in (None, "")
+    }
+    if "not_exist" in not_exist_markers or "order does not exist." in not_exist_markers:
+        return "MISSING"
+
+    for key in ("status", "state"):
+        value = _string_or_none(payload.get(key))
+        if value:
+            return value.upper()
+    if isinstance(raw, dict):
+        for key in ("status", "state"):
+            value = _string_or_none(raw.get(key))
+            if value:
+                return value.upper()
+    return event_status or "UNKNOWN"
 
 
 def _resolve_side(value: Any) -> str:

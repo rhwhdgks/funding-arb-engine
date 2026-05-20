@@ -4,7 +4,6 @@ import os
 import signal
 import sys
 import time
-from collections import Counter
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
@@ -16,6 +15,7 @@ from src.strategy.config import load_strategy_config, normalize_exchange_name, p
 from src.strategy.candidates import (
     CandidateBuildHooks,
     CandidateCollectionHooks,
+    build_candidate_scan_summary,
     collect_pair_candidates,
     compute_effective_funding_components,
     compute_stale_data_penalty_usd,
@@ -669,65 +669,6 @@ def build_candidate_signature(candidates: list[PairCandidate], top_n: int = 5) -
     return tuple(signature)
 
 
-def normalize_candidate_block_reason(reason: str) -> str:
-    normalized = str(reason or "").strip()
-    if not normalized:
-        return "unknown_block_reason"
-    if "(" in normalized:
-        normalized = normalized.split("(", 1)[0]
-    return normalized
-
-
-def candidate_scan_item(candidate: PairCandidate | None) -> dict[str, Any] | None:
-    if candidate is None:
-        return None
-    return {
-        "candidate_id": candidate.id,
-        "symbol": candidate.symbol,
-        "long_exchange": candidate.long_exchange,
-        "short_exchange": candidate.short_exchange,
-        "pair": f"{candidate.long_exchange}L/{candidate.short_exchange}S",
-        "qty": candidate.executable_qty,
-        "notional_usd": candidate.notional_usd,
-        "expected_net_edge_usd": candidate.expected_net_edge_usd,
-        "expected_net_edge_bps": candidate.expected_net_edge_bps,
-        "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
-        "can_enter": candidate.can_enter,
-        "block_reasons": list(candidate.block_reasons[:5]),
-        "normalized_block_reasons": [
-            normalize_candidate_block_reason(reason)
-            for reason in candidate.block_reasons[:5]
-        ],
-    }
-
-
-def build_candidate_scan_summary(candidates: list[PairCandidate]) -> dict[str, Any]:
-    total = len(candidates)
-    enterable = [candidate for candidate in candidates if candidate.can_enter]
-    blocked = [candidate for candidate in candidates if not candidate.can_enter]
-
-    reason_counter: Counter[str] = Counter()
-    for candidate in blocked:
-        reasons = candidate.block_reasons or ["blocked_without_reason"]
-        for reason in reasons:
-            reason_counter[normalize_candidate_block_reason(reason)] += 1
-
-    top_candidate = candidates[0] if candidates else None
-    top_enterable = enterable[0] if enterable else None
-    top_blocked = blocked[0] if blocked else None
-
-    return {
-        "total_candidates": total,
-        "enterable_candidates": len(enterable),
-        "blocked_candidates": len(blocked),
-        "top_candidate": candidate_scan_item(top_candidate),
-        "top_enterable_candidate": candidate_scan_item(top_enterable),
-        "top_blocked_candidate": candidate_scan_item(top_blocked),
-        "top_block_reason": reason_counter.most_common(1)[0][0] if reason_counter else "",
-        "reason_counts": dict(reason_counter.most_common(12)),
-    }
-
-
 async def console_command_reader(command_queue: asyncio.Queue[str]) -> None:
     if not sys.stdin.isatty():
         return
@@ -1178,6 +1119,69 @@ def marketable_limit_price_with_bps(exchange: Any, symbol: str, side: str, bps: 
     return base_price * (1.0 - (bps / 10000.0))
 
 
+def maker_close_limit_price(exchange: Any, symbol: str, side: str, bps: float = 0.0) -> float:
+    snapshot = exchange.get_symbol_snapshot(symbol)
+    normalized_side = side.lower()
+    bps = max(float(bps or 0.0), 0.0)
+    if normalized_side == "buy":
+        best_bid = extract_best_bid(snapshot)
+        if best_bid <= 0:
+            return 0.0
+        return normalize_limit_price_for_side(exchange, symbol, side, best_bid * (1.0 - bps / 10000.0))
+
+    best_ask = extract_best_ask(snapshot)
+    if best_ask <= 0:
+        return 0.0
+    return normalize_limit_price_for_side(exchange, symbol, side, best_ask * (1.0 + bps / 10000.0))
+
+
+def marketable_entry_target_price(exchange: Any, symbol: str, side: str, config: StrategyConfig) -> float:
+    base_price = marketable_limit_price(exchange, symbol, side)
+    if base_price <= 0:
+        return 0.0
+    bps = max(config.entry_first_leg_marketable_bps, 0.0)
+    if side.lower() == "buy":
+        raw_price = base_price * (1.0 + (bps / 10000.0))
+    else:
+        raw_price = base_price * (1.0 - (bps / 10000.0))
+    return normalize_limit_price_for_side(exchange, symbol, side, raw_price)
+
+
+def spread_buffer_entry_target_price(
+    candidate: PairCandidate,
+    first_exchange_name: str,
+    first_side: str,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> float:
+    symbol = candidate.symbol
+    first_exchange = exchanges[first_exchange_name]
+    first_snapshot = first_exchange.get_symbol_snapshot(symbol)
+    target_bps = max(config.entry_spread_bps, 0.0) + (max(config.entry_cancel_buffer_bps, 0.0) / 2.0)
+
+    if first_exchange_name == candidate.long_exchange and first_side.lower() == "buy":
+        reference_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
+        reference_price = extract_best_bid(reference_snapshot)
+        maker_best_bid = extract_best_bid(first_snapshot)
+        if reference_price <= 0:
+            return 0.0
+        raw_target = reference_price * (1.0 - (target_bps / 10000.0))
+        target_price = min(raw_target, maker_best_bid) if maker_best_bid > 0 else raw_target
+        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
+
+    if first_exchange_name == candidate.short_exchange and first_side.lower() == "sell":
+        reference_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
+        reference_price = extract_best_ask(reference_snapshot)
+        maker_best_ask = extract_best_ask(first_snapshot)
+        if reference_price <= 0:
+            return 0.0
+        raw_target = reference_price * (1.0 + (target_bps / 10000.0))
+        target_price = max(raw_target, maker_best_ask) if maker_best_ask > 0 else raw_target
+        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
+
+    return marketable_entry_target_price(first_exchange, symbol, first_side, config)
+
+
 def normalize_limit_price_for_side(exchange: Any, symbol: str, side: str, raw_price: float) -> float:
     if raw_price <= 0:
         return 0.0
@@ -1199,6 +1203,11 @@ def passive_entry_target_price(
 ) -> float:
     symbol = candidate.symbol
     first_exchange = exchanges[first_exchange_name]
+    if config.entry_first_leg_price_mode == "marketable":
+        return marketable_entry_target_price(first_exchange, symbol, first_side, config)
+    if config.entry_first_leg_price_mode == "spread_buffer":
+        return spread_buffer_entry_target_price(candidate, first_exchange_name, first_side, exchanges, config)
+
     first_snapshot = first_exchange.get_symbol_snapshot(symbol)
     quote_qty = candidate.executable_qty if candidate.executable_qty > EPS else candidate.target_qty
     if quote_qty <= EPS:
@@ -1626,6 +1635,28 @@ def limit_price_changed(exchange: Any, symbol: str, previous_price: float, targe
     return abs(previous_price - target_price) > max(EPS, abs(previous_price) * 1e-9)
 
 
+def entry_limit_price_changed(
+    exchange: Any,
+    symbol: str,
+    previous_price: float,
+    target_price: float,
+    config: StrategyConfig,
+) -> bool:
+    if config.entry_first_leg_price_mode != "spread_buffer":
+        return limit_price_changed(exchange, symbol, previous_price, target_price)
+    if previous_price <= 0 or target_price <= 0:
+        return True
+    buffer_bps = max(config.entry_cancel_buffer_bps, 0.0)
+    if buffer_bps <= 0:
+        return limit_price_changed(exchange, symbol, previous_price, target_price)
+    meta = getattr(exchange, "ticker_info", {}).get(symbol, {}) or {}
+    tick_size = _safe_float(meta.get("tick_size"), 0.0)
+    price_gap = abs(previous_price - target_price)
+    buffer_gap = abs(target_price) * (buffer_bps / 2.0) / 10000.0
+    min_gap = max(buffer_gap, tick_size if tick_size > 0 else EPS)
+    return price_gap > min_gap + EPS
+
+
 def is_waiting_order_active(exchange: Any, order_result: dict[str, Any] | None) -> bool:
     order_uuid = extract_order_uuid(order_result)
     if not order_uuid:
@@ -1665,7 +1696,11 @@ async def execute_requoting_limit_leg(
         probe_reason_prefix=probe_reason_prefix,
         resolve_effective_order_qty=resolve_effective_order_qty,
         is_waiting_order_active=is_waiting_order_active,
-        limit_price_changed=limit_price_changed,
+        limit_price_changed=(
+            (lambda exch, sym, prev, target: entry_limit_price_changed(exch, sym, prev, target, config))
+            if not is_close
+            else limit_price_changed
+        ),
         cancel_if_open=cancel_if_open,
         normalize_exchange_qty_for_order=normalize_exchange_qty_for_order,
         print_verbose=print_verbose,
@@ -2016,6 +2051,95 @@ async def emergency_flatten_symbol_state(
 async def emergency_flatten_symbol(exchange: Any, symbol: str, aggressive_bps: float = 20.0) -> bool:
     ok, _ = await emergency_flatten_symbol_state(exchange, symbol, aggressive_bps=aggressive_bps)
     return ok
+
+
+async def close_leg_market_qty(
+    *,
+    exchange: Any,
+    symbol: str,
+    role: str,
+    side: str,
+    target_qty: float,
+    config: StrategyConfig,
+    is_close: bool,
+) -> FlattenLegResult:
+    exchange_name = getattr(exchange, "persist_name", getattr(exchange, "name", "unknown"))
+    result = FlattenLegResult(exchange_name=exchange_name, symbol=symbol, role=role, side=side)
+    await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_pre_{role}")
+    pre_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+    result.start_qty = pre_qty
+
+    preview = exchange_order_execution_preview(
+        exchange,
+        symbol,
+        side,
+        target_qty,
+        config.close_aggressive_bps,
+    )
+    close_qty = _safe_float(preview.get("executable_qty"), 0.0)
+    result.requested_qty = close_qty
+    if close_qty <= EPS:
+        result.end_qty = pre_qty
+        result.ok = True
+        result.assumed_flat = True
+        result.failure_reason = "dust_assumed_flat"
+        return result
+
+    try:
+        log_pair_close_attempt(
+            attempt=1,
+            exchange=exchange_name,
+            symbol=symbol,
+            side=side,
+            qty=close_qty,
+            price_preview=_safe_float(preview.get("price")),
+            min_executable_qty=_safe_float(preview.get("min_executable_qty")),
+        )
+        result.attempted_order = True
+        market_kwargs: dict[str, Any] = {"is_hedge": True}
+        if is_close:
+            market_kwargs["is_close"] = use_reduce_only_market_close(exchange, pre_qty, side)
+        market_result = await exchange.market_order(symbol, side, close_qty, **market_kwargs)
+        if market_result and market_result.get("error"):
+            if is_close and error_means_no_position_to_close(market_result):
+                result.ok = True
+                result.assumed_flat = True
+                result.failure_reason = "dust_assumed_flat"
+                return result
+            failure_reason, error_code, error_message, temporarily_unavailable = classify_flatten_failure(market_result)
+            result.failure_reason = failure_reason
+            result.error_code = error_code
+            result.error_message = error_message
+            result.temporarily_unavailable = temporarily_unavailable
+            return result
+
+        await asyncio.sleep(config.action_settle_wait_sec)
+        resolved_qty = await resolve_effective_order_qty(
+            exchange=exchange,
+            symbol=symbol,
+            side=side,
+            pre_qty=pre_qty,
+            target_qty=close_qty,
+            order_result=market_result,
+            is_close=is_close,
+            reason=f"strategy_close_exact_market_{role}",
+        )
+        result.closed_qty = resolved_qty
+        await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_post_{role}")
+        result.end_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+        if resolved_qty + qty_match_tolerance(close_qty) >= close_qty:
+            result.ok = True
+            return result
+        result.failure_reason = "partial_fill"
+        return result
+    except Exception as exc:
+        failure_reason, error_code, error_message, temporarily_unavailable = classify_flatten_failure(None, exc)
+        result.failure_reason = failure_reason
+        result.error_code = error_code
+        result.error_message = error_message
+        result.temporarily_unavailable = temporarily_unavailable
+        result.end_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+        return result
 
 
 def pair_close_leg_specs(pair_like: Any, close_first_leg_role: str | None = None) -> list[dict[str, Any]]:
@@ -3416,6 +3540,216 @@ def estimate_close_pnl_now(
     return gross_pnl - close_fee_cost - close_slippage
 
 
+def maker_then_taker_close_enabled(pair: OpenPairState, config: StrategyConfig) -> bool:
+    if config.close_execution_mode != "maker_then_taker":
+        return False
+    if config.close_maker_timeout_sec <= 0:
+        return False
+    allowed_reasons = {str(reason).strip().lower() for reason in config.close_maker_reasons if str(reason).strip()}
+    close_reason = str(pair.last_close_reason or "").strip().lower()
+    return close_reason in allowed_reasons
+
+
+async def close_pair_maker_then_taker_once(
+    pair: OpenPairState,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> PairFlattenResult | None:
+    if not maker_then_taker_close_enabled(pair, config):
+        return None
+
+    specs = pair_close_leg_specs(pair, config.close_first_leg_role)
+    maker_spec = specs[0]
+    taker_spec = specs[1]
+    symbol = pair.symbol
+
+    await refresh_symbol_state(exchanges[pair.long_exchange], symbol, "strategy_close_maker_pre_long")
+    await refresh_symbol_state(exchanges[pair.short_exchange], symbol, "strategy_close_maker_pre_short")
+    long_qty = effective_position_qty(
+        exchanges[pair.long_exchange].get_symbol_snapshot(symbol),
+        exchanges[pair.long_exchange],
+        symbol,
+        config,
+    )
+    short_qty = effective_position_qty(
+        exchanges[pair.short_exchange].get_symbol_snapshot(symbol),
+        exchanges[pair.short_exchange],
+        symbol,
+        config,
+    )
+    state, balanced_qty, _gap = classify_pair_position_state(long_qty, short_qty, reference_qty=pair.qty)
+    if state != "balanced_open" or balanced_qty <= EPS:
+        record_live_event(
+            config,
+            "pair_close_maker_skipped",
+            pair=pair_event_payload(pair),
+            reason="not_balanced_open",
+            close_state=state,
+            long_qty=long_qty,
+            short_qty=short_qty,
+        )
+        return None
+
+    maker_exchange_name = maker_spec["exchange_name"]
+    maker_exchange = exchanges[maker_exchange_name]
+    maker_side = maker_spec["side"]
+    maker_role = maker_spec["role"]
+    maker_pre_qty = long_qty if maker_role == "long" else short_qty
+    maker_target_qty = min(pair.qty, balanced_qty, abs(maker_pre_qty))
+    maker_price = maker_close_limit_price(
+        maker_exchange,
+        symbol,
+        maker_side,
+        config.close_maker_price_bps,
+    )
+    maker_target_qty = normalize_exchange_qty_for_order(maker_exchange, symbol, maker_target_qty, maker_price)
+    if maker_price <= 0 or maker_target_qty <= EPS:
+        record_live_event(
+            config,
+            "pair_close_maker_skipped",
+            pair=pair_event_payload(pair),
+            reason="maker_not_executable",
+            maker_exchange=maker_exchange_name,
+            maker_side=maker_side,
+            maker_price=maker_price,
+            maker_target_qty=maker_target_qty,
+        )
+        return None
+
+    record_live_event(
+        config,
+        "pair_close_maker_then_taker_started",
+        pair=pair_event_payload(pair),
+        maker_exchange=maker_exchange_name,
+        maker_role=maker_role,
+        maker_side=maker_side,
+        maker_target_qty=maker_target_qty,
+        maker_price=maker_price,
+        timeout_sec=config.close_maker_timeout_sec,
+    )
+
+    maker_closed_qty, maker_order, maker_price_used = await execute_requoting_limit_leg(
+        exchange=maker_exchange,
+        symbol=symbol,
+        side=maker_side,
+        target_qty=maker_target_qty,
+        pre_qty=maker_pre_qty,
+        timeout_sec=config.close_maker_timeout_sec,
+        config=config,
+        is_close=True,
+        price_resolver=lambda: maker_close_limit_price(
+            maker_exchange,
+            symbol,
+            maker_side,
+            config.close_maker_price_bps,
+        ),
+        log_prefix="close-maker",
+        probe_reason_prefix="strategy_close_maker",
+    )
+    maker_closed_qty = min(maker_closed_qty, maker_target_qty)
+    if maker_closed_qty <= EPS:
+        record_live_event(
+            config,
+            "pair_close_maker_no_fill",
+            pair=pair_event_payload(pair),
+            maker_exchange=maker_exchange_name,
+            maker_role=maker_role,
+            maker_side=maker_side,
+            maker_target_qty=maker_target_qty,
+            maker_price=maker_price_used or maker_price,
+            order_id=extract_order_uuid(maker_order),
+        )
+        return None
+
+    await refresh_symbol_state(maker_exchange, symbol, "strategy_close_maker_filled")
+    maker_leg = FlattenLegResult(
+        exchange_name=maker_exchange_name,
+        symbol=symbol,
+        role=maker_role,
+        side=maker_side,
+        requested_qty=maker_target_qty,
+        start_qty=maker_pre_qty,
+        end_qty=extract_position_qty(maker_exchange.get_symbol_snapshot(symbol)),
+        closed_qty=maker_closed_qty,
+        ok=True,
+        attempted_order=True,
+    )
+
+    taker_exchange_name = taker_spec["exchange_name"]
+    taker_exchange = exchanges[taker_exchange_name]
+    taker_side = taker_spec["side"]
+    taker_role = taker_spec["role"]
+    taker_result = await close_leg_market_qty(
+        exchange=taker_exchange,
+        symbol=symbol,
+        role=taker_role,
+        side=taker_side,
+        target_qty=maker_closed_qty,
+        config=config,
+        is_close=True,
+    )
+
+    if not taker_result.ok:
+        restore_side = "buy" if maker_side == "sell" else "sell"
+        restore_result = await close_leg_market_qty(
+            exchange=maker_exchange,
+            symbol=symbol,
+            role=f"{maker_role}_restore",
+            side=restore_side,
+            target_qty=maker_closed_qty,
+            config=config,
+            is_close=False,
+        )
+        pair_result = PairFlattenResult(
+            ok=False,
+            leg_results=[maker_leg, taker_result, restore_result],
+            failed_leg=taker_result,
+            other_leg_action="rehedged" if restore_result.ok else "maker_close_only",
+            neutralized=restore_result.ok,
+            neutralize_payload={
+                "restore_exchange": maker_exchange_name,
+                "restore_side": restore_side,
+                "restore_qty": maker_closed_qty,
+                "restore_ok": restore_result.ok,
+            },
+        )
+        record_live_event(
+            config,
+            "pair_close_maker_then_taker_failed",
+            pair=pair_event_payload(pair),
+            maker_leg=flatten_leg_result_payload(maker_leg),
+            taker_leg=flatten_leg_result_payload(taker_result),
+            restore_leg=flatten_leg_result_payload(restore_result),
+        )
+        return pair_result
+
+    record_live_event(
+        config,
+        "pair_close_maker_then_taker_matched",
+        pair=pair_event_payload(pair),
+        maker_leg=flatten_leg_result_payload(maker_leg),
+        taker_leg=flatten_leg_result_payload(taker_result),
+        maker_closed_qty=maker_closed_qty,
+        remaining_pair_qty=max(pair.qty - maker_closed_qty, 0.0),
+    )
+
+    if maker_closed_qty + qty_match_tolerance(pair.qty) >= pair.qty:
+        return PairFlattenResult(
+            ok=True,
+            leg_results=[maker_leg, taker_result],
+            other_leg_action="closed",
+        )
+
+    record_live_event(
+        config,
+        "pair_close_maker_partial_then_fallback",
+        pair=pair_event_payload(pair),
+        maker_closed_qty=maker_closed_qty,
+        remaining_pair_qty=max(pair.qty - maker_closed_qty, 0.0),
+    )
+    return None
+
+
 async def close_pair_limit_then_hedge(
     pair: OpenPairState,
     exchanges: dict[str, Any],
@@ -3428,14 +3762,16 @@ async def close_pair_limit_then_hedge(
         f"symbol={pair.symbol} long={pair.long_exchange} short={pair.short_exchange}"
     )
 
-    flatten_result = await emergency_flatten_pair_state(
-        pair,
-        exchanges,
-        aggressive_bps=config.emergency_flatten_bps,
-        config=config,
-        close_first_leg_role=config.close_first_leg_role,
-        restore_neutrality=True,
-    )
+    flatten_result = await close_pair_maker_then_taker_once(pair, exchanges, config)
+    if flatten_result is None:
+        flatten_result = await emergency_flatten_pair_state(
+            pair,
+            exchanges,
+            aggressive_bps=config.emergency_flatten_bps,
+            config=config,
+            close_first_leg_role=config.close_first_leg_role,
+            restore_neutrality=True,
+        )
     flattened = flatten_result.ok
     forced_flat_exchanges = flatten_result.forced_flat_exchanges
 
@@ -3802,6 +4138,7 @@ def describe_live_plan(candidate: PairCandidate, config: StrategyConfig) -> str:
     return (
         f"symbol={candidate.symbol} qty={candidate.executable_qty:.6f} "
         f"first_leg={first_exchange}:{first_side} timeout={config.first_leg_timeout_sec}s "
+        f"entry_price_mode={config.entry_first_leg_price_mode} "
         f"hedge={hedge_exchange}:{hedge_side} mode={hedge_mode}"
     )
 
@@ -3987,6 +4324,11 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
             f"notional_usd={config.order_notional_usd} "
             f"auto_enter={config.auto_enter_enabled} auto_close={config.auto_close_enabled} "
             f"first_leg_role={config.first_leg_role} max_open_pairs={config.max_open_pairs} "
+            f"entry_price_mode={config.entry_first_leg_price_mode} "
+            f"entry_spread_bps={config.entry_spread_bps} "
+            f"entry_cancel_buffer_bps={config.entry_cancel_buffer_bps} "
+            f"entry_marketable_bps={config.entry_first_leg_marketable_bps} "
+            f"close_mode={config.close_execution_mode} "
             f"account_imbalance_hedge={config.account_imbalance_hedge_enabled} "
             f"leverage={config.leverage} margin_mode={config.margin_mode} "
             f"margin_mode_guard={config.startup_margin_mode_guard_enabled} "
@@ -4007,6 +4349,10 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
     print(f"order_notional_usd={config.order_notional_usd}")
     print(
         f"first_leg_timeout_sec={config.first_leg_timeout_sec} "
+        f"entry_first_leg_price_mode={config.entry_first_leg_price_mode} "
+        f"entry_spread_bps={config.entry_spread_bps} "
+        f"entry_cancel_buffer_bps={config.entry_cancel_buffer_bps} "
+        f"entry_first_leg_marketable_bps={config.entry_first_leg_marketable_bps} "
         f"hedge_market_immediate={config.hedge_market_immediate} "
         f"hedge_requote_timeout_sec={config.hedge_requote_timeout_sec} "
         f"hedge_requote_count={config.hedge_requote_count} "
@@ -4028,6 +4374,9 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"bootstrap_on_entry={config.bootstrap_on_entry} "
         f"first_leg_role={config.first_leg_role} "
         f"close_first_leg_role={config.close_first_leg_role} "
+        f"close_execution_mode={config.close_execution_mode} "
+        f"close_maker_timeout_sec={config.close_maker_timeout_sec} "
+        f"close_maker_reasons={config.close_maker_reasons} "
         f"max_open_pairs={config.max_open_pairs} "
         f"assumed_flat_grace_sec={config.assumed_flat_grace_sec} "
         f"live_event_log_path={config.live_event_log_path}"

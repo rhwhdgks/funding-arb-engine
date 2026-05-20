@@ -124,7 +124,7 @@ fi
 
 usage() {
   cat <<'EOF'
-usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report|final-report]
+usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report|final-report|opportunity-report]
 
 commands:
   start   start background live strategy runtime
@@ -135,6 +135,7 @@ commands:
   summary print current-run live event summary
   report  show current exchange report snapshot
   final-report  write final PASS/FAIL report for the latest run
+  opportunity-report  write candidate opportunity/no-entry report for the latest run
 EOF
 }
 
@@ -371,6 +372,11 @@ show_final_report() {
   STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/final_run_report.py --env-file "$STRATEGY_ENV_FILE" --meta "$RUN_META_FILE" "$@"
 }
 
+show_opportunity_report() {
+  ensure_runtime
+  STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/candidate_opportunity_report.py --env-file "$STRATEGY_ENV_FILE" --meta "$RUN_META_FILE" "$@"
+}
+
 show_summary() {
   ensure_runtime
   if [[ ! -f "$RUN_META_FILE" ]]; then
@@ -430,6 +436,9 @@ case "$ACTION" in
     ;;
   final-report)
     show_final_report "$@"
+    ;;
+  opportunity-report)
+    show_opportunity_report "$@"
     ;;
   *)
     usage

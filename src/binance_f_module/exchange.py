@@ -1145,12 +1145,23 @@ class Exchange:
 
     async def get_order_status(self, order: dict):
         ticker = (order.get("ticker") or order.get("symbol") or "").upper()
-        uuid = order.get("uuid") or order.get("client_order_id") or order.get("order_id")
+        client_order_id = order.get("client_order_id") or order.get("uuid")
+        order_id = self._order_id_for_fill_lookup(order)
+        uuid = client_order_id or order_id
 
         if not uuid:
             return None
 
-        return await get_order(
+        if not client_order_id and order_id:
+            return await get_order(
+                order_id,
+                {
+                    "ticker": ticker,
+                    "symbol": ticker,
+                },
+            )
+
+        result = await get_order(
             uuid,
             {
                 "ticker": ticker,
@@ -1159,6 +1170,25 @@ class Exchange:
                 "lookup_by": "client_order_id",
             },
         )
+        result_state = str((result or {}).get("state") or "").lower()
+        result_error = str((result or {}).get("error") or "").lower()
+        if (
+            order_id
+            and str(order_id) != str(uuid)
+            and (result_state == "not_exist" or result_error == "not_exist")
+        ):
+            order_id_result = await get_order(
+                order_id,
+                {
+                    "ticker": ticker,
+                    "symbol": ticker,
+                },
+            )
+            order_id_state = str((order_id_result or {}).get("state") or "").lower()
+            order_id_error = str((order_id_result or {}).get("error") or "").lower()
+            if order_id_result and order_id_state != "not_exist" and order_id_error != "not_exist":
+                return order_id_result
+        return result
 
 
     def default_dict(self, timestamp: int) -> dict:
@@ -1328,6 +1358,51 @@ class Exchange:
         except Exception as exc:
             print(f"[{self.name}][trade_history_sync][error] {exc}")
 
+    async def _poll_order_trade_progress(
+        self,
+        ticker: str,
+        order_payload: dict | None,
+        *,
+        event_source: str,
+    ) -> tuple[str | None, dict | None]:
+        if not ticker or not isinstance(order_payload, dict) or not order_payload:
+            return (None, None)
+
+        retry_count = max(
+            int(os.getenv("MARKET_ORDER_TRADE_POLL_RETRY_COUNT", os.getenv("TRADE_HISTORY_SYNC_RETRY_COUNT", "4")) or 4),
+            1,
+        )
+        retry_delay_sec = max(
+            float(os.getenv("MARKET_ORDER_TRADE_POLL_RETRY_DELAY_SEC", os.getenv("TRADE_HISTORY_SYNC_RETRY_DELAY_SEC", "0.5")) or 0.5),
+            0.0,
+        )
+        order_id = self._order_id_for_fill_lookup(order_payload)
+
+        for attempt in range(retry_count):
+            if order_id:
+                trades = await self.get_trades(
+                    ticker,
+                    limit=max(self.market_order_followup_trade_limit, 100),
+                    option={"order_id": order_id},
+                )
+            else:
+                trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
+
+            progress_event, progress_payload = schedule_order_progress_from_trades(
+                self.persist_name,
+                ticker,
+                order_payload,
+                trades or [],
+                event_source=event_source,
+            )
+            if progress_event is not None:
+                return (progress_event, progress_payload)
+
+            if attempt + 1 < retry_count and retry_delay_sec > 0:
+                await asyncio.sleep(retry_delay_sec)
+
+        return (None, None)
+
     def _order_id_for_fill_lookup(self, order: dict | None) -> str | None:
         if not isinstance(order, dict):
             return None
@@ -1369,6 +1444,25 @@ class Exchange:
         if order_qty > 1e-12 and 0.0 <= left_qty < order_qty:
             return max(order_qty - left_qty, 0.0)
         return 0.0
+
+    def _is_market_order_payload(self, order: dict | None) -> bool:
+        if not isinstance(order, dict):
+            return False
+
+        candidates: list[Any] = [
+            order.get("order_type"),
+            order.get("type"),
+            order.get("orderType"),
+            order.get("ordType"),
+        ]
+        raw = order.get("raw")
+        if isinstance(raw, dict):
+            candidates.extend([raw.get("type"), raw.get("origType"), raw.get("orderType")])
+        request = order.get("request")
+        if isinstance(request, dict):
+            candidates.extend([request.get("order_type"), request.get("type"), request.get("orderType")])
+
+        return any(str(value or "").strip().upper() == "MARKET" for value in candidates)
 
     def handle_cancel_result(self, result: Optional[dict], uuid: str):
         if not result:
@@ -1557,13 +1651,30 @@ class Exchange:
             await asyncio.sleep(self.market_order_followup_delay_sec)
 
         merged_status: dict | None = None
+        is_market_order = self._is_market_order_payload(order_data)
         try:
             current_status = await self.get_order_status(order_data)
             if current_status:
                 merged_status = self._merge_polled_status(order_data, current_status)
                 latest_status = str(merged_status.get("status", "")).upper()
                 latest_state = str(merged_status.get("state", "")).lower()
-                if latest_state == "exist" or latest_status in {"NEW", "OPEN", "LIVE", "PARTIALLY_FILLED"}:
+                latest_error = str(merged_status.get("error", "")).lower()
+                is_open_like = latest_status in {"NEW", "OPEN", "LIVE", "PARTIALLY_FILLED"}
+                is_missing = latest_state == "not_exist" or latest_error == "not_exist"
+                is_market_order = is_market_order or self._is_market_order_payload(merged_status)
+
+                if is_missing:
+                    if not is_market_order:
+                        emitted = schedule_polled_order_status(
+                            self.persist_name,
+                            ticker,
+                            order_data,
+                            merged_status,
+                            event_source="rest_poll_market",
+                        )
+                        self._forget_order_status(order_data)
+                        return emitted
+                elif latest_state == "exist" or is_open_like:
                     emitted = schedule_polled_order_status(
                         self.persist_name,
                         ticker,
@@ -1573,7 +1684,11 @@ class Exchange:
                     )
                     self._replace_waiting_order(merged_status)
                     self._remember_order_status(merged_status)
-                    return emitted
+                    # A market order should not remain live just because the
+                    # immediate Binance lookup still says NEW. Continue into
+                    # trade polling so order_history can be finalized.
+                    if not is_market_order:
+                        return emitted
                 if latest_status in {"FILLED", "FINISHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
                     emitted = schedule_polled_order_status(
                         self.persist_name,
@@ -1591,14 +1706,14 @@ class Exchange:
             print(f"[{self.name}][market_followup][status][error] {exc}")
 
         try:
-            trades = await self.get_trades(ticker, limit=self.market_order_followup_trade_limit)
-            progress_event, progress_payload = schedule_order_progress_from_trades(
-                self.persist_name,
+            progress_event, progress_payload = await self._poll_order_trade_progress(
                 ticker,
-                order_data,
-                trades or [],
+                merged_status or order_data,
                 event_source="trade_poll_market",
             )
+            if progress_event == "fill":
+                self._forget_order_status(progress_payload or order_data)
+                return progress_event
             if progress_event == "partial_fill" and isinstance(progress_payload, dict):
                 self._replace_waiting_order(progress_payload)
                 self._remember_order_status(progress_payload)

@@ -32,8 +32,16 @@ class StrategyConfig:
     hedge_requote_timeout_sec: float = 0.7
     hedge_requote_count: int = 2
     close_first_leg_role: str = "short"
+    close_execution_mode: str = "safe_taker"
+    close_maker_timeout_sec: float = 2.0
+    close_maker_price_bps: float = 0.0
+    close_maker_reasons: list[str] = field(default_factory=lambda: ["close_candidate", "take_profit"])
     close_aggressive_bps: float = 8.0
     emergency_flatten_bps: float = 20.0
+    entry_first_leg_price_mode: str = "passive"
+    entry_first_leg_marketable_bps: float = 0.0
+    entry_spread_bps: float = 0.0
+    entry_cancel_buffer_bps: float = 0.0
     action_settle_wait_sec: float = 0.6
     entry_order_settle_sec: float = 1.2
     entry_order_cooldown_sec: float = 1.0

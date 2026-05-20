@@ -82,6 +82,10 @@ DB 설정은 선택값이다. `MARIADB_*`가 하나도 없으면 runtime DB writ
 - `STRATEGY_TAKE_PROFIT_BPS` 기본 `6`. 비워도 bps 기준으로 동작한다.
 - `STRATEGY_STOP_LOSS_BPS` 기본 `8`. 내부 threshold는 `-8bps`로 정규화한다.
 - `STRATEGY_HOLD_BUFFER_BPS` 기본 `2`. 비워도 bps 기준으로 동작한다.
+- `STRATEGY_CLOSE_EXECUTION_MODE` 기본 `safe_taker`. `maker_then_taker`면 정상 청산(`close_candidate,take_profit`)에서 한쪽 maker 체결 후 반대쪽을 taker로 맞춘다.
+- `STRATEGY_CLOSE_MAKER_TIMEOUT_SEC` maker 청산 leg 대기 시간. 기본 `2`.
+- `STRATEGY_CLOSE_MAKER_PRICE_BPS` maker 청산 가격을 best bid/ask에서 얼마나 더 보수적으로 둘지. 기본 `0`.
+- `STRATEGY_CLOSE_MAKER_REASONS` maker 청산을 허용할 close reason 목록. 기본 `close_candidate,take_profit`.
 - `STRATEGY_TAKE_PROFIT_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
 - `STRATEGY_STOP_LOSS_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
 
