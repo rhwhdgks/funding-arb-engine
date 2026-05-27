@@ -6,6 +6,7 @@ from src.strategy.models import (
     DEFAULT_ALLOWED_PAIRS,
     DEFAULT_CLOSE_FEE_BPS,
     DEFAULT_ENTRY_FEE_BPS,
+    DEFAULT_TAKER_FEE_BPS,
     PROJECT_ROOT,
     StrategyConfig,
 )
@@ -122,9 +123,11 @@ def load_strategy_config() -> StrategyConfig:
         DEFAULT_CLOSE_FEE_BPS,
         fallback_prefixes=("STRATEGY_ENTRY_FEE_BPS", "STRATEGY_MAKER_FEE_BPS"),
     )
-    raw_entry_spread_bps = os.getenv("STRATEGY_ENTRY_SPREAD_BPS")
-    if raw_entry_spread_bps in (None, ""):
-        raw_entry_spread_bps = os.getenv("STRATEGY_MIN_EXPECTED_NET_EDGE_BPS", "0.0")
+    taker_fee_bps = load_fee_bps_map(
+        "STRATEGY_TAKER_FEE_BPS",
+        DEFAULT_TAKER_FEE_BPS,
+    )
+    raw_entry_spread_bps = os.getenv("STRATEGY_ENTRY_SPREAD_BPS", "0.0")
 
     config = StrategyConfig(
         exchange_names=exchange_names,
@@ -228,6 +231,7 @@ def load_strategy_config() -> StrategyConfig:
         ),
         entry_fee_bps=entry_fee_bps,
         close_fee_bps=close_fee_bps,
+        taker_fee_bps=taker_fee_bps,
         first_leg_role=os.getenv("STRATEGY_FIRST_LEG_ROLE", "long").strip().lower(),
         stdout_log_style=os.getenv("STRATEGY_STDOUT_LOG_STYLE", "verbose").strip().lower(),
     )

@@ -74,8 +74,11 @@ DB 설정은 선택값이다. `MARIADB_*`가 하나도 없으면 runtime DB writ
 - `STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC`
 - `STRATEGY_HEDGE_REQUOTE_COUNT`
 - `STRATEGY_ACTION_ACCOUNT_FRESH_SEC`
+- `STRATEGY_ENTRY_FIRST_LEG_PRICE_MODE` 기본 `passive`. 실운영 권장값은 `spread_buffer`.
+- `STRATEGY_ENTRY_SPREAD_BPS` maker 주문 위치 전용 spread. 진입 조건과 분리되어 있으며 기본 `0`.
+- `STRATEGY_ENTRY_CANCEL_BUFFER_BPS` Question4식 cancel buffer. `spread_buffer`에서는 주문가가 `spread + cancel_buffer / 2`에 놓인다.
 - `STRATEGY_MIN_EXPECTED_NET_EDGE_USD`
-- `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS`
+- `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS` 진입 기회 판단 전용 threshold. maker 주문 위치에는 fallback으로 사용하지 않는다.
 - `STRATEGY_REQUIRE_FUNDING_PAYMENT`
 - `STRATEGY_MIN_HOLD_SEC`
 - `STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC`

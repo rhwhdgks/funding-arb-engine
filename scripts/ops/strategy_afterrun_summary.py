@@ -140,7 +140,10 @@ def summarize_entry_submit_telemetry(run_rows: list[dict]) -> dict:
     stale_preflight_rows = [
         row for row in preflight_rows
         if float(row.get("market_age_ms") or 0) > SUBMIT_MARKET_AGE_WARN_MS
-        or row.get("can_trade") is False
+    ]
+    blocked_preflight_rows = [
+        row for row in preflight_rows
+        if row.get("can_trade") is False
         or bool(row.get("block_reasons") or [])
     ]
     return {
@@ -154,6 +157,7 @@ def summarize_entry_submit_telemetry(run_rows: list[dict]) -> dict:
         "submit_latency_ms_p95": percentile(submit_latency_values, 0.95),
         "submit_latency_ms_max": max(submit_latency_values) if submit_latency_values else 0.0,
         "stale_preflight_count": len(stale_preflight_rows),
+        "blocked_preflight_count": len(blocked_preflight_rows),
         "warn_threshold_ms": SUBMIT_MARKET_AGE_WARN_MS,
     }
 
@@ -503,6 +507,7 @@ def render_summary_markdown(payload: dict) -> str:
     else:
         lines.append(f"- preflight_count: {submit_telemetry.get('preflight_count')}")
         lines.append(f"- stale_preflight_count: {submit_telemetry.get('stale_preflight_count')}")
+        lines.append(f"- blocked_preflight_count: {submit_telemetry.get('blocked_preflight_count', 0)}")
         lines.append(f"- market_age_ms_avg: {submit_telemetry.get('market_age_ms_avg', 0):.1f}")
         lines.append(f"- market_age_ms_p95: {submit_telemetry.get('market_age_ms_p95', 0):.1f}")
         lines.append(f"- market_age_ms_max: {submit_telemetry.get('market_age_ms_max', 0):.1f}")

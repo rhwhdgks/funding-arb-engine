@@ -106,6 +106,8 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label
 - `STRATEGY_LEVERAGE`: 거래소에 설정할 레버리지
 - `STRATEGY_MAX_GROSS_LEVERAGE`: 계정 전체 gross exposure cap
 - `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS`: 진입 최소 기대 edge
+- `STRATEGY_ENTRY_SPREAD_BPS`: maker 주문 위치 전용 spread. 진입 최소 edge와 분리됨
+- `STRATEGY_ENTRY_CANCEL_BUFFER_BPS`: Question4식 maker 주문 cancel buffer
 - `STRATEGY_REQUIRE_FUNDING_PAYMENT`: funding을 내는 방향만 허용할지
 - `STRATEGY_TAKE_PROFIT_BPS`: 기본 `6`
 - `STRATEGY_STOP_LOSS_BPS`: 기본 `8`, 내부에서는 `-8bps`로 처리

@@ -586,6 +586,7 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     else:
         lines.append(f"- preflight_count: {submit_telemetry.get('preflight_count')}")
         lines.append(f"- stale_preflight_count: {submit_telemetry.get('stale_preflight_count')}")
+        lines.append(f"- blocked_preflight_count: {submit_telemetry.get('blocked_preflight_count', 0)}")
         lines.append(f"- market_age_ms_avg: {float(submit_telemetry.get('market_age_ms_avg') or 0):.1f}")
         lines.append(f"- market_age_ms_p95: {float(submit_telemetry.get('market_age_ms_p95') or 0):.1f}")
         lines.append(f"- market_age_ms_max: {float(submit_telemetry.get('market_age_ms_max') or 0):.1f}")
@@ -631,7 +632,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconcile-json-output")
     parser.add_argument("--label")
     parser.add_argument("--wait", action="store_true")
-    parser.add_argument("--allow-warnings", action="store_true")
+    parser.add_argument(
+        "--allow-warnings",
+        dest="allow_warnings",
+        action="store_true",
+        default=True,
+        help="Allow WARN component checks in the final verdict. This is the default.",
+    )
+    parser.add_argument(
+        "--strict-warnings",
+        dest="allow_warnings",
+        action="store_false",
+        help="Treat WARN component checks as final verdict blockers.",
+    )
     parser.add_argument("--skip-live-check", action="store_true")
     parser.add_argument("--wait-ws-sec", type=float, default=2.0)
     parser.add_argument("--trade-limit", type=int, default=1)

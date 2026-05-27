@@ -107,6 +107,21 @@ def emit_order_event(
         print(f"[strategy][order_event][warn] event_type={event_type} error={exc!r}")
 
 
+def schedule_trade_history_sync_if_available(exchange: Any, symbol: str, order_result: dict[str, Any] | None) -> None:
+    if not isinstance(order_result, dict) or not order_result:
+        return
+    sync = getattr(exchange, "_schedule_trade_history_sync", None)
+    if not callable(sync):
+        return
+    try:
+        sync(symbol, order_result)
+    except Exception as exc:
+        print(
+            f"[strategy][trade_history_sync][warn] "
+            f"exchange={exchange_runtime_name(exchange)} symbol={symbol} error={exc!r}"
+        )
+
+
 def market_freshness_payload(exchange: Any, symbol: str, submit_start_ms: int) -> dict[str, Any]:
     try:
         snapshot = exchange.get_symbol_snapshot(symbol)
@@ -199,6 +214,7 @@ def log_entry_first_leg_progress(
         position_delta=resolved_qty,
         reason=reason,
     )
+    schedule_trade_history_sync_if_available(exchange, symbol, order_result)
 
 
 def entry_order_settle_sec(config: Any) -> float:

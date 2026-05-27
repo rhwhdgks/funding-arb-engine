@@ -16,6 +16,11 @@ DEFAULT_CLOSE_FEE_BPS = {
     "okx": 2.0,
     "gateio": 8.0,
 }
+DEFAULT_TAKER_FEE_BPS = {
+    "binance": 5.0,
+    "okx": 5.0,
+    "gateio": 8.0,
+}
 
 
 @dataclass
@@ -104,6 +109,7 @@ class StrategyConfig:
     live_event_log_path: Path = field(default_factory=lambda: PROJECT_ROOT / "logs" / "strategy_live.jsonl")
     entry_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ENTRY_FEE_BPS))
     close_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CLOSE_FEE_BPS))
+    taker_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_TAKER_FEE_BPS))
     first_leg_role: str = "long"
     stdout_log_style: str = "verbose"
 

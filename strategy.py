@@ -25,6 +25,7 @@ from src.strategy.candidates import (
     extract_mid_price,
     extract_next_funding_ms,
     rank_candidates,
+    seconds_until,
 )
 from src.strategy.control import EntryControlStore
 from src.strategy.hedge import HedgeExecutionResult, execute_residual_hedge
@@ -48,14 +49,14 @@ from src.strategy.risk_gate import (
     RiskGateDecision,
     evaluate_entry_risk,
 )
-from src.strategy.close_policy import evaluate_close_policy, pair_entry_reference_notional_usd
+from src.strategy.close_policy import close_fee_cost_usd, evaluate_close_policy, pair_entry_reference_notional_usd
 from src.strategy.rules import (
     close_first_leg_plan,
     close_hedge_leg_plan,
     first_leg_plan,
     hedge_leg_plan,
-    required_entry_open_edge_usd,
 )
+from src.strategy import order_price_policy
 from src.strategy.models import (
     PROJECT_ROOT,
     FlattenLegResult,
@@ -1104,47 +1105,19 @@ def render_open_pairs(open_pairs: dict[str, OpenPairState]) -> str:
 
 
 def marketable_limit_price(exchange: Any, symbol: str, side: str) -> float:
-    snapshot = exchange.get_symbol_snapshot(symbol)
-    if side.lower() == "buy":
-        return extract_best_ask(snapshot)
-    return extract_best_bid(snapshot)
+    return order_price_policy.marketable_limit_price(exchange, symbol, side)
 
 
 def marketable_limit_price_with_bps(exchange: Any, symbol: str, side: str, bps: float) -> float:
-    base_price = marketable_limit_price(exchange, symbol, side)
-    if base_price <= 0:
-        return 0.0
-    if side.lower() == "buy":
-        return base_price * (1.0 + (bps / 10000.0))
-    return base_price * (1.0 - (bps / 10000.0))
+    return order_price_policy.marketable_limit_price_with_bps(exchange, symbol, side, bps)
 
 
 def maker_close_limit_price(exchange: Any, symbol: str, side: str, bps: float = 0.0) -> float:
-    snapshot = exchange.get_symbol_snapshot(symbol)
-    normalized_side = side.lower()
-    bps = max(float(bps or 0.0), 0.0)
-    if normalized_side == "buy":
-        best_bid = extract_best_bid(snapshot)
-        if best_bid <= 0:
-            return 0.0
-        return normalize_limit_price_for_side(exchange, symbol, side, best_bid * (1.0 - bps / 10000.0))
-
-    best_ask = extract_best_ask(snapshot)
-    if best_ask <= 0:
-        return 0.0
-    return normalize_limit_price_for_side(exchange, symbol, side, best_ask * (1.0 + bps / 10000.0))
+    return order_price_policy.maker_close_limit_price(exchange, symbol, side, bps)
 
 
 def marketable_entry_target_price(exchange: Any, symbol: str, side: str, config: StrategyConfig) -> float:
-    base_price = marketable_limit_price(exchange, symbol, side)
-    if base_price <= 0:
-        return 0.0
-    bps = max(config.entry_first_leg_marketable_bps, 0.0)
-    if side.lower() == "buy":
-        raw_price = base_price * (1.0 + (bps / 10000.0))
-    else:
-        raw_price = base_price * (1.0 - (bps / 10000.0))
-    return normalize_limit_price_for_side(exchange, symbol, side, raw_price)
+    return order_price_policy.marketable_entry_target_price(exchange, symbol, side, config)
 
 
 def spread_buffer_entry_target_price(
@@ -1154,44 +1127,17 @@ def spread_buffer_entry_target_price(
     exchanges: dict[str, Any],
     config: StrategyConfig,
 ) -> float:
-    symbol = candidate.symbol
-    first_exchange = exchanges[first_exchange_name]
-    first_snapshot = first_exchange.get_symbol_snapshot(symbol)
-    target_bps = max(config.entry_spread_bps, 0.0) + (max(config.entry_cancel_buffer_bps, 0.0) / 2.0)
-
-    if first_exchange_name == candidate.long_exchange and first_side.lower() == "buy":
-        reference_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_bid(reference_snapshot)
-        maker_best_bid = extract_best_bid(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price * (1.0 - (target_bps / 10000.0))
-        target_price = min(raw_target, maker_best_bid) if maker_best_bid > 0 else raw_target
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    if first_exchange_name == candidate.short_exchange and first_side.lower() == "sell":
-        reference_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_ask(reference_snapshot)
-        maker_best_ask = extract_best_ask(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price * (1.0 + (target_bps / 10000.0))
-        target_price = max(raw_target, maker_best_ask) if maker_best_ask > 0 else raw_target
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    return marketable_entry_target_price(first_exchange, symbol, first_side, config)
+    return order_price_policy.spread_buffer_entry_target_price(
+        candidate,
+        first_exchange_name,
+        first_side,
+        exchanges,
+        config,
+    )
 
 
 def normalize_limit_price_for_side(exchange: Any, symbol: str, side: str, raw_price: float) -> float:
-    if raw_price <= 0:
-        return 0.0
-    meta = getattr(exchange, "ticker_info", {}).get(symbol, {}) or {}
-    tick_size = _safe_float(meta.get("tick_size"), 0.0)
-    if tick_size <= 0:
-        return raw_price
-    if side.lower() == "buy":
-        return floor_by_step(raw_price, tick_size)
-    return ceil_by_step(raw_price, tick_size)
+    return order_price_policy.normalize_limit_price_for_side(exchange, symbol, side, raw_price)
 
 
 def passive_entry_target_price(
@@ -1201,47 +1147,12 @@ def passive_entry_target_price(
     exchanges: dict[str, Any],
     config: StrategyConfig,
 ) -> float:
-    symbol = candidate.symbol
-    first_exchange = exchanges[first_exchange_name]
-    if config.entry_first_leg_price_mode == "marketable":
-        return marketable_entry_target_price(first_exchange, symbol, first_side, config)
-    if config.entry_first_leg_price_mode == "spread_buffer":
-        return spread_buffer_entry_target_price(candidate, first_exchange_name, first_side, exchanges, config)
-
-    first_snapshot = first_exchange.get_symbol_snapshot(symbol)
-    quote_qty = candidate.executable_qty if candidate.executable_qty > EPS else candidate.target_qty
-    if quote_qty <= EPS:
-        return 0.0
-
-    required_unit_edge = required_entry_open_edge_usd(candidate, config) / quote_qty
-
-    if first_exchange_name == candidate.long_exchange and first_side.lower() == "buy":
-        reference_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_bid(reference_snapshot)
-        maker_best_bid = extract_best_bid(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price - required_unit_edge
-        passive_cap = maker_best_bid if maker_best_bid > 0 else raw_target
-        target_price = min(raw_target, passive_cap)
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    if first_exchange_name == candidate.short_exchange and first_side.lower() == "sell":
-        reference_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_ask(reference_snapshot)
-        maker_best_ask = extract_best_ask(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price + required_unit_edge
-        passive_floor = maker_best_ask if maker_best_ask > 0 else raw_target
-        target_price = max(raw_target, passive_floor)
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    return normalize_limit_price_for_side(
-        first_exchange,
-        symbol,
+    return order_price_policy.passive_entry_target_price(
+        candidate,
+        first_exchange_name,
         first_side,
-        marketable_limit_price(first_exchange, symbol, first_side),
+        exchanges,
+        config,
     )
 
 
@@ -3475,6 +3386,12 @@ def estimate_hold_pnl_next_funding(
     long_next_funding_ms = extract_next_funding_ms(long_snapshot)
     short_next_funding_ms = extract_next_funding_ms(short_snapshot)
     now_ms = int(time.time() * 1000)
+    # This estimator answers "what's the PnL if we hold until the next funding
+    # settlement?" — the relevant horizon is whichever side settles first.
+    long_remaining_sec = seconds_until(long_next_funding_ms, now_ms=now_ms) if long_next_funding_ms > 0 else 0.0
+    short_remaining_sec = seconds_until(short_next_funding_ms, now_ms=now_ms) if short_next_funding_ms > 0 else 0.0
+    candidates_sec = [s for s in (long_remaining_sec, short_remaining_sec) if s > 0]
+    forecast_hold_sec = min(candidates_sec) if candidates_sec else float(config.min_hold_sec)
     (
         _raw_funding_pnl_usd,
         funding_confidence,
@@ -3489,6 +3406,7 @@ def estimate_hold_pnl_next_funding(
         long_next_funding_ms=long_next_funding_ms,
         short_next_funding_ms=short_next_funding_ms,
         config=config,
+        forecast_hold_sec=forecast_hold_sec,
         now_ms=now_ms,
     )
     stale_data_penalty_usd = compute_stale_data_penalty_usd(
@@ -3532,9 +3450,12 @@ def estimate_close_pnl_now(
     )
     long_notional = pair.qty * long_bid
     short_notional = pair.qty * short_ask
-    close_fee_cost = (
-        long_notional * config.close_fee_bps.get(pair.long_exchange, 0.0) / 10000.0
-        + short_notional * config.close_fee_bps.get(pair.short_exchange, 0.0) / 10000.0
+    close_fee_cost = close_fee_cost_usd(
+        long_exchange=pair.long_exchange,
+        short_exchange=pair.short_exchange,
+        long_notional_usd=long_notional,
+        short_notional_usd=short_notional,
+        config=config,
     )
     close_slippage = ((long_notional + short_notional) / 2.0) * (config.close_slippage_bps * 2.0) / 10000.0
     return gross_pnl - close_fee_cost - close_slippage

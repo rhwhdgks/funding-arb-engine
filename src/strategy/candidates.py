@@ -3,6 +3,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from src.strategy.close_policy import close_fee_cost_usd
+from src.strategy.entry_policy import evaluate_entry_policy
 from src.strategy.models import PairCandidate, StrategyConfig
 
 
@@ -153,6 +155,9 @@ def compute_funding_time_decay_factor(
     return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
 
 
+FUNDING_SETTLEMENT_SEC = 28800.0  # 8h per funding settlement on binance/okx perps
+
+
 def compute_effective_funding_components(
     *,
     long_rate: float,
@@ -162,9 +167,14 @@ def compute_effective_funding_components(
     long_next_funding_ms: int,
     short_next_funding_ms: int,
     config: StrategyConfig,
+    forecast_hold_sec: float,
     now_ms: int | None = None,
 ) -> tuple[float, float, float, float, float]:
-    raw_funding_pnl_usd = (-long_rate * long_notional) + (short_rate * short_notional)
+    # Funding rates are per 8h settlement. Scale to the forecast hold horizon
+    # so expected_net_edge reflects what we'd realistically collect/pay during
+    # the trade rather than a full settlement's worth.
+    hold_scale = max(0.0, float(forecast_hold_sec)) / FUNDING_SETTLEMENT_SEC
+    raw_funding_pnl_usd = ((-long_rate * long_notional) + (short_rate * short_notional)) * hold_scale
     funding_confidence = compute_funding_confidence(long_next_funding_ms, short_next_funding_ms, config)
     funding_alignment_factor = compute_funding_alignment_factor(long_next_funding_ms, short_next_funding_ms, config)
     funding_time_decay_factor = compute_funding_time_decay_factor(
@@ -195,9 +205,26 @@ def compute_open_cost_usd(
     short_notional: float,
     config: StrategyConfig,
 ) -> float:
+    # Entry: first leg pays maker when posted passively (passive / spread_buffer)
+    # and taker when crossed (marketable). Hedge leg is taker on
+    # hedge_market_immediate, otherwise maker.
+    if config.first_leg_role == "long":
+        first_ex, first_notional = long_exchange, long_notional
+        hedge_ex, hedge_notional = short_exchange, short_notional
+    else:
+        first_ex, first_notional = short_exchange, short_notional
+        hedge_ex, hedge_notional = long_exchange, long_notional
+    if config.entry_first_leg_price_mode == "marketable":
+        first_fee_bps = config.taker_fee_bps.get(first_ex, 0.0)
+    else:
+        first_fee_bps = config.entry_fee_bps.get(first_ex, 0.0)
+    if config.hedge_market_immediate:
+        hedge_fee_bps = config.taker_fee_bps.get(hedge_ex, 0.0)
+    else:
+        hedge_fee_bps = config.entry_fee_bps.get(hedge_ex, 0.0)
     return (
-        long_notional * config.entry_fee_bps.get(long_exchange, 0.0) / 10000.0
-        + short_notional * config.entry_fee_bps.get(short_exchange, 0.0) / 10000.0
+        first_notional * first_fee_bps / 10000.0
+        + hedge_notional * hedge_fee_bps / 10000.0
     )
 
 
@@ -207,12 +234,15 @@ def compute_expected_close_cost_usd(
     reference_notional: float,
     config: StrategyConfig,
 ) -> float:
-    close_fee_cost_usd = (
-        reference_notional * config.close_fee_bps.get(long_exchange, 0.0) / 10000.0
-        + reference_notional * config.close_fee_bps.get(short_exchange, 0.0) / 10000.0
+    close_fee_cost = close_fee_cost_usd(
+        long_exchange=long_exchange,
+        short_exchange=short_exchange,
+        long_notional_usd=reference_notional,
+        short_notional_usd=reference_notional,
+        config=config,
     )
     close_slippage_cost_usd = reference_notional * (config.close_slippage_bps * 2.0) / 10000.0
-    return close_fee_cost_usd + close_slippage_cost_usd
+    return close_fee_cost + close_slippage_cost_usd
 
 
 def compute_stale_data_penalty_usd(
@@ -302,6 +332,7 @@ def compute_pair_candidate(
         long_next_funding_ms=long_next_funding_ms,
         short_next_funding_ms=short_next_funding_ms,
         config=config,
+        forecast_hold_sec=config.min_hold_sec,
         now_ms=current_ms,
     )
     stale_data_penalty_usd = compute_stale_data_penalty_usd(
@@ -357,19 +388,16 @@ def compute_pair_candidate(
             balance_reports_by_exchange=balance_reports_by_exchange,
         )
     )
-    if (
-        config.min_effective_funding_usd is not None
-        and effective_funding_pnl_usd < config.min_effective_funding_usd
-    ):
-        block_reasons.append("effective_funding_below_usd_threshold")
-    if config.require_funding_payment and raw_funding_pnl_usd >= -EPS:
-        block_reasons.append("funding_payment_required")
-    if expected_net_edge_usd < config.min_expected_net_edge_usd:
-        block_reasons.append("net_edge_below_usd_threshold")
-    if expected_net_edge_bps < config.min_expected_net_edge_bps:
-        block_reasons.append("net_edge_below_bps_threshold")
-
-    can_enter = len(block_reasons) == 0
+    entry_decision = evaluate_entry_policy(
+        config=config,
+        base_reasons=block_reasons,
+        raw_funding_pnl_usd=raw_funding_pnl_usd,
+        effective_funding_pnl_usd=effective_funding_pnl_usd,
+        expected_net_edge_usd=expected_net_edge_usd,
+        expected_net_edge_bps=expected_net_edge_bps,
+    )
+    block_reasons = entry_decision.reasons
+    can_enter = entry_decision.can_enter
     return PairCandidate(
         symbol=symbol,
         long_exchange=long_exchange,

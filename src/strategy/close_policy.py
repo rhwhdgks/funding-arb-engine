@@ -28,6 +28,38 @@ def pair_entry_reference_notional_usd(pair: OpenPairState) -> float:
     return max(float(pair.qty or 0.0) * reference_price, 0.0)
 
 
+def close_fee_cost_usd(
+    *,
+    long_exchange: str,
+    short_exchange: str,
+    long_notional_usd: float,
+    short_notional_usd: float,
+    config: StrategyConfig,
+) -> float:
+    """Return expected close fees using the configured close execution mode."""
+    long_notional = max(float(long_notional_usd or 0.0), 0.0)
+    short_notional = max(float(short_notional_usd or 0.0), 0.0)
+
+    if config.close_first_leg_role == "long":
+        first_exchange, first_notional = long_exchange, long_notional
+        hedge_exchange, hedge_notional = short_exchange, short_notional
+    else:
+        first_exchange, first_notional = short_exchange, short_notional
+        hedge_exchange, hedge_notional = long_exchange, long_notional
+
+    if config.close_execution_mode == "maker_then_taker":
+        first_fee_bps = config.close_fee_bps.get(first_exchange, 0.0)
+        hedge_fee_bps = config.taker_fee_bps.get(hedge_exchange, 0.0)
+    else:
+        first_fee_bps = config.taker_fee_bps.get(first_exchange, 0.0)
+        hedge_fee_bps = config.taker_fee_bps.get(hedge_exchange, 0.0)
+
+    return (
+        first_notional * float(first_fee_bps or 0.0) / 10000.0
+        + hedge_notional * float(hedge_fee_bps or 0.0) / 10000.0
+    )
+
+
 def close_thresholds_usd(
     pair: OpenPairState,
     config: StrategyConfig,
