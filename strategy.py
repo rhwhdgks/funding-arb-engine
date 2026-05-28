@@ -3002,7 +3002,7 @@ async def enter_pair_limit_then_hedge(
             aggressive_bps=config.emergency_flatten_bps,
         )
         if not flattened:
-            log_danger("헤지불가첫체결", symbol=symbol, result="페어종료실패")
+            log_danger(title="헤지불가첫체결", symbol=symbol, result="페어종료실패")
         return None
     if first_fill_residual_qty > EPS:
         first_residual_preview = exchange_order_execution_preview(
@@ -3136,7 +3136,7 @@ async def enter_pair_limit_then_hedge(
 
     if long_qty_after <= EPS or short_qty_after >= -EPS:
         log_danger(
-            "진입후방향불일치",
+            title="진입후방향불일치",
             symbol=symbol,
             long_exchange=candidate.long_exchange,
             long_qty=f"{long_qty_after:.6f}",
@@ -3147,7 +3147,7 @@ async def enter_pair_limit_then_hedge(
         return None
     if pair_qty <= EPS:
         log_danger(
-            "진입후수량없음",
+            title="진입후수량없음",
             symbol=symbol,
             long_before=f"{pre_long_qty:.6f}",
             long_after=f"{long_qty_after:.6f}",
@@ -3204,7 +3204,7 @@ async def enter_pair_limit_then_hedge(
     )
     if long_entry_price <= 0 or short_entry_price <= 0:
         log_danger(
-            "진입평단누락",
+            title="진입평단누락",
             symbol=symbol,
             long_exchange=candidate.long_exchange,
             long_entry=f"{long_entry_price:.8f}",
@@ -3708,7 +3708,7 @@ async def close_pair_limit_then_hedge(
     if flatten_result.failed_leg is not None:
         failed_payload = flatten_leg_result_payload(flatten_result.failed_leg)
         log_danger(
-            "페어종료레그실패",
+            title="페어종료레그실패",
             id=pair.pair_id,
             symbol=pair.symbol,
             failed_exchange=flatten_result.failed_leg.exchange_name,
@@ -3759,7 +3759,7 @@ async def close_pair_limit_then_hedge(
 
     pair.status = "close_imbalance"
     log_danger(
-        "청산불균형",
+        title="청산불균형",
         id=pair.pair_id,
         long_after=f"{long_qty_after:.6f}",
         short_after=f"{short_qty_after:.6f}",
@@ -3894,7 +3894,7 @@ async def manage_open_pairs(
                     )
                 else:
                     log_danger(
-                        "페어방향불일치",
+                        title="페어방향불일치",
                         id=pair_id,
                         long_qty=f"{long_qty:.6f}",
                         short_qty=f"{short_qty:.6f}",
