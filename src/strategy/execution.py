@@ -529,6 +529,7 @@ async def execute_requoting_limit_leg(
     record_order_event: Callable[..., None] | None = None,
     last_order_submit_ms_by_key: dict[tuple[str, str, str], int] | None = None,
     extract_position_qty: Callable[[dict[str, Any]], float] | None = None,
+    telemetry: dict[str, Any] | None = None,
     eps: float,
 ) -> tuple[float, dict[str, Any] | None, float]:
     deadline = time.monotonic() + max(timeout_sec, 0.0)
@@ -542,6 +543,12 @@ async def execute_requoting_limit_leg(
     last_order_price_used = 0.0
     resolved_qty = 0.0
     entry_event_recorder = record_order_event if (not is_close and log_prefix == "enter") else None
+    entry_telemetry = telemetry if (not is_close and log_prefix == "enter") else None
+    if entry_telemetry is not None:
+        entry_telemetry.setdefault("exchange", exchange_runtime_name(exchange))
+        entry_telemetry.setdefault("symbol", str(symbol).upper())
+        entry_telemetry.setdefault("side", str(side).lower())
+        entry_telemetry.setdefault("target_qty", target_qty)
 
     while True:
         remaining_time_sec = deadline - time.monotonic()
@@ -560,6 +567,11 @@ async def execute_requoting_limit_leg(
             ),
         )
         if resolved_qty > previous_resolved_qty + eps:
+            if entry_telemetry is not None:
+                fill_detected_ms = wall_time_ms()
+                entry_telemetry.setdefault("first_fill_detected_ms", fill_detected_ms)
+                entry_telemetry["last_fill_detected_ms"] = fill_detected_ms
+                entry_telemetry["resolved_qty"] = resolved_qty
             log_entry_first_leg_progress(
                 exchange=exchange,
                 symbol=symbol,
@@ -723,6 +735,15 @@ async def execute_requoting_limit_leg(
                 f"remaining={remaining_qty:.6f} price={target_price}",
             )
             submit_start_ms = wall_time_ms()
+            freshness = market_freshness_payload(exchange, symbol, submit_start_ms)
+            if entry_telemetry is not None:
+                entry_telemetry.setdefault("first_submit_start_ms", submit_start_ms)
+                entry_telemetry.setdefault("first_market_age_ms", freshness.get("market_age_ms"))
+                entry_telemetry.setdefault("first_stale_age_ms", freshness.get("stale_age_ms"))
+                entry_telemetry["last_submit_start_ms"] = submit_start_ms
+                entry_telemetry["last_market_age_ms"] = freshness.get("market_age_ms")
+                entry_telemetry["last_stale_age_ms"] = freshness.get("stale_age_ms")
+                entry_telemetry["submit_count"] = int(entry_telemetry.get("submit_count") or 0) + 1
             if entry_event_recorder is not None:
                 emit_order_event(
                     entry_event_recorder,
@@ -736,10 +757,17 @@ async def execute_requoting_limit_leg(
                     target_price=target_price,
                     active_price=active_price,
                     resolved_qty=resolved_qty,
-                    **market_freshness_payload(exchange, symbol, submit_start_ms),
+                    **freshness,
                 )
             order_result = await exchange.order(symbol, side, submit_qty, target_price)
             submit_end_ms = wall_time_ms()
+            if entry_telemetry is not None:
+                submit_latency_ms = submit_end_ms - submit_start_ms
+                entry_telemetry.setdefault("first_submit_end_ms", submit_end_ms)
+                entry_telemetry.setdefault("first_submit_latency_ms", submit_latency_ms)
+                entry_telemetry["last_submit_end_ms"] = submit_end_ms
+                entry_telemetry["last_submit_latency_ms"] = submit_latency_ms
+                entry_telemetry["last_submit_target_price"] = target_price
             if entry_event_recorder is not None:
                 emit_order_event(
                     entry_event_recorder,
@@ -793,6 +821,11 @@ async def execute_requoting_limit_leg(
         ),
     )
     if resolved_qty > previous_resolved_qty + eps:
+        if entry_telemetry is not None:
+            fill_detected_ms = wall_time_ms()
+            entry_telemetry.setdefault("first_fill_detected_ms", fill_detected_ms)
+            entry_telemetry["last_fill_detected_ms"] = fill_detected_ms
+            entry_telemetry["resolved_qty"] = resolved_qty
         log_entry_first_leg_progress(
             exchange=exchange,
             symbol=symbol,
@@ -853,6 +886,11 @@ async def execute_requoting_limit_leg(
             ),
         )
         if resolved_qty > previous_resolved_qty + eps:
+            if entry_telemetry is not None:
+                fill_detected_ms = wall_time_ms()
+                entry_telemetry.setdefault("first_fill_detected_ms", fill_detected_ms)
+                entry_telemetry["last_fill_detected_ms"] = fill_detected_ms
+                entry_telemetry["resolved_qty"] = resolved_qty
             log_entry_first_leg_progress(
                 exchange=exchange,
                 symbol=symbol,
@@ -874,4 +912,9 @@ async def execute_requoting_limit_leg(
                 eps=eps,
             )
 
-    return resolved_qty, active_order, active_price if active_price > 0 else last_order_price_used
+    final_price_used = active_price if active_price > 0 else last_order_price_used
+    if entry_telemetry is not None:
+        entry_telemetry["completed_ms"] = wall_time_ms()
+        entry_telemetry["resolved_qty"] = resolved_qty
+        entry_telemetry["final_price_used"] = final_price_used
+    return resolved_qty, active_order, final_price_used

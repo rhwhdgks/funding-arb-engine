@@ -29,6 +29,7 @@ from scripts.ops.order_trade_reconcile_report import write_json as write_report_
 from scripts.ops.strategy_afterrun_summary import (  # noqa: E402
     build_summary_payload,
     format_duration_ms,
+    percentile,
     render_summary_markdown,
 )
 
@@ -201,6 +202,7 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
         "top_block_reasons": dict(block_reason_counts.most_common(10)),
         "top_candidate_symbols": dict(top_symbol_counts.most_common(10)),
         "top_enterable_symbols": dict(top_enterable_symbol_counts.most_common(10)),
+        "entry_quality": build_entry_quality_report(run_rows),
         "pairs": pair_rows,
     }
 
@@ -232,6 +234,97 @@ def nonzero_balance_positions(report: dict[str, Any]) -> list[dict[str, Any]]:
         if abs(qty) > 0.0:
             result.append(row)
     return result
+
+
+def avg(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def build_entry_quality_report(run_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    quality_rows = [row for row in run_rows if row.get("event_type") == "entry_quality_analysis"]
+    expected_bps_values = [safe_float(row.get("expected_net_edge_bps")) for row in quality_rows]
+    expected_open_bps_values = [safe_float(row.get("expected_open_edge_bps")) for row in quality_rows]
+    actual_bps_values = [safe_float(row.get("actual_open_edge_bps")) for row in quality_rows]
+    slippage_bps_values = [safe_float(row.get("entry_edge_slippage_bps")) for row in quality_rows]
+    first_fill_to_hedge_values = [safe_float(row.get("first_fill_to_hedge_fill_ms")) for row in quality_rows]
+    total_entry_elapsed_values = [safe_float(row.get("total_entry_elapsed_ms")) for row in quality_rows]
+    bad_expected_rows = [
+        row
+        for row in quality_rows
+        if safe_float(row.get("expected_net_edge_bps")) >= 10.0
+        and safe_float(row.get("actual_open_edge_bps")) <= 0.0
+    ]
+
+    by_symbol: dict[str, dict[str, Any]] = {}
+    for row in quality_rows:
+        symbol = str(row.get("symbol") or "").upper() or "-"
+        bucket = by_symbol.setdefault(
+            symbol,
+            {
+                "count": 0,
+                "expected_net_edge_bps_values": [],
+                "expected_open_edge_bps_values": [],
+                "actual_open_edge_bps_values": [],
+                "slippage_bps_values": [],
+                "first_fill_to_hedge_fill_ms_values": [],
+            },
+        )
+        bucket["count"] += 1
+        bucket["expected_net_edge_bps_values"].append(safe_float(row.get("expected_net_edge_bps")))
+        bucket["expected_open_edge_bps_values"].append(safe_float(row.get("expected_open_edge_bps")))
+        bucket["actual_open_edge_bps_values"].append(safe_float(row.get("actual_open_edge_bps")))
+        bucket["slippage_bps_values"].append(safe_float(row.get("entry_edge_slippage_bps")))
+        bucket["first_fill_to_hedge_fill_ms_values"].append(safe_float(row.get("first_fill_to_hedge_fill_ms")))
+
+    symbol_rows: list[dict[str, Any]] = []
+    for symbol, bucket in by_symbol.items():
+        symbol_rows.append(
+            {
+                "symbol": symbol,
+                "count": bucket["count"],
+                "expected_net_edge_bps_avg": avg(bucket["expected_net_edge_bps_values"]),
+                "expected_open_edge_bps_avg": avg(bucket["expected_open_edge_bps_values"]),
+                "actual_open_edge_bps_avg": avg(bucket["actual_open_edge_bps_values"]),
+                "slippage_bps_avg": avg(bucket["slippage_bps_values"]),
+                "first_fill_to_hedge_fill_ms_avg": avg(bucket["first_fill_to_hedge_fill_ms_values"]),
+            }
+        )
+    symbol_rows.sort(key=lambda row: (-int(row["count"]), str(row["symbol"])))
+
+    worst_pairs: list[dict[str, Any]] = []
+    for row in sorted(
+        quality_rows,
+        key=lambda item: abs(safe_float(item.get("entry_edge_slippage_bps"))),
+        reverse=True,
+    )[:5]:
+        worst_pairs.append(
+            {
+                "pair_id": row.get("pair_id"),
+                "symbol": str(row.get("symbol") or "").upper(),
+                "pair": f"{row.get('long_exchange') or '-'}L/{row.get('short_exchange') or '-'}S",
+                "expected_net_edge_bps": safe_float(row.get("expected_net_edge_bps")),
+                "expected_open_edge_bps": safe_float(row.get("expected_open_edge_bps")),
+                "actual_open_edge_bps": safe_float(row.get("actual_open_edge_bps")),
+                "slippage_bps": safe_float(row.get("entry_edge_slippage_bps")),
+                "first_fill_to_hedge_fill_ms": safe_float(row.get("first_fill_to_hedge_fill_ms")),
+                "total_entry_elapsed_ms": safe_float(row.get("total_entry_elapsed_ms")),
+            }
+        )
+
+    return {
+        "entry_quality_count": len(quality_rows),
+        "expected_ge_10_actual_nonpositive_count": len(bad_expected_rows),
+        "expected_net_edge_bps_avg": avg(expected_bps_values),
+        "expected_open_edge_bps_avg": avg(expected_open_bps_values),
+        "actual_open_edge_bps_avg": avg(actual_bps_values),
+        "slippage_bps_avg": avg(slippage_bps_values),
+        "first_fill_to_hedge_fill_ms_p50": percentile(first_fill_to_hedge_values, 0.50),
+        "first_fill_to_hedge_fill_ms_p90": percentile(first_fill_to_hedge_values, 0.90),
+        "total_entry_elapsed_ms_p50": percentile(total_entry_elapsed_values, 0.50),
+        "total_entry_elapsed_ms_p90": percentile(total_entry_elapsed_values, 0.90),
+        "by_symbol": symbol_rows,
+        "worst_pairs": worst_pairs,
+    }
 
 
 async def collect_live_flat_report(
@@ -525,6 +618,11 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Info Counters")
     for key in (
+        "maker_entry_preposition_candidate_selected",
+        "maker_entry_order_submitted",
+        "maker_entry_fill_detected",
+        "maker_entry_order_cancelled",
+        "maker_entry_symbol_paused",
         "pair_opened",
         "pair_closed",
         "pair_entry_micro_partial_detected",
@@ -534,6 +632,9 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
         "entry_order_disappeared_resolved",
         "entry_limit_order_submit_preflight",
         "entry_limit_order_submit_result",
+        "entry_post_first_fill_edge_check",
+        "entry_aborted_after_first_fill_bad_edge",
+        "entry_quality_analysis",
         "pair_closed_after_recovery",
         "pair_neutralized_after_close_failure",
     ):
@@ -579,6 +680,55 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
             )
     else:
         lines.append("- no closed pairs in this run")
+    lines.append("")
+    entry_quality = performance.get("entry_quality") or {}
+    lines.append("## Entry Quality")
+    lines.append(f"- entry_quality_count: {entry_quality.get('entry_quality_count', 0)}")
+    lines.append(
+        "- expected_ge_10_actual_nonpositive_count: "
+        f"{entry_quality.get('expected_ge_10_actual_nonpositive_count', 0)}"
+    )
+    lines.append(f"- expected_net_edge_bps_avg: {float(entry_quality.get('expected_net_edge_bps_avg') or 0):.2f}")
+    lines.append(f"- expected_open_edge_bps_avg: {float(entry_quality.get('expected_open_edge_bps_avg') or 0):.2f}")
+    lines.append(f"- actual_open_edge_bps_avg: {float(entry_quality.get('actual_open_edge_bps_avg') or 0):.2f}")
+    lines.append(f"- slippage_bps_avg: {float(entry_quality.get('slippage_bps_avg') or 0):.2f}")
+    lines.append(
+        f"- first_fill_to_hedge_fill_ms_p50/p90: "
+        f"{float(entry_quality.get('first_fill_to_hedge_fill_ms_p50') or 0):.1f}/"
+        f"{float(entry_quality.get('first_fill_to_hedge_fill_ms_p90') or 0):.1f}"
+    )
+    symbol_quality = entry_quality.get("by_symbol") or []
+    if symbol_quality:
+        lines.append("")
+        lines.append("| symbol | count | expected_net_bps | expected_open_bps | actual_open_bps | slippage_bps | hedge_lag_ms_avg |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for row in symbol_quality[:10]:
+            lines.append(
+                "| "
+                f"{row.get('symbol') or '-'} | "
+                f"{int(row.get('count') or 0)} | "
+                f"{float(row.get('expected_net_edge_bps_avg') or 0):.2f} | "
+                f"{float(row.get('expected_open_edge_bps_avg') or 0):.2f} | "
+                f"{float(row.get('actual_open_edge_bps_avg') or 0):.2f} | "
+                f"{float(row.get('slippage_bps_avg') or 0):.2f} | "
+                f"{float(row.get('first_fill_to_hedge_fill_ms_avg') or 0):.1f} |"
+            )
+    worst_pairs = entry_quality.get("worst_pairs") or []
+    if worst_pairs:
+        lines.append("")
+        lines.append("| symbol | pair | expected_net_bps | expected_open_bps | actual_open_bps | slippage_bps | hedge_lag_ms |")
+        lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+        for row in worst_pairs:
+            lines.append(
+                "| "
+                f"{row.get('symbol') or '-'} | "
+                f"{row.get('pair') or '-'} | "
+                f"{float(row.get('expected_net_edge_bps') or 0):.2f} | "
+                f"{float(row.get('expected_open_edge_bps') or 0):.2f} | "
+                f"{float(row.get('actual_open_edge_bps') or 0):.2f} | "
+                f"{float(row.get('slippage_bps') or 0):.2f} | "
+                f"{float(row.get('first_fill_to_hedge_fill_ms') or 0):.1f} |"
+            )
     lines.append("")
     lines.append("## Entry Submit Price Age")
     if int(submit_telemetry.get("preflight_count") or 0) <= 0:

@@ -101,6 +101,7 @@
 ### [reference](/home/jonghan/findalpha/arbitrage/funding%20fee/reference)
 - 현재는 [reference/question4](/home/jonghan/findalpha/arbitrage/funding%20fee/reference/question4) 레퍼런스를 여기에 모아뒀습니다.
 - 실운영 코드가 아니라 비교/아이디어 참고용입니다.
+- [reference/개발요구사항.txt](/home/jonghan/findalpha/arbitrage/funding%20fee/reference/개발요구사항.txt)는 [docs/development_requirements_checklist.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/development_requirements_checklist.md)에 운영 체크리스트로 반영합니다.
 
 ## 9. 지금 기준으로 무시해도 되는 것
 
@@ -134,3 +135,4 @@
 1. [README.md](/home/jonghan/findalpha/arbitrage/funding%20fee/README.md)
 2. [docs/runbook.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/runbook.md)
 3. [docs/env_vars.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/env_vars.md)
+4. [docs/development_requirements_checklist.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/development_requirements_checklist.md)

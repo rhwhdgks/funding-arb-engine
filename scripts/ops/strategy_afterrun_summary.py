@@ -23,6 +23,7 @@ OPEN_ORDER_STATUSES = (
 )
 
 FAIL_EVENT_TYPES = (
+    "entry_bad_edge_rollback_failed",
     "pair_entry_overfill_detected",
     "pair_entry_overfill_flatten_failed",
     "pair_close_leg_failed",
@@ -36,6 +37,14 @@ WARN_EVENT_TYPES = (
 )
 
 INFO_EVENT_TYPES = (
+    "maker_entry_preposition_candidate_selected",
+    "maker_entry_order_submitted",
+    "maker_entry_fill_detected",
+    "maker_entry_order_cancelled",
+    "maker_entry_symbol_paused",
+    "maker_entry_order_disappeared_settle_started",
+    "maker_entry_order_disappeared_without_fill",
+    "maker_entry_fill_not_hedgeable",
     "pair_entry_micro_partial_detected",
     "pair_entry_micro_residual_ignored",
     "pair_direction_micro_residual_detected",
@@ -44,6 +53,9 @@ INFO_EVENT_TYPES = (
     "entry_order_disappeared_resolved",
     "entry_limit_order_submit_preflight",
     "entry_limit_order_submit_result",
+    "entry_post_first_fill_edge_check",
+    "entry_aborted_after_first_fill_bad_edge",
+    "entry_quality_analysis",
 )
 
 SUBMIT_MARKET_AGE_WARN_MS = 1500

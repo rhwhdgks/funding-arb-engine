@@ -43,6 +43,7 @@ from src.strategy.logging import (
     log_pair_opened,
     log_residual_ignored,
 )
+from src.strategy.maker_entry_engine import MakerEntryEngine, MakerEntryHooks
 from src.strategy.risk_gate import (
     OrderSlot,
     RiskGateContext,
@@ -50,6 +51,7 @@ from src.strategy.risk_gate import (
     evaluate_entry_risk,
 )
 from src.strategy.close_policy import close_fee_cost_usd, evaluate_close_policy, pair_entry_reference_notional_usd
+from src.strategy.entry_policy import evaluate_post_first_fill_edge
 from src.strategy.rules import (
     close_first_leg_plan,
     close_hedge_leg_plan,
@@ -83,6 +85,7 @@ load_dotenv()
 
 SUPPORTED_SYMBOLS_CACHE_DIR = PROJECT_ROOT / "logs" / "supported_symbols_cache"
 EPS = 1e-9
+_BOOTSTRAP_SUCCESS_CACHE: set[tuple[str, str, int, str]] = set()
 
 
 def flatten_leg_result_payload(result: FlattenLegResult | None) -> dict[str, Any] | None:
@@ -692,6 +695,8 @@ def apply_open_pair_capacity_blocks(
     open_pairs: dict[str, OpenPairState],
     config: StrategyConfig,
 ) -> list[PairCandidate]:
+    if config.max_open_pairs <= 0:
+        return rank_candidates(candidates)
     active_count = sum(1 for pair in open_pairs.values() if pair.status not in {"closed", "failed"})
     for candidate in candidates:
         if active_count >= config.max_open_pairs and "max_open_pairs_reached" not in candidate.block_reasons:
@@ -1156,6 +1161,22 @@ def passive_entry_target_price(
     )
 
 
+def required_edge_entry_target_price(
+    candidate: PairCandidate,
+    first_exchange_name: str,
+    first_side: str,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> float:
+    return order_price_policy.required_edge_entry_target_price(
+        candidate,
+        first_exchange_name,
+        first_side,
+        exchanges,
+        config,
+    )
+
+
 def normalize_exchange_qty(exchange: Any, symbol: str, qty: float) -> float:
     meta = getattr(exchange, "ticker_info", {}).get(symbol, {}) or {}
     step_size = _safe_float(meta.get("step_size"), 0.0)
@@ -1467,6 +1488,107 @@ def current_pair_close_edge(pair: OpenPairState, exchanges: dict[str, Any]) -> t
     return long_bid, short_ask, close_edge_usd
 
 
+def current_pair_open_edge(pair: OpenPairState, exchanges: dict[str, Any]) -> tuple[float, float, float]:
+    long_snapshot = exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol)
+    short_snapshot = exchanges[pair.short_exchange].get_symbol_snapshot(pair.symbol)
+    long_ask = extract_best_ask(long_snapshot)
+    short_bid = extract_best_bid(short_snapshot)
+    open_edge_usd = pair.qty * (short_bid - long_ask) if long_ask > 0 and short_bid > 0 else 0.0
+    return long_ask, short_bid, open_edge_usd
+
+
+def bootstrap_cache_key(exchange_name: str, symbol: str, config: StrategyConfig) -> tuple[str, str, int, str]:
+    return (
+        normalize_exchange_name(exchange_name),
+        normalize_symbol(symbol),
+        int(config.leverage),
+        str(config.margin_mode or "").strip().lower(),
+    )
+
+
+async def bootstrap_exchange_symbol_once(
+    exchange_name: str,
+    symbol: str,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> list[dict[str, Any]]:
+    if not config.bootstrap_on_entry:
+        return []
+
+    exchange_name = normalize_exchange_name(exchange_name)
+    symbol = normalize_symbol(symbol)
+    key = bootstrap_cache_key(exchange_name, symbol, config)
+    if key in _BOOTSTRAP_SUCCESS_CACHE:
+        return []
+
+    exchange = exchanges.get(exchange_name)
+    if exchange is None:
+        return [
+            {
+                "exchange": exchange_name,
+                "symbol": symbol,
+                "field": "bootstrap",
+                "error": "exchange_not_configured",
+            }
+        ]
+
+    result = await exchange.bootstrap_symbol(
+        symbol=symbol,
+        leverage=config.leverage,
+        margin_mode=config.margin_mode,
+    )
+    failures = bootstrap_result_failures(
+        exchange_name=exchange_name,
+        symbol=symbol,
+        result=result,
+    )
+    if failures:
+        return failures
+
+    _BOOTSTRAP_SUCCESS_CACHE.add(key)
+    return []
+
+
+async def bootstrap_strategy_symbols_once(
+    exchanges: dict[str, Any],
+    symbols: list[str],
+    config: StrategyConfig,
+) -> list[dict[str, Any]]:
+    if not config.bootstrap_on_entry:
+        return []
+
+    failures: list[dict[str, Any]] = []
+    attempted_keys: set[tuple[str, str]] = set()
+    for exchange_name in sorted(exchanges.keys()):
+        for symbol in symbols:
+            attempted_keys.add((normalize_exchange_name(exchange_name), normalize_symbol(symbol)))
+            failures.extend(
+                await bootstrap_exchange_symbol_once(
+                    exchange_name,
+                    symbol,
+                    exchanges,
+                    config,
+                )
+            )
+
+    failed_keys = {
+        (normalize_exchange_name(str(row.get("exchange", ""))), normalize_symbol(str(row.get("symbol", ""))))
+        for row in failures
+        if row.get("exchange") and row.get("symbol")
+    }
+    record_live_event(
+        config,
+        "startup_bootstrap_symbols_done",
+        exchange_count=len(exchanges),
+        symbol_count=len(symbols),
+        attempted_count=len(attempted_keys),
+        success_count=max(0, len(attempted_keys) - len(failed_keys)),
+        failure_count=len(failures),
+        failures=failures[:20],
+    )
+    return failures
+
+
 async def bootstrap_candidate_exchanges(
     candidate: PairCandidate,
     exchanges: dict[str, Any],
@@ -1476,16 +1598,12 @@ async def bootstrap_candidate_exchanges(
         return []
     failures: list[dict[str, Any]] = []
     for exchange_name in {candidate.long_exchange, candidate.short_exchange}:
-        result = await exchanges[exchange_name].bootstrap_symbol(
-            symbol=candidate.symbol,
-            leverage=config.leverage,
-            margin_mode=config.margin_mode,
-        )
         failures.extend(
-            bootstrap_result_failures(
-                exchange_name=exchange_name,
-                symbol=candidate.symbol,
-                result=result,
+            await bootstrap_exchange_symbol_once(
+                exchange_name,
+                candidate.symbol,
+                exchanges,
+                config,
             )
         )
     return failures
@@ -1592,6 +1710,7 @@ async def execute_requoting_limit_leg(
     log_prefix: str,
     probe_reason_prefix: str,
     last_order_submit_ms_by_key: dict[tuple[str, str, str], int] | None = None,
+    telemetry: dict[str, Any] | None = None,
 ) -> tuple[float, dict[str, Any] | None, float]:
     return await _execution_execute_requoting_limit_leg(
         exchange=exchange,
@@ -1621,6 +1740,7 @@ async def execute_requoting_limit_leg(
         record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         last_order_submit_ms_by_key=last_order_submit_ms_by_key,
         extract_position_qty=extract_position_qty,
+        telemetry=telemetry,
         eps=EPS,
     )
 
@@ -1739,12 +1859,25 @@ def classify_flatten_failure(order_result: Any, exc: Exception | None = None) ->
     return ("remaining_actionable_after_retries", code, message, False)
 
 
-async def refresh_symbol_state(exchange: Any, symbol: str, reason: str) -> None:
+async def refresh_symbol_state(
+    exchange: Any,
+    symbol: str,
+    reason: str,
+    *,
+    include_account: bool = True,
+    include_open_orders: bool = True,
+    include_funding: bool = False,
+) -> None:
     reconcile = getattr(exchange, "reconcile_state", None)
     if not callable(reconcile):
         return
     try:
-        await reconcile(include_account=True, include_open_orders=True, include_funding=False, reason=reason)
+        await reconcile(
+            include_account=include_account,
+            include_open_orders=include_open_orders,
+            include_funding=include_funding,
+            reason=reason,
+        )
     except TypeError:
         try:
             await reconcile(reason=reason)
@@ -2621,14 +2754,18 @@ async def recover_account_imbalances(
     open_pairs: dict[str, OpenPairState],
     assumed_flat_until_ms: dict[tuple[str, str], int],
     next_retry_ms_by_key: dict[tuple[str, str, str, float], int],
+    skip_symbols: set[str] | None = None,
 ) -> None:
     if not config.enable_live or not config.account_imbalance_hedge_enabled:
         return
 
     active_symbols = active_open_pair_symbols(open_pairs)
+    skip_symbols = {symbol.upper() for symbol in (skip_symbols or set())}
     current_ms = now_ms()
 
     for symbol in symbols:
+        if symbol.upper() in skip_symbols:
+            continue
         symbol_has_open_pair = symbol in active_symbols
 
         for left_exchange, right_exchange in config.allowed_pairs:
@@ -2854,6 +2991,8 @@ async def enter_pair_limit_then_hedge(
     assumed_flat_until_ms: dict[tuple[str, str], int] | None = None,
     last_entry_order_submit_ms_by_key: dict[tuple[str, str, str], int] | None = None,
 ) -> OpenPairState | None:
+    entry_started_ms = now_ms()
+    entry_telemetry: dict[str, Any] = {"entry_started_ms": entry_started_ms}
     symbol = candidate.symbol
     first_exchange_name, first_side = first_leg_plan(candidate, config)
     hedge_exchange_name, hedge_side = hedge_leg_plan(candidate, config)
@@ -2949,7 +3088,9 @@ async def enter_pair_limit_then_hedge(
         log_prefix="enter",
         probe_reason_prefix="strategy_entry_first",
         last_order_submit_ms_by_key=last_entry_order_submit_ms_by_key,
+        telemetry=entry_telemetry,
     )
+    first_leg_done_ms = now_ms()
 
     if first_filled_qty <= EPS:
         return None
@@ -3025,6 +3166,97 @@ async def enter_pair_limit_then_hedge(
                 f"잔량={first_fill_residual_qty:.6f} 사유=최소주문수량미만"
             )
 
+    post_fill_edge_decision = evaluate_post_first_fill_edge(
+        candidate=candidate,
+        config=config,
+        first_exchange_name=first_exchange_name,
+        first_fill_price=first_price_used,
+        hedge_price=_safe_float(hedge_preview.get("price"), 0.0),
+        qty=hedgeable_first_fill_qty,
+    )
+    record_live_event(
+        config,
+        "entry_post_first_fill_edge_check",
+        candidate_id=candidate.id,
+        symbol=symbol,
+        first_exchange=first_exchange_name,
+        first_side=first_side,
+        hedge_exchange=hedge_exchange_name,
+        hedge_side=hedge_side,
+        first_filled_qty=first_filled_qty,
+        hedgeable_qty=hedgeable_first_fill_qty,
+        first_fill_price=first_price_used,
+        hedge_price=post_fill_edge_decision.hedge_price,
+        long_price=post_fill_edge_decision.long_price,
+        short_price=post_fill_edge_decision.short_price,
+        actual_open_edge_usd=post_fill_edge_decision.actual_open_edge_usd,
+        actual_open_edge_bps=post_fill_edge_decision.actual_open_edge_bps,
+        min_open_edge_bps=post_fill_edge_decision.min_open_edge_bps,
+        actual_estimated_net_edge_usd=post_fill_edge_decision.actual_estimated_net_edge_usd,
+        actual_estimated_net_edge_bps=post_fill_edge_decision.actual_estimated_net_edge_bps,
+        min_net_edge_bps=post_fill_edge_decision.min_net_edge_bps,
+        reference_notional_usd=post_fill_edge_decision.reference_notional_usd,
+        can_hedge=post_fill_edge_decision.can_hedge,
+        reason=post_fill_edge_decision.reason,
+        expected_net_edge_bps=candidate.expected_net_edge_bps,
+        expected_open_edge_bps=candidate.entry_open_edge_bps,
+    )
+    if not post_fill_edge_decision.can_hedge:
+        print(
+            f"[strategy][enter][abort] first_fill_edge_bad symbol={symbol} "
+            f"actual_open_edge_bps={post_fill_edge_decision.actual_open_edge_bps:.4f} "
+            f"threshold_bps={post_fill_edge_decision.min_open_edge_bps:.4f} "
+            f"actual_net_edge_bps={post_fill_edge_decision.actual_estimated_net_edge_bps:.4f} "
+            f"net_threshold_bps={post_fill_edge_decision.min_net_edge_bps:.4f} "
+            f"reason={post_fill_edge_decision.reason}"
+        )
+        flattened = await emergency_flatten_symbol(
+            first_exchange,
+            symbol,
+            aggressive_bps=config.emergency_flatten_bps,
+        )
+        record_live_event(
+            config,
+            "entry_aborted_after_first_fill_bad_edge",
+            candidate_id=candidate.id,
+            symbol=symbol,
+            first_exchange=first_exchange_name,
+            first_side=first_side,
+            first_filled_qty=first_filled_qty,
+            hedgeable_qty=hedgeable_first_fill_qty,
+            first_fill_price=first_price_used,
+            hedge_price=post_fill_edge_decision.hedge_price,
+            actual_open_edge_usd=post_fill_edge_decision.actual_open_edge_usd,
+            actual_open_edge_bps=post_fill_edge_decision.actual_open_edge_bps,
+            min_open_edge_bps=post_fill_edge_decision.min_open_edge_bps,
+            actual_estimated_net_edge_usd=post_fill_edge_decision.actual_estimated_net_edge_usd,
+            actual_estimated_net_edge_bps=post_fill_edge_decision.actual_estimated_net_edge_bps,
+            min_net_edge_bps=post_fill_edge_decision.min_net_edge_bps,
+            reason=post_fill_edge_decision.reason,
+            rollback_ok=flattened,
+        )
+        if not flattened:
+            record_live_event(
+                config,
+                "entry_bad_edge_rollback_failed",
+                candidate_id=candidate.id,
+                symbol=symbol,
+                first_exchange=first_exchange_name,
+                first_side=first_side,
+                first_filled_qty=first_filled_qty,
+                reason=post_fill_edge_decision.reason,
+            )
+            log_danger(
+                title="진입후나쁜갭정리실패",
+                symbol=symbol,
+                first_exchange=first_exchange_name,
+                first_qty=f"{first_filled_qty:.6f}",
+                actual_open_edge_bps=f"{post_fill_edge_decision.actual_open_edge_bps:.4f}",
+                actual_net_edge_bps=f"{post_fill_edge_decision.actual_estimated_net_edge_bps:.4f}",
+            )
+        return None
+
+    hedge_start_ms = now_ms()
     hedge_execution = await execute_residual_hedge(
         stage_label="entry",
         exchange_name=hedge_exchange_name,
@@ -3048,6 +3280,7 @@ async def enter_pair_limit_then_hedge(
         settle_grace_sec=settle_grace_sec,
         record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
+    hedge_done_ms = now_ms()
     hedged_qty = hedge_execution.filled_qty
     hedge_price_used = hedge_execution.avg_price
     remaining_qty = hedge_execution.remaining_qty
@@ -3313,6 +3546,77 @@ async def enter_pair_limit_then_hedge(
         )
     pair_id = f"{symbol}:{candidate.long_exchange}:{candidate.short_exchange}:{int(time.time() * 1000)}"
 
+    actual_reference_notional_usd = max(pair_qty * ((long_entry_price + short_entry_price) / 2.0), 0.0)
+    actual_entry_open_edge_usd = pair_qty * (short_entry_price - long_entry_price)
+    actual_entry_open_edge_bps = (
+        actual_entry_open_edge_usd / actual_reference_notional_usd * 10000.0
+        if actual_reference_notional_usd > EPS
+        else 0.0
+    )
+    expected_open_edge_usd_for_actual_qty = pair_qty * (candidate.short_bid - candidate.long_ask)
+    entry_edge_slippage_usd = actual_entry_open_edge_usd - expected_open_edge_usd_for_actual_qty
+    entry_edge_slippage_bps = actual_entry_open_edge_bps - candidate.entry_open_edge_bps
+    qty_scale = pair_qty / candidate.executable_qty if candidate.executable_qty > EPS else 1.0
+    actual_estimated_net_edge_usd = (
+        actual_entry_open_edge_usd
+        + candidate.effective_funding_pnl_usd * qty_scale
+        - candidate.open_fee_cost_usd * qty_scale
+        - candidate.expected_close_cost_usd * qty_scale
+        - candidate.risk_buffer_usd * qty_scale
+        - candidate.stale_data_penalty_usd * qty_scale
+    )
+    actual_estimated_net_edge_bps = (
+        actual_estimated_net_edge_usd / actual_reference_notional_usd * 10000.0
+        if actual_reference_notional_usd > EPS
+        else 0.0
+    )
+    first_fill_detected_ms = int(entry_telemetry.get("first_fill_detected_ms") or first_leg_done_ms)
+    record_live_event(
+        config,
+        "entry_quality_analysis",
+        pair_id=pair_id,
+        symbol=symbol,
+        long_exchange=candidate.long_exchange,
+        short_exchange=candidate.short_exchange,
+        qty=pair_qty,
+        requested_qty=executable_qty,
+        expected_open_edge_usd=candidate.entry_open_edge_usd,
+        expected_open_edge_bps=candidate.entry_open_edge_bps,
+        expected_open_edge_usd_for_actual_qty=expected_open_edge_usd_for_actual_qty,
+        expected_net_edge_usd=candidate.expected_net_edge_usd,
+        expected_net_edge_bps=candidate.expected_net_edge_bps,
+        actual_open_edge_usd=actual_entry_open_edge_usd,
+        actual_open_edge_bps=actual_entry_open_edge_bps,
+        actual_estimated_net_edge_usd=actual_estimated_net_edge_usd,
+        actual_estimated_net_edge_bps=actual_estimated_net_edge_bps,
+        entry_edge_slippage_usd=entry_edge_slippage_usd,
+        entry_edge_slippage_bps=entry_edge_slippage_bps,
+        first_exchange=first_exchange_name,
+        first_side=first_side,
+        hedge_exchange=hedge_exchange_name,
+        hedge_side=hedge_side,
+        first_leg_fill_price=first_price_used,
+        hedge_fill_price=hedge_price_used,
+        long_entry_price=long_entry_price,
+        short_entry_price=short_entry_price,
+        candidate_long_ask=candidate.long_ask,
+        candidate_short_bid=candidate.short_bid,
+        candidate_market_age_ms=entry_telemetry.get("first_market_age_ms"),
+        candidate_stale_age_ms=entry_telemetry.get("first_stale_age_ms"),
+        first_submit_latency_ms=entry_telemetry.get("first_submit_latency_ms"),
+        first_submit_start_ms=entry_telemetry.get("first_submit_start_ms"),
+        first_submit_end_ms=entry_telemetry.get("first_submit_end_ms"),
+        first_fill_detected_ms=first_fill_detected_ms,
+        first_leg_done_ms=first_leg_done_ms,
+        hedge_start_ms=hedge_start_ms,
+        hedge_done_ms=hedge_done_ms,
+        first_leg_elapsed_ms=max(first_leg_done_ms - entry_started_ms, 0),
+        first_fill_to_hedge_fill_ms=max(hedge_done_ms - first_fill_detected_ms, 0),
+        hedge_elapsed_ms=max(hedge_done_ms - hedge_start_ms, 0),
+        total_entry_elapsed_ms=max(hedge_done_ms - entry_started_ms, 0),
+        first_leg_submit_count=int(entry_telemetry.get("submit_count") or 0),
+    )
+
     log_pair_opened(
         pair_id=pair_id,
         symbol=symbol,
@@ -3349,9 +3653,448 @@ async def enter_pair_limit_then_hedge(
             "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
             "expected_net_edge_usd": candidate.expected_net_edge_usd,
             "expected_net_edge_bps": candidate.expected_net_edge_bps,
+            "actual_entry_open_edge_usd": actual_entry_open_edge_usd,
+            "actual_entry_open_edge_bps": actual_entry_open_edge_bps,
+            "actual_estimated_net_edge_usd": actual_estimated_net_edge_usd,
+            "actual_estimated_net_edge_bps": actual_estimated_net_edge_bps,
+            "entry_edge_slippage_usd": entry_edge_slippage_usd,
+            "entry_edge_slippage_bps": entry_edge_slippage_bps,
         },
         entry_position_delta={
             "account_pair_qty": account_pair_qty,
+            "long_pre_qty": pre_long_qty,
+            "long_qty_after": long_qty_after,
+            "long_entry_delta": long_entry_delta,
+            "short_pre_qty": pre_short_qty,
+            "short_qty_after": short_qty_after,
+            "short_entry_delta": short_entry_delta,
+            "first_exchange": first_exchange_name,
+            "first_side": first_side,
+            "first_filled_qty": first_filled_qty,
+            "hedge_exchange": hedge_exchange_name,
+            "hedge_side": hedge_side,
+            "hedged_qty": hedged_qty,
+        },
+    )
+    return pair
+
+
+async def complete_entry_after_maker_first_fill(
+    *,
+    candidate: PairCandidate,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+    first_exchange_name: str,
+    first_side: str,
+    hedge_exchange_name: str,
+    hedge_side: str,
+    pre_qty_first: float,
+    pre_qty_hedge: float,
+    first_filled_qty: float,
+    first_price_used: float,
+    executable_qty: float,
+    assumed_flat_until_ms: dict[tuple[str, str], int] | None,
+    entry_started_ms: int,
+    source: str = "maker_entry_engine",
+) -> OpenPairState | None:
+    symbol = candidate.symbol
+    first_exchange = exchanges[first_exchange_name]
+    hedge_exchange = exchanges[hedge_exchange_name]
+    first_leg_done_ms = now_ms()
+
+    hedge_preview = exchange_order_execution_preview(
+        hedge_exchange,
+        symbol,
+        hedge_side,
+        first_filled_qty,
+        config.close_aggressive_bps,
+    )
+    hedgeable_first_fill_qty = _safe_float(hedge_preview.get("executable_qty"), 0.0)
+    if config.maker_entry_q4_fast_hedge:
+        hedge_price = _safe_float(hedge_preview.get("price"), 0.0)
+        hedgeable_first_fill_qty = normalize_exchange_qty_for_order(
+            hedge_exchange,
+            symbol,
+            first_filled_qty,
+            hedge_price,
+        )
+    if hedgeable_first_fill_qty <= EPS:
+        flattened = await emergency_flatten_symbol(
+            first_exchange,
+            symbol,
+            aggressive_bps=config.emergency_flatten_bps,
+        )
+        record_live_event(
+            config,
+            "maker_entry_fill_not_hedgeable",
+            candidate_id=candidate.id,
+            symbol=symbol,
+            first_exchange=first_exchange_name,
+            first_side=first_side,
+            first_filled_qty=first_filled_qty,
+            hedge_min_qty=_safe_float(hedge_preview.get("min_executable_qty"), 0.0),
+            rollback_ok=flattened,
+        )
+        if not flattened:
+            log_danger(title="메이커체결헤지불가정리실패", symbol=symbol, first_qty=f"{first_filled_qty:.6f}")
+        return None
+
+    if config.maker_entry_q4_fast_hedge:
+        record_live_event(
+            config,
+            "maker_entry_q4_fast_hedge",
+            source=source,
+            candidate_id=candidate.id,
+            symbol=symbol,
+            first_exchange=first_exchange_name,
+            first_side=first_side,
+            hedge_exchange=hedge_exchange_name,
+            hedge_side=hedge_side,
+            first_filled_qty=first_filled_qty,
+            hedgeable_qty=hedgeable_first_fill_qty,
+            first_fill_price=first_price_used,
+            hedge_price=_safe_float(hedge_preview.get("price"), 0.0),
+            reason="question4_style_skip_post_fill_edge_check",
+        )
+    else:
+        post_fill_edge_decision = evaluate_post_first_fill_edge(
+            candidate=candidate,
+            config=config,
+            first_exchange_name=first_exchange_name,
+            first_fill_price=first_price_used,
+            hedge_price=_safe_float(hedge_preview.get("price"), 0.0),
+            qty=hedgeable_first_fill_qty,
+        )
+        record_live_event(
+            config,
+            "entry_post_first_fill_edge_check",
+            source=source,
+            candidate_id=candidate.id,
+            symbol=symbol,
+            first_exchange=first_exchange_name,
+            first_side=first_side,
+            hedge_exchange=hedge_exchange_name,
+            hedge_side=hedge_side,
+            first_filled_qty=first_filled_qty,
+            hedgeable_qty=hedgeable_first_fill_qty,
+            first_fill_price=first_price_used,
+            hedge_price=post_fill_edge_decision.hedge_price,
+            long_price=post_fill_edge_decision.long_price,
+            short_price=post_fill_edge_decision.short_price,
+            actual_open_edge_usd=post_fill_edge_decision.actual_open_edge_usd,
+            actual_open_edge_bps=post_fill_edge_decision.actual_open_edge_bps,
+            min_open_edge_bps=post_fill_edge_decision.min_open_edge_bps,
+            actual_estimated_net_edge_usd=post_fill_edge_decision.actual_estimated_net_edge_usd,
+            actual_estimated_net_edge_bps=post_fill_edge_decision.actual_estimated_net_edge_bps,
+            min_net_edge_bps=post_fill_edge_decision.min_net_edge_bps,
+            reference_notional_usd=post_fill_edge_decision.reference_notional_usd,
+            can_hedge=post_fill_edge_decision.can_hedge,
+            reason=post_fill_edge_decision.reason,
+            expected_net_edge_bps=candidate.expected_net_edge_bps,
+            expected_open_edge_bps=candidate.entry_open_edge_bps,
+        )
+        if not post_fill_edge_decision.can_hedge:
+            flattened = await emergency_flatten_symbol(
+                first_exchange,
+                symbol,
+                aggressive_bps=config.emergency_flatten_bps,
+            )
+            record_live_event(
+                config,
+                "entry_aborted_after_first_fill_bad_edge",
+                source=source,
+                candidate_id=candidate.id,
+                symbol=symbol,
+                first_exchange=first_exchange_name,
+                first_side=first_side,
+                first_filled_qty=first_filled_qty,
+                hedgeable_qty=hedgeable_first_fill_qty,
+                first_fill_price=first_price_used,
+                hedge_price=post_fill_edge_decision.hedge_price,
+                actual_open_edge_usd=post_fill_edge_decision.actual_open_edge_usd,
+                actual_open_edge_bps=post_fill_edge_decision.actual_open_edge_bps,
+                min_open_edge_bps=post_fill_edge_decision.min_open_edge_bps,
+                actual_estimated_net_edge_usd=post_fill_edge_decision.actual_estimated_net_edge_usd,
+                actual_estimated_net_edge_bps=post_fill_edge_decision.actual_estimated_net_edge_bps,
+                min_net_edge_bps=post_fill_edge_decision.min_net_edge_bps,
+                reason=post_fill_edge_decision.reason,
+                rollback_ok=flattened,
+            )
+            if not flattened:
+                record_live_event(
+                    config,
+                    "entry_bad_edge_rollback_failed",
+                    source=source,
+                    candidate_id=candidate.id,
+                    symbol=symbol,
+                    first_exchange=first_exchange_name,
+                    first_side=first_side,
+                    first_filled_qty=first_filled_qty,
+                    reason=post_fill_edge_decision.reason,
+                )
+                log_danger(
+                    title="메이커체결나쁜갭정리실패",
+                    symbol=symbol,
+                    first_exchange=first_exchange_name,
+                    first_qty=f"{first_filled_qty:.6f}",
+                    actual_open_edge_bps=f"{post_fill_edge_decision.actual_open_edge_bps:.4f}",
+                    actual_net_edge_bps=f"{post_fill_edge_decision.actual_estimated_net_edge_bps:.4f}",
+                )
+            return None
+
+    hedge_start_ms = now_ms()
+    hedge_execution = await execute_residual_hedge(
+        stage_label="entry",
+        exchange_name=hedge_exchange_name,
+        exchange=hedge_exchange,
+        symbol=symbol,
+        side=hedge_side,
+        pre_qty=pre_qty_hedge,
+        target_qty=hedgeable_first_fill_qty,
+        config=config,
+        is_close=False,
+        eps=EPS,
+        extract_position_qty=extract_position_qty,
+        marketable_limit_price_with_bps=marketable_limit_price_with_bps,
+        print_verbose=print_verbose,
+        use_reduce_only_market_close=use_reduce_only_market_close,
+        resolve_effective_order_qty=resolve_effective_order_qty,
+        extract_order_avg_price=extract_order_avg_price,
+        wait_for_position_fill=wait_for_position_fill,
+        wait_for_position_close=wait_for_position_close,
+        cancel_if_open=cancel_if_open,
+        settle_grace_sec=settle_grace_sec,
+        record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
+    )
+    hedge_done_ms = now_ms()
+    hedged_qty = hedge_execution.filled_qty
+    hedge_price_used = hedge_execution.avg_price
+    if hedge_execution.remaining_qty > EPS:
+        log_hedge_incomplete(
+            symbol=symbol,
+            first_filled_qty=first_filled_qty,
+            hedged_qty=hedged_qty,
+            remaining_qty=hedge_execution.remaining_qty,
+        )
+        await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+        return None
+
+    pre_qty_by_exchange = {
+        first_exchange_name: pre_qty_first,
+        hedge_exchange_name: pre_qty_hedge,
+    }
+    pre_long_qty = pre_qty_by_exchange.get(candidate.long_exchange, 0.0)
+    pre_short_qty = pre_qty_by_exchange.get(candidate.short_exchange, 0.0)
+
+    async def refresh_entry_deltas(reason_prefix: str) -> tuple[dict[str, Any], dict[str, Any], float, float, float, float, float]:
+        await refresh_symbol_state(
+            exchanges[candidate.long_exchange],
+            symbol,
+            f"{reason_prefix}_long",
+            include_account=True,
+            include_open_orders=False,
+            include_funding=False,
+        )
+        await refresh_symbol_state(
+            exchanges[candidate.short_exchange],
+            symbol,
+            f"{reason_prefix}_short",
+            include_account=True,
+            include_open_orders=False,
+            include_funding=False,
+        )
+        long_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
+        short_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
+        long_qty = extract_position_qty(long_snapshot)
+        short_qty = extract_position_qty(short_snapshot)
+        long_delta = entry_delta_qty(pre_long_qty, long_qty, "long")
+        short_delta = entry_delta_qty(pre_short_qty, short_qty, "short")
+        return long_snapshot, short_snapshot, long_qty, short_qty, long_delta, short_delta, min(long_delta, short_delta)
+
+    (
+        long_snapshot_after,
+        short_snapshot_after,
+        long_qty_after,
+        short_qty_after,
+        long_entry_delta,
+        short_entry_delta,
+        pair_qty,
+    ) = await refresh_entry_deltas("maker_entry_post_open")
+
+    delta_attempts = 1
+    max_delta_attempts = 4
+    while pair_qty <= EPS and min(first_filled_qty, hedged_qty) > EPS and delta_attempts < max_delta_attempts:
+        delta_attempts += 1
+        record_live_event(
+            config,
+            "maker_entry_delta_waiting_for_account_snapshot",
+            candidate_id=candidate.id,
+            symbol=symbol,
+            attempt=delta_attempts,
+            max_attempts=max_delta_attempts,
+            first_filled_qty=first_filled_qty,
+            hedged_qty=hedged_qty,
+            long_qty_after=long_qty_after,
+            short_qty_after=short_qty_after,
+            long_entry_delta=long_entry_delta,
+            short_entry_delta=short_entry_delta,
+        )
+        await asyncio.sleep(config.action_settle_wait_sec)
+        (
+            long_snapshot_after,
+            short_snapshot_after,
+            long_qty_after,
+            short_qty_after,
+            long_entry_delta,
+            short_entry_delta,
+            pair_qty,
+        ) = await refresh_entry_deltas(f"maker_entry_post_delta_retry_{delta_attempts}")
+
+    if pair_qty <= EPS:
+        await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+        record_live_event(
+            config,
+            "maker_entry_delta_missing",
+            candidate_id=candidate.id,
+            symbol=symbol,
+            first_filled_qty=first_filled_qty,
+            hedged_qty=hedged_qty,
+            long_qty_after=long_qty_after,
+            short_qty_after=short_qty_after,
+            long_entry_delta=long_entry_delta,
+            short_entry_delta=short_entry_delta,
+            attempts=delta_attempts,
+        )
+        return None
+
+    long_order_price = first_price_used if first_exchange_name == candidate.long_exchange else hedge_price_used
+    short_order_price = hedge_price_used if hedge_exchange_name == candidate.short_exchange else first_price_used
+    long_entry_price = (
+        extract_position_entry_price(long_snapshot_after)
+        or long_order_price
+        or extract_mid_price(long_snapshot_after)
+    )
+    short_entry_price = (
+        extract_position_entry_price(short_snapshot_after)
+        or short_order_price
+        or extract_mid_price(short_snapshot_after)
+    )
+    if long_entry_price <= 0 or short_entry_price <= 0:
+        await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+        log_danger(
+            title="메이커진입평단누락",
+            symbol=symbol,
+            long_entry=f"{long_entry_price:.8f}",
+            short_entry=f"{short_entry_price:.8f}",
+        )
+        return None
+
+    pair_id = f"{symbol}:{candidate.long_exchange}:{candidate.short_exchange}:{int(time.time() * 1000)}"
+    reference_notional_usd = max(pair_qty * ((long_entry_price + short_entry_price) / 2.0), 0.0)
+    actual_entry_open_edge_usd = pair_qty * (short_entry_price - long_entry_price)
+    actual_entry_open_edge_bps = (
+        actual_entry_open_edge_usd / reference_notional_usd * 10000.0
+        if reference_notional_usd > EPS
+        else 0.0
+    )
+    expected_open_edge_usd_for_actual_qty = pair_qty * (candidate.short_bid - candidate.long_ask)
+    entry_edge_slippage_usd = actual_entry_open_edge_usd - expected_open_edge_usd_for_actual_qty
+    entry_edge_slippage_bps = actual_entry_open_edge_bps - candidate.entry_open_edge_bps
+    qty_scale = pair_qty / candidate.executable_qty if candidate.executable_qty > EPS else 1.0
+    actual_estimated_net_edge_usd = (
+        actual_entry_open_edge_usd
+        + candidate.effective_funding_pnl_usd * qty_scale
+        - candidate.open_fee_cost_usd * qty_scale
+        - candidate.expected_close_cost_usd * qty_scale
+        - candidate.risk_buffer_usd * qty_scale
+        - candidate.stale_data_penalty_usd * qty_scale
+    )
+    actual_estimated_net_edge_bps = (
+        actual_estimated_net_edge_usd / reference_notional_usd * 10000.0
+        if reference_notional_usd > EPS
+        else 0.0
+    )
+    record_live_event(
+        config,
+        "entry_quality_analysis",
+        source=source,
+        pair_id=pair_id,
+        symbol=symbol,
+        long_exchange=candidate.long_exchange,
+        short_exchange=candidate.short_exchange,
+        qty=pair_qty,
+        requested_qty=executable_qty,
+        expected_open_edge_usd=candidate.entry_open_edge_usd,
+        expected_open_edge_bps=candidate.entry_open_edge_bps,
+        expected_open_edge_usd_for_actual_qty=expected_open_edge_usd_for_actual_qty,
+        expected_net_edge_usd=candidate.expected_net_edge_usd,
+        expected_net_edge_bps=candidate.expected_net_edge_bps,
+        actual_open_edge_usd=actual_entry_open_edge_usd,
+        actual_open_edge_bps=actual_entry_open_edge_bps,
+        actual_estimated_net_edge_usd=actual_estimated_net_edge_usd,
+        actual_estimated_net_edge_bps=actual_estimated_net_edge_bps,
+        entry_edge_slippage_usd=entry_edge_slippage_usd,
+        entry_edge_slippage_bps=entry_edge_slippage_bps,
+        first_exchange=first_exchange_name,
+        first_side=first_side,
+        hedge_exchange=hedge_exchange_name,
+        hedge_side=hedge_side,
+        first_leg_fill_price=first_price_used,
+        hedge_fill_price=hedge_price_used,
+        long_entry_price=long_entry_price,
+        short_entry_price=short_entry_price,
+        first_leg_done_ms=first_leg_done_ms,
+        hedge_start_ms=hedge_start_ms,
+        hedge_done_ms=hedge_done_ms,
+        total_entry_elapsed_ms=max(hedge_done_ms - entry_started_ms, 0),
+        first_fill_to_hedge_fill_ms=max(hedge_done_ms - first_leg_done_ms, 0),
+    )
+
+    log_pair_opened(
+        pair_id=pair_id,
+        symbol=symbol,
+        qty=pair_qty,
+        long_exchange=candidate.long_exchange,
+        short_exchange=candidate.short_exchange,
+    )
+    pair = OpenPairState(
+        pair_id=pair_id,
+        symbol=symbol,
+        long_exchange=candidate.long_exchange,
+        short_exchange=candidate.short_exchange,
+        qty=pair_qty,
+        requested_qty=executable_qty,
+        long_entry_price=long_entry_price,
+        short_entry_price=short_entry_price,
+        entry_time_ms=int(time.time() * 1000),
+        entry_net_edge_usd=candidate.expected_net_edge_usd,
+        funding_long_rate=candidate.funding_long_rate,
+        funding_short_rate=candidate.funding_short_rate,
+        status="open",
+    )
+    clear_pair_assumed_flat(pair, assumed_flat_until_ms)
+    record_live_event(
+        config,
+        "pair_opened",
+        source=source,
+        pair=pair_event_payload(pair),
+        candidate={
+            "id": candidate.id,
+            "executable_qty": candidate.executable_qty,
+            "notional_usd": candidate.notional_usd,
+            "entry_open_edge_usd": candidate.entry_open_edge_usd,
+            "entry_open_edge_bps": candidate.entry_open_edge_bps,
+            "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
+            "expected_net_edge_usd": candidate.expected_net_edge_usd,
+            "expected_net_edge_bps": candidate.expected_net_edge_bps,
+            "actual_entry_open_edge_usd": actual_entry_open_edge_usd,
+            "actual_entry_open_edge_bps": actual_entry_open_edge_bps,
+            "actual_estimated_net_edge_usd": actual_estimated_net_edge_usd,
+            "actual_estimated_net_edge_bps": actual_estimated_net_edge_bps,
+            "entry_edge_slippage_usd": entry_edge_slippage_usd,
+            "entry_edge_slippage_bps": entry_edge_slippage_bps,
+        },
+        entry_position_delta={
             "long_pre_qty": pre_long_qty,
             "long_qty_after": long_qty_after,
             "long_entry_delta": long_entry_delta,
@@ -3416,11 +4159,8 @@ def estimate_hold_pnl_next_funding(
         funding_time_decay_factor,
         config,
     )
-    return (
-        estimate_close_pnl_now(pair, exchanges, config)
-        + effective_funding_pnl_usd
-        - stale_data_penalty_usd
-    )
+    _long_ask, _short_bid, open_edge_usd = current_pair_open_edge(pair, exchanges)
+    return open_edge_usd + effective_funding_pnl_usd - stale_data_penalty_usd
 
 
 def current_pair_reference_notional_usd(
@@ -3434,6 +4174,33 @@ def current_pair_reference_notional_usd(
     if long_ref > 0 and short_ref > 0:
         return max(pair.qty * ((long_ref + short_ref) / 2.0), 0.0)
     return pair_entry_reference_notional_usd(pair)
+
+
+def spread_close_signal_confirmed(
+    pair: OpenPairState,
+    decision: str,
+    config: StrategyConfig,
+    current_ms: int,
+) -> bool:
+    if decision != "spread_nonpositive":
+        pair.close_signal_first_seen_ms = 0
+        pair.close_signal_confirm_count = 0
+        return True
+
+    confirm_count = max(int(config.close_spread_confirm_count or 1), 1)
+    confirm_ms = int(max(float(config.close_spread_confirm_sec or 0.0), 0.0) * 1000)
+    if confirm_count <= 1 and confirm_ms <= 0:
+        return True
+
+    if pair.last_close_reason != decision or pair.close_signal_first_seen_ms <= 0:
+        pair.close_signal_first_seen_ms = current_ms
+        pair.close_signal_confirm_count = 1
+    else:
+        pair.close_signal_confirm_count += 1
+
+    count_ready = pair.close_signal_confirm_count >= confirm_count
+    time_ready = current_ms - pair.close_signal_first_seen_ms >= confirm_ms
+    return count_ready and time_ready
 
 
 def estimate_close_pnl_now(
@@ -3981,6 +4748,7 @@ async def manage_open_pairs(
         pair.qty = balanced_qty
         close_pnl_now = estimate_close_pnl_now(pair, exchanges, config)
         _, _, close_edge_now = current_pair_close_edge(pair, exchanges)
+        _, _, open_edge_now = current_pair_open_edge(pair, exchanges)
         hold_pnl = estimate_hold_pnl_next_funding(pair, exchanges, config)
         entry_age_sec = max((now_ms() - pair.entry_time_ms) / 1000.0, 0.0)
         close_reference_notional_usd = current_pair_reference_notional_usd(pair, exchanges)
@@ -3990,13 +4758,14 @@ async def manage_open_pairs(
             hold_pnl_usd=hold_pnl,
             entry_age_sec=entry_age_sec,
             close_pnl_usd=close_pnl_now,
-            close_edge_usd=close_edge_now,
+            close_edge_usd=open_edge_now,
             reference_notional_usd=close_reference_notional_usd,
             action_inputs_fresh=action_inputs_fresh,
         )
         decision = close_evaluation.decision
         close_thresholds = close_evaluation.thresholds
         close_reference_notional_usd = close_evaluation.reference_notional_usd
+        previous_close_reason = pair.last_close_reason
         pair.last_close_pnl_usd = close_evaluation.close_pnl_usd
         pair.last_close_edge_usd = close_evaluation.close_edge_usd
         pair.last_close_reason = decision
@@ -4012,12 +4781,26 @@ async def manage_open_pairs(
                 f"stop_loss_usd={close_thresholds['stop_loss_usd']:.4f} "
                 f"close_reference_notional_usd={close_reference_notional_usd:.4f} "
                 f"close_pnl_now={pair.last_close_pnl_usd:.4f} "
-                f"close_edge_now={pair.last_close_edge_usd:.4f} "
+                f"open_edge_now={pair.last_close_edge_usd:.4f} "
+                f"close_edge_now={close_edge_now:.4f} "
                 f"entry_age_sec={entry_age_sec:.1f} min_hold_sec={config.min_hold_sec:.1f}"
             )
 
         if config.auto_close_enabled and close_evaluation.should_auto_close:
             current_ms = now_ms()
+            if not spread_close_signal_confirmed(pair, decision, config, current_ms):
+                if previous_close_reason != decision or pair.close_signal_confirm_count <= 1:
+                    record_live_event(
+                        config,
+                        "pair_close_signal_waiting_confirm",
+                        pair=pair_event_payload(pair),
+                        reason=decision,
+                        confirm_count=pair.close_signal_confirm_count,
+                        required_count=config.close_spread_confirm_count,
+                        first_seen_ms=pair.close_signal_first_seen_ms,
+                        confirm_sec=config.close_spread_confirm_sec,
+                    )
+                continue
             if current_ms < pair.next_auto_close_retry_ms:
                 continue
             pair.next_auto_close_retry_ms = current_ms + int(config.auto_close_retry_cooldown_sec * 1000)
@@ -4249,6 +5032,14 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
             f"entry_spread_bps={config.entry_spread_bps} "
             f"entry_cancel_buffer_bps={config.entry_cancel_buffer_bps} "
             f"entry_marketable_bps={config.entry_first_leg_marketable_bps} "
+            f"maker_engine={config.maker_entry_engine_enabled} "
+            f"maker_symbols={config.maker_entry_engine_symbols} "
+            f"maker_replace_bps={config.maker_entry_engine_replace_edge_bps} "
+            f"maker_queue_gap_bps={config.maker_entry_engine_queue_edge_gap_bps} "
+            f"maker_transient_pause={config.maker_entry_engine_transient_pause_sec}s "
+            f"maker_stale_pause={config.maker_entry_engine_stale_pause_sec}s "
+            f"maker_q4_fast_hedge={config.maker_entry_q4_fast_hedge} "
+            f"hedge_fast_ack={config.hedge_fast_ack} "
             f"close_mode={config.close_execution_mode} "
             f"account_imbalance_hedge={config.account_imbalance_hedge_enabled} "
             f"leverage={config.leverage} margin_mode={config.margin_mode} "
@@ -4258,7 +5049,10 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
             f"rate_limit_threshold={config.rate_limit_guard_usage_threshold} "
             f"funding_payment_only={config.require_funding_payment} "
             f"entry_settle={config.entry_order_settle_sec}s "
+            f"post_fill_check={config.entry_post_fill_edge_check_enabled} "
+            f"post_fill_net_bps={config.entry_post_fill_min_net_edge_bps} "
             f"entry_cooldown={config.entry_order_cooldown_sec}s "
+            f"close_spread_confirm={config.close_spread_confirm_count}/{config.close_spread_confirm_sec}s "
             f"entry_control_file={config.entry_control_file}"
         )
         return
@@ -4275,15 +5069,28 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"entry_cancel_buffer_bps={config.entry_cancel_buffer_bps} "
         f"entry_first_leg_marketable_bps={config.entry_first_leg_marketable_bps} "
         f"hedge_market_immediate={config.hedge_market_immediate} "
+        f"hedge_fast_ack={config.hedge_fast_ack} "
         f"hedge_requote_timeout_sec={config.hedge_requote_timeout_sec} "
         f"hedge_requote_count={config.hedge_requote_count} "
         f"entry_order_settle_sec={config.entry_order_settle_sec} "
+        f"entry_post_fill_edge_check_enabled={config.entry_post_fill_edge_check_enabled} "
+        f"entry_post_fill_min_net_edge_bps={config.entry_post_fill_min_net_edge_bps} "
         f"entry_order_cooldown_sec={config.entry_order_cooldown_sec} "
         f"symbol_recent_close_cooldown_sec={config.symbol_recent_close_cooldown_sec}"
     )
     print(
         f"approval_mode={config.approval_mode} "
         f"auto_enter_enabled={config.auto_enter_enabled} "
+        f"maker_entry_engine_enabled={config.maker_entry_engine_enabled} "
+        f"maker_entry_engine_symbols={config.maker_entry_engine_symbols} "
+        f"maker_entry_engine_max_open_orders={config.maker_entry_engine_max_open_orders} "
+        f"maker_entry_engine_requote_sec={config.maker_entry_engine_requote_sec} "
+        f"maker_entry_engine_replace_edge_bps={config.maker_entry_engine_replace_edge_bps} "
+        f"maker_entry_engine_queue_edge_gap_bps={config.maker_entry_engine_queue_edge_gap_bps} "
+        f"maker_entry_engine_transient_pause_sec={config.maker_entry_engine_transient_pause_sec} "
+        f"maker_entry_engine_stale_pause_sec={config.maker_entry_engine_stale_pause_sec} "
+        f"maker_entry_q4_fast_hedge={config.maker_entry_q4_fast_hedge} "
+        f"hedge_fast_ack={config.hedge_fast_ack} "
         f"auto_enter_cooldown_sec={config.auto_enter_cooldown_sec} "
         f"render_interval_sec={config.render_interval_sec} "
         f"recovery_retry_cooldown_sec={config.recovery_retry_cooldown_sec} "
@@ -4323,10 +5130,13 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"entry_threshold_bps={config.min_expected_net_edge_bps} "
         f"min_effective_funding_usd={effective_funding_floor} "
         f"require_funding_payment={config.require_funding_payment} "
+        f"entry_funding_forecast_sec={config.entry_funding_forecast_sec} "
         f"hold_buffer_usd={config.hold_buffer_usd} "
         f"hold_buffer_bps={config.hold_buffer_bps} "
         f"min_hold_sec={config.min_hold_sec} "
         f"close_candidate_min_age_sec={config.close_candidate_min_age_sec} "
+        f"close_spread_confirm_count={config.close_spread_confirm_count} "
+        f"close_spread_confirm_sec={config.close_spread_confirm_sec} "
         f"max_hold_sec={config.max_hold_sec} "
         f"take_profit_usd={config.take_profit_usd} "
         f"take_profit_bps={config.take_profit_bps} "
@@ -4381,6 +5191,24 @@ async def strategy_loop() -> None:
     shutdown_requested = asyncio.Event()
     shutdown_reason: dict[str, str] = {"reason": "normal_exit"}
     installed_signal_handlers: list[signal.Signals] = []
+    maker_entry_engine = MakerEntryEngine(
+        MakerEntryHooks(
+            first_leg_plan=first_leg_plan,
+            hedge_leg_plan=hedge_leg_plan,
+            target_price=required_edge_entry_target_price,
+            hedge_price_preview=marketable_limit_price_with_bps,
+            common_executable_qty=compute_common_executable_qty,
+            extract_position_qty=extract_position_qty,
+            position_fill_delta=position_fill_delta,
+            extract_order_uuid=extract_order_uuid,
+            is_waiting_order_active=is_waiting_order_active,
+            price_changed=entry_limit_price_changed,
+            cancel_if_open=cancel_if_open,
+            bootstrap_candidate=bootstrap_candidate_exchanges,
+            complete_after_first_fill=complete_entry_after_maker_first_fill,
+            record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
+        )
+    )
 
     last_signature: tuple[Any, ...] | None = None
     last_render_ts = 0.0
@@ -4403,6 +5231,19 @@ async def strategy_loop() -> None:
             enabled=config.startup_margin_mode_guard_enabled,
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         )
+        startup_bootstrap_failures = await bootstrap_strategy_symbols_once(exchanges, symbols, config)
+        if startup_bootstrap_failures:
+            print(
+                "[strategy][startup][bootstrap][warn] "
+                f"failures={len(startup_bootstrap_failures)} "
+                f"sample={startup_bootstrap_failures[:3]}"
+            )
+        else:
+            print_verbose(
+                config,
+                "[strategy][startup][bootstrap] "
+                f"exchanges={list(exchanges.keys())} symbols={len(symbols)} leverage={config.leverage}",
+            )
 
         if runtime_persistence.enabled:
             snapshot_task = asyncio.create_task(
@@ -4496,14 +5337,28 @@ async def strategy_loop() -> None:
             if shutdown_requested.is_set():
                 break
 
-            await recover_account_imbalances(
-                symbols=symbols,
-                exchanges=exchanges,
-                config=config,
-                open_pairs=open_pairs,
-                assumed_flat_until_ms=assumed_flat_until_ms,
-                next_retry_ms_by_key=account_imbalance_next_retry_ms,
-            )
+            if not shutdown_requested.is_set() and config.enable_live and config.auto_enter_enabled:
+                maker_pairs = await maker_entry_engine.step(
+                    candidates=candidates,
+                    open_pairs=open_pairs,
+                    exchanges=exchanges,
+                    config=config,
+                    symbols=symbols,
+                    assumed_flat_until_ms=assumed_flat_until_ms,
+                )
+                for pair in maker_pairs:
+                    open_pairs[pair.pair_id] = pair
+
+            if not shutdown_requested.is_set():
+                await recover_account_imbalances(
+                    symbols=symbols,
+                    exchanges=exchanges,
+                    config=config,
+                    open_pairs=open_pairs,
+                    assumed_flat_until_ms=assumed_flat_until_ms,
+                    next_retry_ms_by_key=account_imbalance_next_retry_ms,
+                    skip_symbols=maker_entry_engine.active_symbols(),
+                )
 
             if not shutdown_requested.is_set() and config.enable_live and config.auto_enter_enabled:
                 active_open_pairs = [
@@ -4511,7 +5366,11 @@ async def strategy_loop() -> None:
                     for pair in open_pairs.values()
                     if pair.status not in {"closed", "failed"}
                 ]
-                available_slots = max(config.max_open_pairs - len(active_open_pairs), 0)
+                available_slots = (
+                    len(candidates)
+                    if config.max_open_pairs <= 0
+                    else max(config.max_open_pairs - len(active_open_pairs), 0)
+                )
 
                 now = time.monotonic()
                 if available_slots > 0 and (now - last_auto_enter_ts) >= config.auto_enter_cooldown_sec:
@@ -4521,6 +5380,8 @@ async def strategy_loop() -> None:
 
                     for candidate in candidates:
                         if not candidate.can_enter:
+                            continue
+                        if maker_entry_engine.is_managed_symbol(candidate.symbol, config, symbols):
                             continue
                         if candidate.symbol in active_symbols or candidate.symbol in selected_symbols:
                             continue

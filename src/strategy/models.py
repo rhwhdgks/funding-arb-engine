@@ -34,6 +34,7 @@ class StrategyConfig:
     scan_interval_sec: float = 1.0
     first_leg_timeout_sec: float = 2.0
     hedge_market_immediate: bool = True
+    hedge_fast_ack: bool = False
     hedge_requote_timeout_sec: float = 0.7
     hedge_requote_count: int = 2
     close_first_leg_role: str = "short"
@@ -47,6 +48,9 @@ class StrategyConfig:
     entry_first_leg_marketable_bps: float = 0.0
     entry_spread_bps: float = 0.0
     entry_cancel_buffer_bps: float = 0.0
+    entry_post_fill_edge_check_enabled: bool = True
+    entry_post_fill_min_open_edge_bps: float = 0.0
+    entry_post_fill_min_net_edge_bps: float = 0.0
     action_settle_wait_sec: float = 0.6
     entry_order_settle_sec: float = 1.2
     entry_order_cooldown_sec: float = 1.0
@@ -56,10 +60,13 @@ class StrategyConfig:
     min_expected_net_edge_bps: float = 0.0
     min_effective_funding_usd: float | None = None
     require_funding_payment: bool = False
+    entry_funding_forecast_sec: float = 300.0
     hold_buffer_usd: float = 0.0
     hold_buffer_bps: float | None = 2.0
     min_hold_sec: float = 300.0
     close_candidate_min_age_sec: float = 1800.0
+    close_spread_confirm_count: int = 1
+    close_spread_confirm_sec: float = 0.0
     max_hold_sec: float = 14400.0
     take_profit_usd: float = 0.10
     stop_loss_usd: float = -0.25
@@ -88,6 +95,15 @@ class StrategyConfig:
     auto_enter_enabled: bool = False
     auto_close_enabled: bool = False
     bootstrap_on_entry: bool = True
+    maker_entry_engine_enabled: bool = False
+    maker_entry_engine_symbols: list[str] = field(default_factory=list)
+    maker_entry_engine_max_open_orders: int = 1
+    maker_entry_engine_requote_sec: float = 1.0
+    maker_entry_engine_replace_edge_bps: float = 5.0
+    maker_entry_engine_queue_edge_gap_bps: float = 10.0
+    maker_entry_engine_transient_pause_sec: float = 60.0
+    maker_entry_engine_stale_pause_sec: float = 30.0
+    maker_entry_q4_fast_hedge: bool = False
     max_candidates_print: int = 10
     max_open_pairs: int = 1
     assumed_flat_grace_sec: float = 8.0
@@ -173,6 +189,8 @@ class OpenPairState:
     last_close_pnl_usd: float = 0.0
     last_close_edge_usd: float = 0.0
     last_close_reason: str = ""
+    close_signal_first_seen_ms: int = 0
+    close_signal_confirm_count: int = 0
     last_direction_mismatch_log_ms: int = 0
     next_recovery_retry_ms: int = 0
     next_auto_close_retry_ms: int = 0

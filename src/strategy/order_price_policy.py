@@ -123,6 +123,44 @@ def spread_buffer_entry_target_price(
     return marketable_entry_target_price(first_exchange, symbol, first_side, config)
 
 
+def required_edge_entry_target_price(
+    candidate: PairCandidate,
+    first_exchange_name: str,
+    first_side: str,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> float:
+    symbol = candidate.symbol
+    first_exchange = exchanges[first_exchange_name]
+    quote_qty = candidate.executable_qty if candidate.executable_qty > EPS else candidate.target_qty
+    if quote_qty <= EPS:
+        return 0.0
+
+    required_unit_edge = required_entry_open_edge_usd(candidate, config) / quote_qty
+
+    if first_exchange_name == candidate.long_exchange and first_side.lower() == "buy":
+        reference_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
+        reference_price = extract_best_bid(reference_snapshot)
+        maker_best_bid = extract_best_bid(first_exchange.get_symbol_snapshot(symbol))
+        if reference_price <= 0:
+            return 0.0
+        raw_target = reference_price - required_unit_edge
+        passive_cap = maker_best_bid if maker_best_bid > 0 else raw_target
+        return normalize_limit_price_for_side(first_exchange, symbol, first_side, min(raw_target, passive_cap))
+
+    if first_exchange_name == candidate.short_exchange and first_side.lower() == "sell":
+        reference_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
+        reference_price = extract_best_ask(reference_snapshot)
+        maker_best_ask = extract_best_ask(first_exchange.get_symbol_snapshot(symbol))
+        if reference_price <= 0:
+            return 0.0
+        raw_target = reference_price + required_unit_edge
+        passive_floor = maker_best_ask if maker_best_ask > 0 else raw_target
+        return normalize_limit_price_for_side(first_exchange, symbol, first_side, max(raw_target, passive_floor))
+
+    return marketable_entry_target_price(first_exchange, symbol, first_side, config)
+
+
 def passive_entry_target_price(
     candidate: PairCandidate,
     first_exchange_name: str,
@@ -137,38 +175,10 @@ def passive_entry_target_price(
     if config.entry_first_leg_price_mode == "spread_buffer":
         return spread_buffer_entry_target_price(candidate, first_exchange_name, first_side, exchanges, config)
 
-    first_snapshot = first_exchange.get_symbol_snapshot(symbol)
-    quote_qty = candidate.executable_qty if candidate.executable_qty > EPS else candidate.target_qty
-    if quote_qty <= EPS:
-        return 0.0
-
-    required_unit_edge = required_entry_open_edge_usd(candidate, config) / quote_qty
-
-    if first_exchange_name == candidate.long_exchange and first_side.lower() == "buy":
-        reference_snapshot = exchanges[candidate.short_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_bid(reference_snapshot)
-        maker_best_bid = extract_best_bid(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price - required_unit_edge
-        passive_cap = maker_best_bid if maker_best_bid > 0 else raw_target
-        target_price = min(raw_target, passive_cap)
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    if first_exchange_name == candidate.short_exchange and first_side.lower() == "sell":
-        reference_snapshot = exchanges[candidate.long_exchange].get_symbol_snapshot(symbol)
-        reference_price = extract_best_ask(reference_snapshot)
-        maker_best_ask = extract_best_ask(first_snapshot)
-        if reference_price <= 0:
-            return 0.0
-        raw_target = reference_price + required_unit_edge
-        passive_floor = maker_best_ask if maker_best_ask > 0 else raw_target
-        target_price = max(raw_target, passive_floor)
-        return normalize_limit_price_for_side(first_exchange, symbol, first_side, target_price)
-
-    return normalize_limit_price_for_side(
-        first_exchange,
-        symbol,
+    return required_edge_entry_target_price(
+        candidate,
+        first_exchange_name,
         first_side,
-        marketable_limit_price(first_exchange, symbol, first_side),
+        exchanges,
+        config,
     )

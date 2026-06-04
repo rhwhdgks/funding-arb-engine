@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from src.strategy.models import OpenPairState, StrategyConfig
 
 
-AUTO_CLOSE_DECISIONS = frozenset({"stop_loss", "take_profit", "max_hold", "close_candidate"})
+AUTO_CLOSE_DECISIONS = frozenset(
+    {"spread_nonpositive", "funding_cost_over_gap", "stop_loss", "take_profit", "max_hold", "close_candidate"}
+)
 
 
 @dataclass(frozen=True)
@@ -103,22 +105,13 @@ def decide_pair_close_reason(
     if not action_inputs_fresh:
         return "await_account_sync"
 
-    thresholds = close_thresholds_usd(pair, config, reference_notional_usd)
-    if entry_age_sec < config.min_hold_sec:
-        return "hold_grace"
-    if close_pnl_usd <= thresholds["stop_loss_usd"]:
-        return "stop_loss"
-    if close_pnl_usd >= thresholds["take_profit_usd"]:
-        return "take_profit"
+    if close_edge_usd <= 0:
+        return "spread_nonpositive"
+    if hold_pnl_usd <= 0:
+        return "funding_cost_over_gap"
     if entry_age_sec >= config.max_hold_sec:
         return "max_hold"
-    if hold_pnl_usd > thresholds["hold_buffer_usd"]:
-        return "hold"
-    if close_edge_usd > 0:
-        return "hold_spread_support"
-    if entry_age_sec < config.close_candidate_min_age_sec:
-        return "hold_close_age_gate"
-    return "close_candidate"
+    return "hold_spread_support"
 
 
 def evaluate_close_policy(

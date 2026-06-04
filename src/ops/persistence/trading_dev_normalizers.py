@@ -27,6 +27,11 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _fee_cost(value: Any) -> float | None:
+    fee = _safe_float(value)
+    return abs(fee) if fee is not None else None
+
+
 def _string_or_none(value: Any) -> str | None:
     if value is None:
         return None
@@ -241,7 +246,7 @@ def build_trade_history_rows(
                 "price": _safe_float(trade.get("price")) or 0.0,
                 "qty": abs(_safe_float(trade.get("qty")) or 0.0),
                 "quote_qty": _safe_float(trade.get("quote_qty")),
-                "fee": _safe_float(trade.get("fee") or trade.get("commission")),
+                "fee": _fee_cost(trade.get("fee") if trade.get("fee") is not None else trade.get("commission")),
                 "fee_ccy": _string_or_none(trade.get("fee_ccy") or trade.get("commission_asset")),
                 "realized_pnl_usdt": _safe_float(trade.get("realized_pnl")),
                 "desktop_time_ms": captured_at_ms,

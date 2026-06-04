@@ -39,6 +39,17 @@ def parse_positive_int_env(key: str, default: int) -> int:
     return value
 
 
+def parse_nonnegative_int_env(key: str, default: int) -> int:
+    raw = os.getenv(key, str(default))
+    try:
+        value = int(str(raw).strip())
+    except Exception as exc:
+        raise ValueError(f"{key} must be an integer >= 0") from exc
+    if value < 0:
+        raise ValueError(f"{key} must be an integer >= 0")
+    return value
+
+
 def parse_optional_float_env(key: str) -> float | None:
     raw = os.getenv(key)
     if raw is None or str(raw).strip() == "":
@@ -139,6 +150,7 @@ def load_strategy_config() -> StrategyConfig:
         scan_interval_sec=float(os.getenv("STRATEGY_SCAN_INTERVAL_SEC", "1.0") or 1.0),
         first_leg_timeout_sec=float(os.getenv("STRATEGY_FIRST_LEG_TIMEOUT_SEC", "2.0") or 2.0),
         hedge_market_immediate=os.getenv("STRATEGY_HEDGE_MARKET_IMMEDIATE", "1").strip().lower() in {"1", "true", "yes", "on"},
+        hedge_fast_ack=parse_bool(os.getenv("STRATEGY_HEDGE_FAST_ACK"), False),
         hedge_requote_timeout_sec=float(os.getenv("STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC", "0.7") or 0.7),
         hedge_requote_count=int(os.getenv("STRATEGY_HEDGE_REQUOTE_COUNT", "2") or 2),
         close_first_leg_role=os.getenv("STRATEGY_CLOSE_FIRST_LEG_ROLE", "short").strip().lower(),
@@ -152,6 +164,13 @@ def load_strategy_config() -> StrategyConfig:
         entry_first_leg_marketable_bps=float(os.getenv("STRATEGY_ENTRY_FIRST_LEG_MARKETABLE_BPS", "0.0") or 0.0),
         entry_spread_bps=float(raw_entry_spread_bps or 0.0),
         entry_cancel_buffer_bps=float(os.getenv("STRATEGY_ENTRY_CANCEL_BUFFER_BPS", "0.0") or 0.0),
+        entry_post_fill_edge_check_enabled=parse_bool(os.getenv("STRATEGY_ENTRY_POST_FILL_EDGE_CHECK_ENABLED"), True),
+        entry_post_fill_min_open_edge_bps=float(
+            os.getenv("STRATEGY_ENTRY_POST_FILL_MIN_OPEN_EDGE_BPS", "0.0") or 0.0
+        ),
+        entry_post_fill_min_net_edge_bps=float(
+            os.getenv("STRATEGY_ENTRY_POST_FILL_MIN_NET_EDGE_BPS", "0.0") or 0.0
+        ),
         action_settle_wait_sec=float(os.getenv("STRATEGY_ACTION_SETTLE_WAIT_SEC", "0.6") or 0.6),
         entry_order_settle_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_SETTLE_SEC", "1.2") or 1.2),
         entry_order_cooldown_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_COOLDOWN_SEC", "1.0") or 1.0),
@@ -167,12 +186,15 @@ def load_strategy_config() -> StrategyConfig:
             else None
         ),
         require_funding_payment=parse_bool(os.getenv("STRATEGY_REQUIRE_FUNDING_PAYMENT"), False),
+        entry_funding_forecast_sec=float(os.getenv("STRATEGY_ENTRY_FUNDING_FORECAST_SEC", "300.0") or 300.0),
         hold_buffer_usd=float(os.getenv("STRATEGY_HOLD_BUFFER_USD", "0.0") or 0.0),
         hold_buffer_bps=hold_buffer_bps,
         min_hold_sec=float(os.getenv("STRATEGY_MIN_HOLD_SEC", "300.0") or 300.0),
         close_candidate_min_age_sec=float(
             os.getenv("STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC", "1800.0") or 1800.0
         ),
+        close_spread_confirm_count=parse_positive_int_env("STRATEGY_CLOSE_SPREAD_CONFIRM_COUNT", 1),
+        close_spread_confirm_sec=float(os.getenv("STRATEGY_CLOSE_SPREAD_CONFIRM_SEC", "0.0") or 0.0),
         max_hold_sec=float(os.getenv("STRATEGY_MAX_HOLD_SEC", "14400.0") or 14400.0),
         take_profit_usd=float(os.getenv("STRATEGY_TAKE_PROFIT_USD", "0.10") or 0.10),
         stop_loss_usd=float(os.getenv("STRATEGY_STOP_LOSS_USD", "-0.25") or -0.25),
@@ -204,8 +226,25 @@ def load_strategy_config() -> StrategyConfig:
         auto_enter_enabled=parse_bool(os.getenv("STRATEGY_AUTO_ENTER_ENABLED"), False),
         auto_close_enabled=parse_bool(os.getenv("STRATEGY_AUTO_CLOSE_ENABLED"), False),
         bootstrap_on_entry=parse_bool(os.getenv("STRATEGY_BOOTSTRAP_ON_ENTRY"), True),
+        maker_entry_engine_enabled=parse_bool(os.getenv("STRATEGY_MAKER_ENGINE_ENABLED"), False),
+        maker_entry_engine_symbols=[symbol.upper() for symbol in parse_csv(os.getenv("STRATEGY_MAKER_ENGINE_SYMBOLS"))],
+        maker_entry_engine_max_open_orders=parse_nonnegative_int_env("STRATEGY_MAKER_ENGINE_MAX_OPEN_ORDERS", 1),
+        maker_entry_engine_requote_sec=float(os.getenv("STRATEGY_MAKER_ENGINE_REQUOTE_SEC", "1.0") or 1.0),
+        maker_entry_engine_replace_edge_bps=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_REPLACE_EDGE_BPS", "5.0") or 5.0
+        ),
+        maker_entry_engine_queue_edge_gap_bps=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS", "10.0") or 10.0
+        ),
+        maker_entry_engine_transient_pause_sec=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_TRANSIENT_PAUSE_SEC", "60.0") or 60.0
+        ),
+        maker_entry_engine_stale_pause_sec=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_STALE_PAUSE_SEC", "30.0") or 30.0
+        ),
+        maker_entry_q4_fast_hedge=parse_bool(os.getenv("STRATEGY_MAKER_ENTRY_Q4_FAST_HEDGE"), False),
         max_candidates_print=int(os.getenv("STRATEGY_MAX_CANDIDATES_PRINT", "10") or 10),
-        max_open_pairs=int(os.getenv("STRATEGY_MAX_OPEN_PAIRS", "1") or 1),
+        max_open_pairs=parse_nonnegative_int_env("STRATEGY_MAX_OPEN_PAIRS", 1),
         assumed_flat_grace_sec=float(os.getenv("STRATEGY_ASSUMED_FLAT_GRACE_SEC", "8.0") or 8.0),
         auto_enter_cooldown_sec=float(os.getenv("STRATEGY_AUTO_ENTER_COOLDOWN_SEC", "15.0") or 15.0),
         render_interval_sec=float(os.getenv("STRATEGY_RENDER_INTERVAL_SEC", "30.0") or 30.0),
@@ -253,6 +292,22 @@ def load_strategy_config() -> StrategyConfig:
         raise ValueError("STRATEGY_ENTRY_FIRST_LEG_MARKETABLE_BPS must be >= 0")
     if config.entry_spread_bps < 0 or config.entry_cancel_buffer_bps < 0:
         raise ValueError("STRATEGY_ENTRY_SPREAD_BPS and STRATEGY_ENTRY_CANCEL_BUFFER_BPS must be >= 0")
+    if config.entry_post_fill_min_open_edge_bps < 0:
+        raise ValueError("STRATEGY_ENTRY_POST_FILL_MIN_OPEN_EDGE_BPS must be >= 0")
+    if config.entry_post_fill_min_net_edge_bps < 0:
+        raise ValueError("STRATEGY_ENTRY_POST_FILL_MIN_NET_EDGE_BPS must be >= 0")
+    if config.close_spread_confirm_sec < 0:
+        raise ValueError("STRATEGY_CLOSE_SPREAD_CONFIRM_SEC must be >= 0")
+    if config.maker_entry_engine_requote_sec < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_REQUOTE_SEC must be >= 0")
+    if config.maker_entry_engine_replace_edge_bps < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_REPLACE_EDGE_BPS must be >= 0")
+    if config.maker_entry_engine_queue_edge_gap_bps < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS must be >= 0")
+    if config.maker_entry_engine_transient_pause_sec < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_TRANSIENT_PAUSE_SEC must be >= 0")
+    if config.maker_entry_engine_stale_pause_sec < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_STALE_PAUSE_SEC must be >= 0")
     if config.stdout_log_style not in {"verbose", "simple"}:
         raise ValueError("STRATEGY_STDOUT_LOG_STYLE must be 'verbose' or 'simple'")
     if config.max_gross_leverage < 0 or config.max_long_leverage < 0 or config.max_short_leverage < 0:

@@ -126,7 +126,7 @@ class Exchange:
 
         self.account_interval = float(os.getenv("OKX_ACCOUNT_INTERVAL_SEC", str(account_interval)))
         self.order_interval = order_interval
-        self.open_orders_interval = open_orders_interval
+        self.open_orders_interval = float(os.getenv("OKX_OPEN_ORDERS_INTERVAL_SEC", str(open_orders_interval)))
         self.funding_interval = funding_interval
         self.health_interval = health_interval
         self.order_cooldown_sec = order_cooldown_sec
@@ -922,7 +922,32 @@ class Exchange:
         self._update_rate_limit_state(order_data)
         return order_data
 
-    async def market_order(self, ticker: str, side: str, amount: float, is_close: bool = False, *, is_hedge: bool = False):
+    def _schedule_market_order_lifecycle(self, ticker: str, order_data: dict | None) -> None:
+        async def _run() -> None:
+            await self._finalize_market_order_lifecycle(ticker, order_data)
+
+        task = asyncio.create_task(_run())
+
+        def _done(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                print(f"[{self.name}][market_followup][background][error] ticker={ticker} error={exc!r}")
+
+        task.add_done_callback(_done)
+
+    async def market_order(
+        self,
+        ticker: str,
+        side: str,
+        amount: float,
+        is_close: bool = False,
+        *,
+        is_hedge: bool = False,
+        fast_ack: bool = False,
+    ):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, order_type="market", is_close=is_close)
@@ -973,7 +998,12 @@ class Exchange:
 
         schedule_order_result(self.persist_name, ticker, order_data, request_payload)
         schedule_order_state_event(self.persist_name, ticker, order_data, prefer_live=False, event_source="rest_result")
-        await self._finalize_market_order_lifecycle(ticker, order_data)
+        if fast_ack and is_hedge and not is_close and isinstance(order_data, dict) and not order_data.get("error"):
+            order_data["fast_ack"] = True
+            order_data["fast_ack_reason"] = "entry_hedge"
+            self._schedule_market_order_lifecycle(ticker, order_data)
+        else:
+            await self._finalize_market_order_lifecycle(ticker, order_data)
         self._update_rate_limit_state(order_data)
         return order_data
 

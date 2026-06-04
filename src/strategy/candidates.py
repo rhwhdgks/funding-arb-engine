@@ -332,7 +332,7 @@ def compute_pair_candidate(
         long_next_funding_ms=long_next_funding_ms,
         short_next_funding_ms=short_next_funding_ms,
         config=config,
-        forecast_hold_sec=config.min_hold_sec,
+        forecast_hold_sec=config.entry_funding_forecast_sec,
         now_ms=current_ms,
     )
     stale_data_penalty_usd = compute_stale_data_penalty_usd(

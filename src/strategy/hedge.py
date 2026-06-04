@@ -69,6 +69,7 @@ async def execute_residual_hedge(
     requote_log_text = "청산 헤지 재호가" if is_close else "헤지 재호가"
     probe_reason_prefix = f"strategy_{stage_label}_hedge"
     position_waiter = wait_for_position_close if is_close else wait_for_position_fill
+    fast_ack_enabled = bool(getattr(config, "hedge_fast_ack", False)) and stage_label == "entry" and not is_close
 
     def outstanding_qty() -> float:
         return max(target_qty - hedged_qty, 0.0)
@@ -108,6 +109,7 @@ async def execute_residual_hedge(
                 post_qty=post_qty,
                 position_delta=hedged_qty,
                 reason=reason,
+                fast_ack=(reason == "market_fast_ack"),
             )
         last_logged_hedged_qty = hedged_qty
 
@@ -129,27 +131,46 @@ async def execute_residual_hedge(
                 f"qty={remaining_qty:.6f}",
             )
             market_kwargs: dict[str, Any] = {"is_hedge": True}
+            if fast_ack_enabled:
+                market_kwargs["fast_ack"] = True
             if is_close:
                 current_hedge_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
                 market_kwargs["is_close"] = use_reduce_only_market_close(exchange, current_hedge_qty, side)
             market_result = await exchange.market_order(symbol, side, remaining_qty, **market_kwargs)
             if market_result and market_result.get("error"):
                 print(f"[strategy][{market_log_prefix}][market][error] {market_log_text} 오류 result={market_result}")
-            await asyncio.sleep(config.action_settle_wait_sec)
-            hedged_qty = max(
-                hedged_qty,
-                await resolve_effective_order_qty(
-                    exchange=exchange,
+            if fast_ack_enabled and market_result and not market_result.get("error"):
+                hedged_qty = max(hedged_qty, remaining_qty)
+                emit_hedge_event(
+                    record_order_event,
+                    "entry_hedge_fast_ack_assumed",
+                    exchange=exchange_name,
                     symbol=symbol,
                     side=side,
-                    pre_qty=pre_qty,
                     target_qty=target_qty,
-                    order_result=market_result,
-                    is_close=is_close,
-                    reason=f"{probe_reason_prefix}_market",
-                ),
-            )
-            log_progress("market")
+                    assumed_filled_qty=hedged_qty,
+                    remaining_qty=outstanding_qty(),
+                    order_id=market_result.get("order_id"),
+                    client_order_id=market_result.get("client_order_id") or market_result.get("uuid"),
+                    reason="market_order_accepted",
+                )
+                log_progress("market_fast_ack")
+            else:
+                await asyncio.sleep(config.action_settle_wait_sec)
+                hedged_qty = max(
+                    hedged_qty,
+                    await resolve_effective_order_qty(
+                        exchange=exchange,
+                        symbol=symbol,
+                        side=side,
+                        pre_qty=pre_qty,
+                        target_qty=target_qty,
+                        order_result=market_result,
+                        is_close=is_close,
+                        reason=f"{probe_reason_prefix}_market",
+                    ),
+                )
+                log_progress("market")
             hedge_price_used = extract_order_avg_price(market_result, hedge_price_used)
         if outstanding_qty() <= eps:
             log_hedge_done(

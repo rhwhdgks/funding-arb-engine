@@ -62,6 +62,8 @@ def korean_close_reason(reason: Any) -> str:
     mapping = {
         "stop_loss": "손절",
         "take_profit": "익절",
+        "spread_nonpositive": "갭0이하",
+        "funding_cost_over_gap": "펀딩비용초과",
         "max_hold": "최대보유",
         "close_candidate": "후보전환",
         "manual": "수동",
