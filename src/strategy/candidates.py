@@ -40,10 +40,28 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def extract_best_bid(snapshot: dict[str, Any]) -> float:
+def _market_source_time_ms(source: dict[str, Any]) -> int:
+    for key in ("desktop_time", "server_time", "event_time", "transaction_time"):
+        try:
+            value = int(source.get(key) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _ordered_top_of_book_sources(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     orderbook = snapshot.get("orderbook", {}) or {}
     tick = snapshot.get("tick", {}) or {}
-    for source in (orderbook, tick):
+    sources = [source for source in (orderbook, tick) if isinstance(source, dict) and source]
+    # Prefer the newest top-of-book source. This keeps maker quotes aligned with
+    # the same data source that refreshed market-data health.
+    return sorted(sources, key=_market_source_time_ms, reverse=True)
+
+
+def extract_best_bid(snapshot: dict[str, Any]) -> float:
+    for source in _ordered_top_of_book_sources(snapshot):
         for key in ("best_bid", "bid", "bid_price"):
             value = _safe_float(source.get(key), 0.0)
             if value > 0:
@@ -52,9 +70,7 @@ def extract_best_bid(snapshot: dict[str, Any]) -> float:
 
 
 def extract_best_ask(snapshot: dict[str, Any]) -> float:
-    orderbook = snapshot.get("orderbook", {}) or {}
-    tick = snapshot.get("tick", {}) or {}
-    for source in (orderbook, tick):
+    for source in _ordered_top_of_book_sources(snapshot):
         for key in ("best_ask", "ask", "ask_price"):
             value = _safe_float(source.get(key), 0.0)
             if value > 0:

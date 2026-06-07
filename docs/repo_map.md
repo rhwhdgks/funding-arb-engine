@@ -1,138 +1,104 @@
 # Repo Map
 
-## 한 줄 요약
-- 이 레포는 지금 `전략 런타임`, `거래소 코어`, `운영/저장`, `실행 스크립트`, `참고 자료`로 나뉩니다.
-- 실제로 자주 보는 곳은 생각보다 적습니다.
+이 문서는 저장소를 처음 보는 사람이 어느 파일부터 보면 되는지 빠르게 잡기 위한 지도입니다. 운영 명령은 [runbook.md](runbook.md), 현재 상태와 우선순위는 [current_status.md](current_status.md)를 기준으로 봅니다.
 
-## 1. 제일 먼저 보면 좋은 파일
+## 추천 읽기 순서
 
-### [main.py](/home/jonghan/findalpha/arbitrage/funding%20fee/main.py)
-- 현재 메인 전략 진입점입니다.
-- 실거래/테스트 서버 모두 결국 이 파일을 시작점으로 봅니다.
+1. [../README.md](../README.md): 프로젝트 목적과 전체 그림
+2. [current_status.md](current_status.md): 현재 완료 상태와 다음 우선순위
+3. [strategy_quality_roadmap.md](strategy_quality_roadmap.md): 전략 품질 100점 목표와 작업 순서
+4. [question4_comparison.md](question4_comparison.md): question4 대비 속도, 안정성, 구현 방식 비교
+5. [runbook.md](runbook.md): 실행, 중지, 리포트, 장애 대응 절차
+6. [env_vars.md](env_vars.md): 환경 파일 분리와 변수 역할
+7. [development_requirements_checklist.md](development_requirements_checklist.md): 개발요구사항 대비 반영 상태
+8. [presentation_summary.md](presentation_summary.md): 발표용 요약
 
-### [strategy.py](/home/jonghan/findalpha/arbitrage/funding%20fee/strategy.py)
-- 실제 전략 구현이 들어 있는 파일입니다.
-- `main.py`가 이 파일을 호출합니다.
+## 핵심 진입점
 
-### [fx.js](/home/jonghan/findalpha/arbitrage/funding%20fee/fx.js)
-- USD/KRW 환율 수집기입니다.
-- 전략 런타임과 별개로 돌립니다.
+| 경로 | 역할 |
+| --- | --- |
+| [../main.py](../main.py) | 전략 실행 진입점 |
+| [../strategy.py](../strategy.py) | pair 후보 계산, 진입/청산/recovery/shutdown 관리 |
+| [../test_server/main.py](../test_server/main.py) | 테스트 서버용 진입점 |
+| [../fx.js](../fx.js) | USD/KRW 환율 수집기 |
 
-## 2. 거래소 코어
+## 코드 구조
 
-### [src/binance_f_module](/home/jonghan/findalpha/arbitrage/funding%20fee/src/binance_f_module)
-### [src/okx_f_module](/home/jonghan/findalpha/arbitrage/funding%20fee/src/okx_f_module)
-### [src/gateio_f_module](/home/jonghan/findalpha/arbitrage/funding%20fee/src/gateio_f_module)
-- 거래소별 핵심 구현입니다.
-- 공통적으로 아래 3파일 구조를 가집니다.
-  - `api.py`: REST/signing/정규화
-  - `websocket_manager.py`: WS 연결/구독/재연결
-  - `exchange.py`: 실행 엔진/로컬 상태/공통 인터페이스
+| 경로 | 역할 |
+| --- | --- |
+| [../src/binance_f_module](../src/binance_f_module) | Binance Futures REST/WS/exchange adapter |
+| [../src/okx_f_module](../src/okx_f_module) | OKX Futures REST/WS/exchange adapter |
+| [../src/gateio_f_module](../src/gateio_f_module) | Gate.io Futures adapter |
+| [../src/hyperliquid_f_module](../src/hyperliquid_f_module) | Hyperliquid Futures adapter |
+| [../src/core](../src/core) | exchange registry, contract, action gate 등 공통 규약 |
+| [../src/strategy](../src/strategy) | candidate, entry/close policy, hedge, risk gate, exposure guard, execution helper |
+| [../src/ops/persistence](../src/ops/persistence) | DB 적재, snapshot, live/final report 보조 |
+| [../src/ops/web](../src/ops/web) | 운영 웹 화면 지원 코드 |
 
-### [src/hyperliquid_f_module](/home/jonghan/findalpha/arbitrage/funding%20fee/src/hyperliquid_f_module)
-- 현재 메인 흐름보다는 보조/실험 성격이 강한 거래소 구현입니다.
+거래소 모듈은 기본적으로 아래 3파일 구조를 따릅니다.
 
-## 3. 공통 코어
+```text
+api.py                  # REST/signing/응답 정규화
+websocket_manager.py    # WS 연결/구독/재연결/market data state
+exchange.py             # REST + WS 상태를 묶은 실행 adapter
+```
 
-### [src/core](/home/jonghan/findalpha/arbitrage/funding%20fee/src/core)
-- 상위 공통 규약/로더 영역입니다.
-- 주요 파일:
-  - [exchange_registry.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/core/exchange_registry.py)
-  - [exchange_contract.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/core/exchange_contract.py)
-  - [action_gate.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/core/action_gate.py)
+## 실행 스크립트
 
-## 4. 운영 저장 / 리포트
+| 경로 | 역할 |
+| --- | --- |
+| [../scripts/runtime/run_strategy_live.sh](../scripts/runtime/run_strategy_live.sh) | 전략 start/stop/status/logs/jsonl/summary/report/final-report |
+| [../scripts/runtime/entry_pause.sh](../scripts/runtime/entry_pause.sh) | 신규 진입 pause/resume/status |
+| [../scripts/runtime/run_symbol_price_collector.sh](../scripts/runtime/run_symbol_price_collector.sh) | symbol price collector start/stop/status/logs/once |
+| [../scripts/runtime/run_fx_collector.sh](../scripts/runtime/run_fx_collector.sh) | FX collector start/stop/status/logs/once |
+| [../scripts/runtime/server_preflight.sh](../scripts/runtime/server_preflight.sh) | 서버 실행 전 점검 스크립트 |
 
-### [src/ops/persistence](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence)
-- DB 적재, snapshot, report 보조 레이어입니다.
-- 현재 기준 주요 파일:
-  - [db.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/db.py)
-  - [event_hooks.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/event_hooks.py)
-  - [live_snapshot.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/live_snapshot.py)
-  - [live_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/live_report.py)
-  - [balance_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/balance_report.py)
-  - [trading_dev_normalizers.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/trading_dev_normalizers.py)
-  - [trading_dev_store.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/trading_dev_store.py)
+## 운영/리포트 스크립트
 
-### [src/ops/web](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/web)
-- 웹 운영 화면 관련 코드입니다.
+| 경로 | 역할 |
+| --- | --- |
+| [../scripts/ops/report.py](../scripts/ops/report.py) | 현재 exchange/account/report snapshot |
+| [../scripts/ops/final_run_report.py](../scripts/ops/final_run_report.py) | 종료 run의 PASS/FAIL 리포트 |
+| [../scripts/ops/order_trade_reconcile_report.py](../scripts/ops/order_trade_reconcile_report.py) | 주문/체결 reconcile 보조 |
+| [../scripts/ops/candidate_opportunity_report.py](../scripts/ops/candidate_opportunity_report.py) | 후보/미진입 reason 요약 |
+| [../scripts/ops/web.py](../scripts/ops/web.py) | 운영 웹 진입점 |
 
-## 5. 실행 스크립트
+## DB와 스키마
 
-### [scripts/runtime](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime)
-- 장시간 실행/런처 모음입니다.
-- 자주 쓰는 파일:
-  - [run_strategy_live.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_strategy_live.sh)
-  - [run_fx_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_fx_collector.sh)
-  - [run_symbol_price_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_symbol_price_collector.sh)
-  - [server_preflight.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/server_preflight.sh)
+| 경로 | 역할 |
+| --- | --- |
+| [../sql/trading_dev_schema.sql](../sql/trading_dev_schema.sql) | 현재 운영 기준 MariaDB 스키마 |
+| [../sql/mariadb_schema.sql](../sql/mariadb_schema.sql) | 기존/참고 스키마 |
+| [../scripts/db/init_db_schema.py](../scripts/db/init_db_schema.py) | DB 스키마 초기화 |
 
-### [scripts/ops](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops)
-- CLI 리포트/운영용 진입점입니다.
-- 자주 쓰는 파일:
-  - [report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/report.py)
-  - [final_run_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/final_run_report.py)
-  - [order_trade_reconcile_report.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/order_trade_reconcile_report.py)
-  - [web.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/ops/web.py)
+DB 설정이 없어도 전략 런타임은 실행될 수 있습니다. DB 사용 여부와 환경변수 역할은 [env_vars.md](env_vars.md)를 봅니다.
 
-### [scripts/db](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/db)
-- DB 스키마 초기화용 스크립트입니다.
-- 현재 기준 핵심은 [init_db_schema.py](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/db/init_db_schema.py)입니다.
+## 테스트 서버
 
-## 6. DB / 스키마
+| 경로 | 역할 |
+| --- | --- |
+| [../test_server](../test_server) | 테스트 서버용 env, logs, runtime 분리 |
+| [../test_server/README.md](../test_server/README.md) | 테스트 서버 실행법과 주의사항 |
+| [../test_server/main.py](../test_server/main.py) | 테스트 서버 진입점 |
 
-### [sql](/home/jonghan/findalpha/arbitrage/funding%20fee/sql)
-- DB 스키마 정의입니다.
-- 주요 파일:
-  - [mariadb_schema.sql](/home/jonghan/findalpha/arbitrage/funding%20fee/sql/mariadb_schema.sql)
-  - [trading_dev_schema.sql](/home/jonghan/findalpha/arbitrage/funding%20fee/sql/trading_dev_schema.sql)
+`test_server/.env`는 실제 파일이 있을 수 있지만, 공개/공유 문서에는 값을 적지 않습니다.
 
-## 7. 테스트 서버
+## 참고 자료
 
-### [test_server](/home/jonghan/findalpha/arbitrage/funding%20fee/test_server)
-- 여기서는 코드 복사본을 들고 있지 않습니다.
-- 분리되는 건 주로:
-  - [test_server/.env](/home/jonghan/findalpha/arbitrage/funding%20fee/test_server/.env)
-  - [test_server/main.py](/home/jonghan/findalpha/arbitrage/funding%20fee/test_server/main.py)
-  - [test_server/README.md](/home/jonghan/findalpha/arbitrage/funding%20fee/test_server/README.md)
+| 경로 | 역할 |
+| --- | --- |
+| [strategy_quality_roadmap.md](strategy_quality_roadmap.md) | 전략 품질 100점 목표와 우선순위 |
+| [question4_comparison.md](question4_comparison.md) | question4와 현재 구조의 속도/안정성/구현 방식 비교 |
+| [../reference/개발요구사항.txt](../reference/개발요구사항.txt) | 원 개발 요구사항 |
+| [../reference/question4](../reference/question4) | 구현 비교와 아이디어 참고용 레퍼런스 |
+| [../reference/README.md](../reference/README.md) | reference 폴더 사용 원칙 |
 
-## 8. 참고 자료
+## 생성물과 캐시
 
-### [reference](/home/jonghan/findalpha/arbitrage/funding%20fee/reference)
-- 현재는 [reference/question4](/home/jonghan/findalpha/arbitrage/funding%20fee/reference/question4) 레퍼런스를 여기에 모아뒀습니다.
-- 실운영 코드가 아니라 비교/아이디어 참고용입니다.
-- [reference/개발요구사항.txt](/home/jonghan/findalpha/arbitrage/funding%20fee/reference/개발요구사항.txt)는 [docs/development_requirements_checklist.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/development_requirements_checklist.md)에 운영 체크리스트로 반영합니다.
+| 경로 | 설명 |
+| --- | --- |
+| `logs/` | 실행 로그와 리포트 산출물 |
+| `runtime/` | pause control 등 런타임 상태 파일 |
+| `.venv/`, `__pycache__/` | 개발 환경/캐시 |
 
-## 9. 지금 기준으로 무시해도 되는 것
-
-### [logs](/home/jonghan/findalpha/arbitrage/funding%20fee/logs)
-- 실행 산출물입니다.
-- 구조를 읽을 때는 안 봐도 됩니다.
-
-### `.venv`, `__pycache__`
-- 개발 런타임/캐시입니다.
-- 소스 구조 자체와는 무관합니다.
-
-## 10. 추천 동선
-
-### 전략 동작을 볼 때
-1. [main.py](/home/jonghan/findalpha/arbitrage/funding%20fee/main.py)
-2. [strategy.py](/home/jonghan/findalpha/arbitrage/funding%20fee/strategy.py)
-3. [src/okx_f_module/exchange.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/okx_f_module/exchange.py)
-4. [src/binance_f_module/exchange.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/binance_f_module/exchange.py)
-
-### DB 적재를 볼 때
-1. [src/ops/persistence/trading_dev_normalizers.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/trading_dev_normalizers.py)
-2. [src/ops/persistence/trading_dev_store.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/trading_dev_store.py)
-3. [src/ops/persistence/event_hooks.py](/home/jonghan/findalpha/arbitrage/funding%20fee/src/ops/persistence/event_hooks.py)
-
-### 실행 스크립트를 볼 때
-1. [scripts/runtime/run_strategy_live.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_strategy_live.sh)
-2. [scripts/runtime/run_fx_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_fx_collector.sh)
-3. [scripts/runtime/run_symbol_price_collector.sh](/home/jonghan/findalpha/arbitrage/funding%20fee/scripts/runtime/run_symbol_price_collector.sh)
-
-### 운영 절차를 볼 때
-1. [README.md](/home/jonghan/findalpha/arbitrage/funding%20fee/README.md)
-2. [docs/runbook.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/runbook.md)
-3. [docs/env_vars.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/env_vars.md)
-4. [docs/development_requirements_checklist.md](/home/jonghan/findalpha/arbitrage/funding%20fee/docs/development_requirements_checklist.md)
+위 경로는 구조 파악 시 먼저 볼 필요가 없습니다.

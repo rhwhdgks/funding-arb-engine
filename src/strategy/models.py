@@ -101,6 +101,8 @@ class StrategyConfig:
     maker_entry_engine_requote_sec: float = 1.0
     maker_entry_engine_replace_edge_bps: float = 5.0
     maker_entry_engine_queue_edge_gap_bps: float = 10.0
+    maker_entry_engine_keep_edge_buffer_bps: float = 2.0
+    maker_entry_engine_active_stale_sec: float = 3.0
     maker_entry_engine_transient_pause_sec: float = 60.0
     maker_entry_engine_stale_pause_sec: float = 30.0
     maker_entry_q4_fast_hedge: bool = False

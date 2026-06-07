@@ -174,6 +174,8 @@ class Exchange:
             errors.append("missing_funding_rate")
         if not next_funding_time or int(next_funding_time) <= 0:
             errors.append("missing_next_funding_time")
+        elif int(next_funding_time) < now_ms - 60_000:
+            errors.append("stale_next_funding_time")
 
         observed = [rate, next_funding_time]
         status = "valid" if not errors else (
@@ -1336,6 +1338,9 @@ class Exchange:
         if result.get("error") == "not_exist":
             self._remove_waiting_order(uuid)
             self._forget_order_status(uuid)
+            return
+
+        if result.get("error"):
             return
 
         self._remove_waiting_order(uuid)

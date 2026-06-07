@@ -107,6 +107,50 @@ def upsert_trade_history_rows(conn, rows: list[dict[str, Any]]) -> int:
     return len(values)
 
 
+def upsert_strategy_entry_quality_row(conn, row: dict[str, Any]) -> int:
+    sql = """
+    INSERT INTO strategy_entry_quality (
+        account_label, logic,
+        run_id, pair_id, symbol, entry_time_ms,
+        expected_net_edge_bps, actual_open_edge_bps, entry_slippage_bps,
+        hedge_latency_ms, trade_refs_json, raw_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+        run_id = COALESCE(VALUES(run_id), run_id),
+        symbol = VALUES(symbol),
+        entry_time_ms = VALUES(entry_time_ms),
+        expected_net_edge_bps = VALUES(expected_net_edge_bps),
+        actual_open_edge_bps = VALUES(actual_open_edge_bps),
+        entry_slippage_bps = VALUES(entry_slippage_bps),
+        hedge_latency_ms = VALUES(hedge_latency_ms),
+        trade_refs_json = VALUES(trade_refs_json),
+        raw_json = VALUES(raw_json)
+    """
+
+    values = (
+        _row_account_label(row),
+        _row_logic(row),
+        row.get("run_id"),
+        row["pair_id"],
+        row["symbol"],
+        row["entry_time_ms"],
+        row.get("expected_net_edge_bps"),
+        row.get("actual_open_edge_bps"),
+        row.get("entry_slippage_bps"),
+        row.get("hedge_latency_ms"),
+        row.get("trade_refs_json"),
+        row.get("raw_json"),
+    )
+
+    cur = conn.cursor()
+    try:
+        cur.execute(sql, values)
+        conn.commit()
+    finally:
+        cur.close()
+    return 1
+
+
 def upsert_order_history_rows(conn, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0

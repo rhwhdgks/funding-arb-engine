@@ -1,121 +1,67 @@
 # Environment Variables
 
-원칙: `.env`에는 거래 실행에 직접 필요한 값만 둔다. 세부 튜닝은 코드 기본값을 우선 사용하고, 실제로 자주 바꾸는 값만 env로 노출한다.
+이 문서는 실제 값 없이 환경변수의 역할과 분리 원칙만 설명합니다. 공개 문서에는 API key, token, password, 실계좌 식별 정보, DB 접속 상세값을 쓰지 않습니다.
+
+## 기본 원칙
+
+- 실서버는 루트 `.env`, 테스트 서버는 `test_server/.env`를 사용합니다.
+- `.env`, `.env.notion`, `test_server/.env`는 git에 올리지 않습니다.
+- 런처는 `STRATEGY_ENV_FILE`로 사용할 env 파일을 고릅니다.
+- 자주 바꾸는 운영값만 env로 노출하고, 낮은 수준의 튜닝값은 코드 기본값을 우선합니다.
+- DB 설정은 선택사항입니다. DB 변수가 없거나 persistence가 비활성화되면 런타임은 DB write를 skip하고 계속 실행할 수 있습니다.
+
+## 파일별 역할
+
+| 파일 | 역할 |
+| --- | --- |
+| `.env` | 실서버 실행용 DB/거래소/전략 운영값 |
+| `test_server/.env` | 테스트 서버 실행용 endpoint, 로그 경로, runtime 파일 경로 |
+| `.env.notion` | Notion 연동용 별도 값 |
+| shell 환경변수 | 일회성 실행 duration, label, collector 옵션 override |
 
 ## Root `.env`
 
-공통 DB/거래소 키와 기본 전략 핵심값만 둔다.
+루트 env는 실서버 운영값을 담습니다. 값 자체는 문서에 적지 않고, 역할만 관리합니다.
 
-### MariaDB
-- `MARIADB_HOST`
-- `MARIADB_PORT`
-- `MARIADB_USER`
-- `MARIADB_PASSWORD`
-- `MARIADB_DATABASE`
-- `ENABLE_DB_PERSISTENCE`
-
-DB 설정은 선택값이다. `MARIADB_*`가 하나도 없으면 runtime DB writer는 자동 비활성화되고, 전략 실행은 DB 없이 계속 진행한다. 강제로 켜거나 끄고 싶으면 `ENABLE_DB_PERSISTENCE=1/0`을 사용한다.
-
-### Exchange Credentials
-- `BINANCE_ACCESS_KEY`
-- `BINANCE_SECRET_KEY`
-- `OKX_ACCESS_KEY`
-- `OKX_SECRET_KEY`
-- `OKX_PASSPHRASE`
-
-### Strategy Core
-- `STRATEGY_ACCOUNT_LABEL`
-- `STRATEGY_LOGIC`
-- `STRATEGY_EXCHANGES`
-- `STRATEGY_ALLOWED_PAIRS`
-- `STRATEGY_SYMBOLS`
-- `STRATEGY_LEVERAGE`
-- `STRATEGY_MARGIN_MODE`
-- `STRATEGY_ORDER_NOTIONAL_USD`
-- `STRATEGY_MAX_OPEN_PAIRS`
-- `STRATEGY_MAX_GROSS_LEVERAGE`
-- `STRATEGY_MAX_LONG_LEVERAGE`
-- `STRATEGY_MAX_SHORT_LEVERAGE`
-
-### Entry Control
-- `STRATEGY_ENTRY_CONTROL_FILE`
-- `STRATEGY_ENTRY_CONTROL_FAIL_CLOSED`
+| 계열 | 역할 |
+| --- | --- |
+| DB 접속 계열 | MariaDB host/port/user/password/database, persistence on/off |
+| 거래소 인증 계열 | Binance/OKX 등 private REST 호출에 필요한 인증값 |
+| 전략 대상 계열 | account label, strategy logic, exchanges, allowed pairs, symbols |
+| 주문 규모 계열 | leverage, margin mode, order notional, max open pairs |
+| 리스크 계열 | gross/long/short exposure cap, rate-limit guard threshold |
+| 진입/청산 계열 | expected edge, funding forecast, hold, take-profit, stop-loss, close mode |
+| 런타임 계열 | log path, pid/lock/run metadata path, stdout style |
+| entry control 계열 | pause control 파일 경로, fail-closed 여부 |
 
 ## `test_server/.env`
 
-테스트 서버는 root와 같은 핵심값에 더해 로그 경로와 테스트 endpoint만 추가로 둔다.
+테스트 서버 env는 루트 코드와 같은 전략을 실행하되, 아래 항목을 테스트용으로 분리합니다.
 
-### Runtime Files
-- `STRATEGY_LIVE_LOG_DIR`
-- `STRATEGY_LIVE_PID_FILE`
-- `STRATEGY_LIVE_LOCK_FILE`
-- `STRATEGY_LIVE_STDOUT_LOG`
-- `STRATEGY_LIVE_EVENT_LOG_PATH`
-- `STRATEGY_LIVE_RUN_META_FILE`
-- `STRATEGY_STDOUT_LOG_STYLE`
+- 테스트 endpoint와 simulated trading 관련 설정
+- 로그, PID, lock, JSONL, run metadata 경로
+- 테스트용 symbol/order notional/duration
+- 테스트 서버용 account label
+- auto enter/auto close/approval mode
 
-### Test Endpoints
-- `BINANCE_BASE_URL`
-- `BINANCE_FUTURES_WS_PUBLIC_URL`
-- `OKX_BASE_URL`
-- `OKX_SIMULATED_TRADING`
-- `OKX_WS_PUBLIC_URL`
-
-### Run Policy
-- `STRATEGY_RUN_DURATION`
-- `STRATEGY_ENABLE_LIVE`
-- `STRATEGY_APPROVAL_MODE`
-- `STRATEGY_AUTO_ENTER_ENABLED`
-- `STRATEGY_AUTO_CLOSE_ENABLED`
-
-### Entry / Close Policy
-- `STRATEGY_AUTO_ENTER_COOLDOWN_SEC`
-- `STRATEGY_FIRST_LEG_TIMEOUT_SEC`
-- `STRATEGY_HEDGE_REQUOTE_TIMEOUT_SEC`
-- `STRATEGY_HEDGE_REQUOTE_COUNT`
-- `STRATEGY_ACTION_ACCOUNT_FRESH_SEC`
-- `STRATEGY_ENTRY_FIRST_LEG_PRICE_MODE` 기본 `passive`. 실운영 권장값은 `spread_buffer`.
-- `STRATEGY_ENTRY_SPREAD_BPS` maker 주문 위치 전용 spread. 진입 조건과 분리되어 있으며 기본 `0`.
-- `STRATEGY_ENTRY_CANCEL_BUFFER_BPS` Question4식 cancel buffer. `spread_buffer`에서는 주문가가 `spread + cancel_buffer / 2`에 놓인다.
-- `STRATEGY_MIN_EXPECTED_NET_EDGE_USD`
-- `STRATEGY_MIN_EXPECTED_NET_EDGE_BPS` 진입 기회 판단 전용 threshold. maker 주문 위치에는 fallback으로 사용하지 않는다.
-- `STRATEGY_REQUIRE_FUNDING_PAYMENT`
-- `STRATEGY_MIN_HOLD_SEC`
-- `STRATEGY_CLOSE_CANDIDATE_MIN_AGE_SEC`
-- `STRATEGY_TAKE_PROFIT_BPS` 기본 `6`. 비워도 bps 기준으로 동작한다.
-- `STRATEGY_STOP_LOSS_BPS` 기본 `8`. 내부 threshold는 `-8bps`로 정규화한다.
-- `STRATEGY_HOLD_BUFFER_BPS` 기본 `2`. 비워도 bps 기준으로 동작한다.
-- `STRATEGY_CLOSE_EXECUTION_MODE` 기본 `safe_taker`. `maker_then_taker`면 정상 청산(`close_candidate,take_profit`)에서 한쪽 maker 체결 후 반대쪽을 taker로 맞춘다.
-- `STRATEGY_CLOSE_MAKER_TIMEOUT_SEC` maker 청산 leg 대기 시간. 기본 `2`.
-- `STRATEGY_CLOSE_MAKER_PRICE_BPS` maker 청산 가격을 best bid/ask에서 얼마나 더 보수적으로 둘지. 기본 `0`.
-- `STRATEGY_CLOSE_MAKER_REASONS` maker 청산을 허용할 close reason 목록. 기본 `close_candidate,take_profit`.
-- `STRATEGY_TAKE_PROFIT_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
-- `STRATEGY_STOP_LOSS_USD` legacy fallback 값. 일반 경로에서는 bps가 우선이다.
-
-## Removed From Main Env
-
-아래 계열은 기본 env에서 제외한다.
-
-- GateIO / Hyperliquid credentials: 현재 기본 전략 경로가 Binance/OKX라 제외
-- Notion tokens: trading runtime 필수값이 아니라 `.env.notion`에 분리
-- Ops web settings: 웹 서버를 돌릴 때 별도 shell/env로 주입
-- Legacy single-symbol keys: `SYMBOL`, `ENTRY_QTY`, `LEVERAGE`, `MARGIN_MODE` 대신 `STRATEGY_*` 사용
-- Low-level websocket/reconcile tuning: 코드 기본값 사용
+테스트 서버라고 해도 주문 실행 경로는 실제 거래소 테스트 환경을 호출할 수 있습니다. 중지할 때는 프로세스를 직접 죽이기보다 런처의 `stop`을 사용합니다.
 
 ## Notion Env
 
-Notion direct API 스크립트는 root `.env`를 먼저 읽고, 그 다음 ignored 파일인 `.env.notion`을 override 로드한다.
+Notion 연동은 trading runtime 필수값이 아닙니다. 별도 env 파일로 분리하고, 운영 코드 설명이나 공개 문서에는 토큰 값을 적지 않습니다.
 
-- `NOTION_TOKEN`
-- `NOTION_DISPLAY_DATABASE_ID`
-- `NOTION_INDEX_DATABASE_ID`
-- `NOTION_VERSION`
+## Collector Env
 
-## Notes
+| 계열 | 역할 |
+| --- | --- |
+| `SYMBOL_PRICE_*` | symbol price collector의 대상 거래소, 심볼, 주기, 로그/runtime 파일 |
+| `FX_*` | FX collector의 실행 주기, 로그/runtime 파일, node 실행 경로 |
 
-- `STRATEGY_ACCOUNT_LABEL`은 DB row를 `test`/`real` 계좌별로 분리하는 값이다.
-- `STRATEGY_LOGIC`은 같은 계좌 안에서 전략/로직을 구분하는 값이며 현재 기본값은 `funding fee`다.
-- `STRATEGY_LEVERAGE`는 거래소에 설정할 주문 레버리지다. `.env`를 바꾼 뒤 strategy를 재시작해야 반영된다.
-- `STRATEGY_MAX_GROSS_LEVERAGE`는 계정 전체 gross exposure cap이다. `0`이면 비활성화다.
-- `STRATEGY_MAX_LONG_LEVERAGE`, `STRATEGY_MAX_SHORT_LEVERAGE`도 `0`이면 비활성화다.
-- Exposure cap은 신규 진입만 막고, close/recovery/shutdown flatten은 막지 않는다.
+보조 수집기는 전략과 별도로 start/stop/status/logs/once 명령을 지원합니다. 자세한 명령은 [runbook.md](runbook.md)를 봅니다.
+
+## 운영 메모
+
+- `STRATEGY_LEVERAGE`와 margin mode 계열 값은 재시작 후 bootstrap 경로에서 반영됩니다.
+- exposure cap은 신규 진입만 막고, close/recovery/shutdown flatten은 막지 않아야 합니다.
+- `STRATEGY_RUN_DURATION=forever`는 무기한 실행 의도로 사용합니다. final report는 stop 이후 생성합니다.
+- env를 바꾼 뒤에는 실행 중 프로세스가 새 값을 읽는지 가정하지 말고 재시작 여부를 확인합니다.

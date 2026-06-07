@@ -111,6 +111,33 @@ CREATE TABLE IF NOT EXISTS trade_history (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 
+CREATE TABLE IF NOT EXISTS strategy_entry_quality (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    account_label VARCHAR(16) NOT NULL DEFAULT 'test',
+    logic VARCHAR(64) NOT NULL DEFAULT 'funding fee',
+
+    run_id VARCHAR(128) NULL,
+    pair_id VARCHAR(160) NOT NULL,
+    symbol VARCHAR(32) NOT NULL,
+
+    entry_time_ms BIGINT UNSIGNED NOT NULL,
+
+    expected_net_edge_bps DECIMAL(18, 8) NULL,
+    actual_open_edge_bps DECIMAL(18, 8) NULL,
+    entry_slippage_bps DECIMAL(18, 8) NULL,
+
+    hedge_latency_ms BIGINT UNSIGNED NULL,
+
+    trade_refs_json JSON NULL,
+    raw_json LONGTEXT NULL,
+
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_strategy_entry_quality_pair (account_label, logic, pair_id),
+    KEY idx_strategy_entry_quality_time (account_label, logic, entry_time_ms),
+    KEY idx_strategy_entry_quality_symbol_time (symbol, entry_time_ms)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
 CREATE TABLE IF NOT EXISTS symbol_price (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
     exchange_name VARCHAR(32) NOT NULL,

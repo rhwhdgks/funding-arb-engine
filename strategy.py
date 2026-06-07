@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from src.core.action_gate import ActionGate
 from dotenv import load_dotenv
+from src.ops.persistence.entry_quality import schedule_entry_quality_persist
 from src.ops.persistence.runtime import build_runtime_persistence_from_env
 from src.core.exchange_registry import build_exchange
 from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_csv
@@ -164,6 +165,10 @@ def record_live_event(config: StrategyConfig, event_type: str, **payload: Any) -
         append_jsonl(config.live_event_log_path, row)
     except Exception as exc:
         print(f"[strategy][warn] failed_to_write_live_event type={event_type} error={exc!r}")
+    try:
+        schedule_entry_quality_persist(row)
+    except Exception as exc:
+        print(f"[strategy][warn] failed_to_schedule_entry_quality_persist type={event_type} error={exc!r}")
 
 
 def simple_stdout_enabled(config: StrategyConfig | None = None) -> bool:
@@ -1645,8 +1650,8 @@ def bootstrap_result_failures(exchange_name: str, symbol: str, result: Any) -> l
     return failures
 
 
-async def cancel_if_open(exchange: Any, symbol: str, order_result: dict[str, Any] | None) -> None:
-    await _execution_cancel_if_open(
+async def cancel_if_open(exchange: Any, symbol: str, order_result: dict[str, Any] | None) -> Any:
+    return await _execution_cancel_if_open(
         exchange,
         symbol,
         order_result,
@@ -3069,7 +3074,7 @@ async def enter_pair_limit_then_hedge(
         f"[strategy][enter] first_leg exchange={first_exchange_name} side={first_side} "
         f"qty={executable_qty:.6f} requested={candidate.target_qty:.6f} price={first_price}"
     )
-    first_filled_qty, _, first_price_used = await execute_requoting_limit_leg(
+    first_filled_qty, first_order_result, first_price_used = await execute_requoting_limit_leg(
         exchange=first_exchange,
         symbol=symbol,
         side=first_side,
@@ -3597,6 +3602,10 @@ async def enter_pair_limit_then_hedge(
         hedge_side=hedge_side,
         first_leg_fill_price=first_price_used,
         hedge_fill_price=hedge_price_used,
+        first_order_id=extract_order_uuid(first_order_result),
+        first_client_order_id=extract_order_uuid(first_order_result),
+        hedge_order_id=hedge_execution.order_id,
+        hedge_client_order_id=hedge_execution.client_order_id,
         long_entry_price=long_entry_price,
         short_entry_price=short_entry_price,
         candidate_long_ask=candidate.long_ask,
@@ -3696,6 +3705,8 @@ async def complete_entry_after_maker_first_fill(
     assumed_flat_until_ms: dict[tuple[str, str], int] | None,
     entry_started_ms: int,
     source: str = "maker_entry_engine",
+    first_order_id: str | None = None,
+    first_client_order_id: str | None = None,
 ) -> OpenPairState | None:
     symbol = candidate.symbol
     first_exchange = exchanges[first_exchange_name]
@@ -4041,6 +4052,10 @@ async def complete_entry_after_maker_first_fill(
         hedge_side=hedge_side,
         first_leg_fill_price=first_price_used,
         hedge_fill_price=hedge_price_used,
+        first_order_id=first_order_id,
+        first_client_order_id=first_client_order_id,
+        hedge_order_id=hedge_execution.order_id,
+        hedge_client_order_id=hedge_execution.client_order_id,
         long_entry_price=long_entry_price,
         short_entry_price=short_entry_price,
         first_leg_done_ms=first_leg_done_ms,

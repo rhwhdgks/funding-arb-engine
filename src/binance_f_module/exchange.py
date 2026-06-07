@@ -1503,6 +1503,9 @@ class Exchange:
             self._forget_order_status(uuid)
             return
 
+        if result.get("error"):
+            return
+
         self._remove_waiting_order(uuid)
         self._forget_order_status(uuid)
 

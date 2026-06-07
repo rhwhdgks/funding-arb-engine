@@ -332,7 +332,7 @@ async def _request(
         is_last = attempt >= retry_max
 
         headers = {"Content-Type": "application/json"}
-        if SIMULATED_TRADING in {"1", "true", "TRUE"}:
+        if auth and SIMULATED_TRADING in {"1", "true", "TRUE"}:
             headers["x-simulated-trading"] = "1"
 
         if auth:
@@ -1033,6 +1033,19 @@ async def delete_order(order_id: str, option: dict[str, Any] = {}) -> dict[str, 
     if status != 200 or not isinstance(data, dict):
         return None
     if data.get("code") != "0":
+        rows = data.get("data") or []
+        if rows:
+            row = rows[0]
+            s_code = str(row.get("sCode") or "")
+            s_msg = str(row.get("sMsg") or "").lower()
+            if s_code == "51400" or "filled, canceled or does not exist" in s_msg:
+                return {
+                    "state": "not_exist",
+                    "error": "not_exist",
+                    "code": s_code,
+                    "uuid": payload.get("clOrdId") or payload.get("ordId"),
+                    "raw": data,
+                }
         return {"error": data, "raw": data}
 
     rows = data.get("data") or []

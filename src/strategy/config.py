@@ -236,6 +236,12 @@ def load_strategy_config() -> StrategyConfig:
         maker_entry_engine_queue_edge_gap_bps=float(
             os.getenv("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS", "10.0") or 10.0
         ),
+        maker_entry_engine_keep_edge_buffer_bps=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_KEEP_EDGE_BUFFER_BPS", "2.0") or 2.0
+        ),
+        maker_entry_engine_active_stale_sec=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_ACTIVE_STALE_SEC", "3.0") or 3.0
+        ),
         maker_entry_engine_transient_pause_sec=float(
             os.getenv("STRATEGY_MAKER_ENGINE_TRANSIENT_PAUSE_SEC", "60.0") or 60.0
         ),
@@ -304,6 +310,10 @@ def load_strategy_config() -> StrategyConfig:
         raise ValueError("STRATEGY_MAKER_ENGINE_REPLACE_EDGE_BPS must be >= 0")
     if config.maker_entry_engine_queue_edge_gap_bps < 0:
         raise ValueError("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS must be >= 0")
+    if config.maker_entry_engine_keep_edge_buffer_bps < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_KEEP_EDGE_BUFFER_BPS must be >= 0")
+    if config.maker_entry_engine_active_stale_sec < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_ACTIVE_STALE_SEC must be >= 0")
     if config.maker_entry_engine_transient_pause_sec < 0:
         raise ValueError("STRATEGY_MAKER_ENGINE_TRANSIENT_PAUSE_SEC must be >= 0")
     if config.maker_entry_engine_stale_pause_sec < 0:

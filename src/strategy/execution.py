@@ -233,14 +233,15 @@ async def cancel_if_open(
     order_result: dict[str, Any] | None,
     *,
     extract_order_uuid: Callable[[dict[str, Any] | None], str | None],
-) -> None:
+) -> Any:
     order_uuid = extract_order_uuid(order_result)
     if not order_uuid:
-        return
+        return None
     try:
-        await exchange.cancel_order(symbol, order_uuid)
+        return await exchange.cancel_order(symbol, order_uuid)
     except Exception as exc:
         print(f"[strategy][cancel_if_open][warn] symbol={symbol} uuid={order_uuid} error={exc}")
+        return {"error": repr(exc), "ticker": symbol, "uuid": order_uuid}
 
 
 def adaptive_limit_action_interval_sec(exchange: Any, config: Any) -> float:

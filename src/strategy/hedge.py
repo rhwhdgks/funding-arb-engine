@@ -13,6 +13,8 @@ class HedgeExecutionResult:
     filled_qty: float
     remaining_qty: float
     avg_price: float = 0.0
+    order_id: str | None = None
+    client_order_id: str | None = None
 
 
 def emit_hedge_event(
@@ -55,6 +57,8 @@ async def execute_residual_hedge(
     hedged_qty = 0.0
     hedge_price_used = 0.0
     last_logged_hedged_qty = 0.0
+    last_order_id: str | None = None
+    last_client_order_id: str | None = None
 
     if target_qty <= eps:
         return HedgeExecutionResult(
@@ -137,6 +141,9 @@ async def execute_residual_hedge(
                 current_hedge_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
                 market_kwargs["is_close"] = use_reduce_only_market_close(exchange, current_hedge_qty, side)
             market_result = await exchange.market_order(symbol, side, remaining_qty, **market_kwargs)
+            if isinstance(market_result, dict) and not market_result.get("error"):
+                last_order_id = market_result.get("order_id")
+                last_client_order_id = market_result.get("client_order_id") or market_result.get("uuid")
             if market_result and market_result.get("error"):
                 print(f"[strategy][{market_log_prefix}][market][error] {market_log_text} 오류 result={market_result}")
             if fast_ack_enabled and market_result and not market_result.get("error"):
@@ -150,8 +157,8 @@ async def execute_residual_hedge(
                     target_qty=target_qty,
                     assumed_filled_qty=hedged_qty,
                     remaining_qty=outstanding_qty(),
-                    order_id=market_result.get("order_id"),
-                    client_order_id=market_result.get("client_order_id") or market_result.get("uuid"),
+                    order_id=last_order_id,
+                    client_order_id=last_client_order_id,
                     reason="market_order_accepted",
                 )
                 log_progress("market_fast_ack")
@@ -186,6 +193,8 @@ async def execute_residual_hedge(
             filled_qty=hedged_qty,
             remaining_qty=outstanding_qty(),
             avg_price=hedge_price_used,
+            order_id=last_order_id,
+            client_order_id=last_client_order_id,
         )
 
     for attempt in range(config.hedge_requote_count + 1):
@@ -203,6 +212,8 @@ async def execute_residual_hedge(
         )
         hedge_result = await exchange.order(symbol, side, remaining_qty, hedge_price, is_hedge=True)
         if hedge_result and not hedge_result.get("error"):
+            last_order_id = hedge_result.get("order_id")
+            last_client_order_id = hedge_result.get("client_order_id") or hedge_result.get("uuid")
             await position_waiter(
                 exchange,
                 symbol,
@@ -270,4 +281,6 @@ async def execute_residual_hedge(
         filled_qty=hedged_qty,
         remaining_qty=outstanding_qty(),
         avg_price=hedge_price_used,
+        order_id=last_order_id,
+        client_order_id=last_client_order_id,
     )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -48,6 +49,7 @@ class MakerOrderState:
     pre_qty_hedge: float
     submitted_ms: int
     disappeared_ms: int = 0
+    cancel_retry_after_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -62,7 +64,7 @@ class MakerEntryHooks:
     extract_order_uuid: Callable[[dict[str, Any] | None], str | None]
     is_waiting_order_active: Callable[[Any, dict[str, Any] | None], bool]
     price_changed: Callable[[Any, str, float, float, StrategyConfig], bool]
-    cancel_if_open: Callable[[Any, str, dict[str, Any] | None], Awaitable[None]]
+    cancel_if_open: Callable[[Any, str, dict[str, Any] | None], Awaitable[Any]]
     bootstrap_candidate: Callable[[PairCandidate, dict[str, Any], StrategyConfig], Awaitable[list[dict[str, Any]]]]
     complete_after_first_fill: Callable[..., Awaitable[OpenPairState | None]]
     record_event: Callable[..., None]
@@ -102,10 +104,20 @@ class MakerEntryEngine:
             return set()
         return {self.active.candidate.symbol.upper()}
 
-    async def cancel_active(self, exchanges: dict[str, Any], symbol: str, reason: str, config: StrategyConfig) -> None:
+    async def cancel_active(
+        self,
+        exchanges: dict[str, Any],
+        symbol: str,
+        reason: str,
+        config: StrategyConfig,
+        assumed_flat_until_ms: dict[tuple[str, str], int],
+    ) -> OpenPairState | None:
         state = self.active
         if state is None:
-            return
+            return None
+        now_ms = int(time.time() * 1000)
+        if state.cancel_retry_after_ms > now_ms:
+            return None
         if "rate_limit_pressure" in reason:
             self._pause_symbol(symbol, reason)
         elif "stale_orderbook" in reason:
@@ -115,7 +127,34 @@ class MakerEntryEngine:
                 int(max(config.maker_entry_engine_stale_pause_sec, 0.0) * 1000),
             )
         exchange = exchanges[state.first_exchange_name]
-        await self.hooks.cancel_if_open(exchange, symbol, state.order_result)
+        cancel_result = await self.hooks.cancel_if_open(exchange, symbol, state.order_result)
+        if not self._cancel_result_is_terminal(cancel_result):
+            retry_ms = self._cancel_retry_ms(cancel_result, config)
+            state.cancel_retry_after_ms = int(time.time() * 1000) + retry_ms
+            self.hooks.record_event(
+                "maker_entry_order_cancel_failed",
+                candidate_id=state.candidate.id,
+                symbol=symbol,
+                exchange=state.first_exchange_name,
+                side=state.first_side,
+                order_id=state.order_id,
+                price=state.price,
+                qty=state.target_qty,
+                reason=reason,
+                cancel_result=cancel_result,
+                retry_after_ms=state.cancel_retry_after_ms,
+            )
+            return None
+
+        pair = await self._complete_if_fill_visible(
+            state=state,
+            exchanges=exchanges,
+            config=config,
+            assumed_flat_until_ms=assumed_flat_until_ms,
+            reason=f"after_cancel:{reason}",
+        )
+        if pair is not None:
+            return pair
         self.hooks.record_event(
             "maker_entry_order_cancelled",
             candidate_id=state.candidate.id,
@@ -126,8 +165,37 @@ class MakerEntryEngine:
             price=state.price,
             qty=state.target_qty,
             reason=reason,
+            cancel_result=cancel_result,
         )
         self.active = None
+        return None
+
+    def _cancel_result_is_terminal(self, result: Any) -> bool:
+        if not isinstance(result, dict):
+            return result is not None
+        error = str(result.get("error") or "").strip().lower()
+        state = str(result.get("state") or result.get("status") or "").strip().lower()
+        if result.get("ok") or state in {"not_exist", "canceled", "cancelled", "filled", "closed"}:
+            return True
+        if error in {"not_exist", "order_not_exist", "already_cancelled", "already_canceled"}:
+            return True
+        code = result.get("code")
+        if code in (-2011, -2013, "-2011", "-2013"):
+            return True
+        text = str(result or "").lower()
+        if "51400" in text or "filled, canceled or does not exist" in text:
+            return True
+        return not bool(error)
+
+    def _cancel_retry_ms(self, result: Any, config: StrategyConfig) -> int:
+        text = str(result or "").lower()
+        if "cancel_cooldown" in text:
+            return 1_000
+        if self._is_transient_submit_error(text):
+            return int(max(config.maker_entry_engine_transient_pause_sec, 1.0) * 1000)
+        if "rate" in text or "-1003" in text or "too many" in text:
+            return RATE_LIMIT_PAUSE_MS
+        return 2_000
 
     def _pause_symbol(self, symbol: str, reason: str) -> None:
         self._pause_symbol_for_ms(symbol, reason, RATE_LIMIT_PAUSE_MS)
@@ -206,12 +274,15 @@ class MakerEntryEngine:
                         edge_improvement_bps=edge_improvement_bps,
                         replace_threshold_bps=config.maker_entry_engine_replace_edge_bps,
                     )
-                    await self.cancel_active(
+                    cancelled_pair = await self.cancel_active(
                         exchanges,
                         state.candidate.symbol,
                         f"better_candidate:{replacement.symbol}:{edge_improvement_bps:.2f}bps",
                         config,
+                        assumed_flat_until_ms,
                     )
+                    if cancelled_pair is not None:
+                        opened.append(cancelled_pair)
             return opened
 
         if config.maker_entry_engine_max_open_orders <= 0:
@@ -303,6 +374,13 @@ class MakerEntryEngine:
             - float(config.maker_entry_engine_queue_edge_gap_bps)
         )
         return float(candidate.expected_net_edge_bps) >= min_queue_edge_bps
+
+    def _active_edge_still_valid(self, candidate: PairCandidate, config: StrategyConfig) -> bool:
+        min_keep_edge_bps = (
+            float(config.min_expected_net_edge_bps)
+            - float(config.maker_entry_engine_keep_edge_buffer_bps)
+        )
+        return float(candidate.expected_net_edge_bps) >= min_keep_edge_bps
 
     def _replacement_candidate(
         self,
@@ -478,13 +556,32 @@ class MakerEntryEngine:
         first_exchange = exchanges[state.first_exchange_name]
 
         if any(pair.symbol == symbol and pair.status not in {"closed", "failed"} for pair in open_pairs.values()):
-            await self.cancel_active(exchanges, symbol, "symbol_pair_exists", config)
-            return None
+            return await self.cancel_active(exchanges, symbol, "symbol_pair_exists", config, assumed_flat_until_ms)
 
         post_qty_first = self.hooks.extract_position_qty(first_exchange.get_symbol_snapshot(symbol))
         filled_qty = self.hooks.position_fill_delta(state.pre_qty_first, post_qty_first, state.first_side)
         if filled_qty > EPS:
-            await self.hooks.cancel_if_open(first_exchange, symbol, state.order_result)
+            cancel_result = None
+            if filled_qty < state.target_qty - EPS:
+                cancel_result = await self.hooks.cancel_if_open(first_exchange, symbol, state.order_result)
+                if not self._cancel_result_is_terminal(cancel_result):
+                    retry_ms = self._cancel_retry_ms(cancel_result, config)
+                    state.cancel_retry_after_ms = int(time.time() * 1000) + retry_ms
+                    self.hooks.record_event(
+                        "maker_entry_order_cancel_failed",
+                        candidate_id=state.candidate.id,
+                        symbol=symbol,
+                        exchange=state.first_exchange_name,
+                        side=state.first_side,
+                        order_id=state.order_id,
+                        price=state.price,
+                        qty=state.target_qty,
+                        reason="filled_residual_cancel_failed",
+                        filled_qty=filled_qty,
+                        cancel_result=cancel_result,
+                        retry_after_ms=state.cancel_retry_after_ms,
+                    )
+                    return None
             self.hooks.record_event(
                 "maker_entry_fill_detected",
                 candidate_id=state.candidate.id,
@@ -495,6 +592,7 @@ class MakerEntryEngine:
                 target_qty=state.target_qty,
                 filled_qty=filled_qty,
                 price=state.price,
+                cancel_result=cancel_result,
             )
             self.active = None
             return await self.hooks.complete_after_first_fill(
@@ -513,16 +611,22 @@ class MakerEntryEngine:
                 assumed_flat_until_ms=assumed_flat_until_ms,
                 entry_started_ms=state.submitted_ms,
                 source="maker_entry_engine",
+                first_order_id=state.order_id,
+                first_client_order_id=state.order_id,
             )
 
         candidate = self._current_candidate_for_state(candidates, state)
         if candidate is None:
-            await self.cancel_active(exchanges, symbol, "candidate_missing", config)
-            return None
-        hard_reasons = self._hard_blocking_reasons_excluding_own_order(candidate, state)
+            return await self.cancel_active(exchanges, symbol, "candidate_missing", config, assumed_flat_until_ms)
+        hard_reasons = self._hard_blocking_reasons_excluding_own_order(candidate, state, exchanges, config)
         if hard_reasons:
-            await self.cancel_active(exchanges, symbol, "candidate_blocked:" + "|".join(hard_reasons[:3]), config)
-            return None
+            return await self.cancel_active(
+                exchanges,
+                symbol,
+                "candidate_blocked:" + "|".join(hard_reasons[:3]),
+                config,
+                assumed_flat_until_ms,
+            )
         if "risk:rate_limit_pressure" in candidate.block_reasons:
             self._pause_symbol(symbol, "risk:rate_limit_pressure")
             return None
@@ -544,13 +648,44 @@ class MakerEntryEngine:
             settle_ms = int(max(config.entry_order_settle_sec, 0.5) * 1000)
             if state.disappeared_ms + settle_ms > now_ms:
                 return None
+            cancel_result = await self.hooks.cancel_if_open(first_exchange, symbol, state.order_result)
+            if not self._cancel_result_is_terminal(cancel_result):
+                retry_ms = self._cancel_retry_ms(cancel_result, config)
+                state.cancel_retry_after_ms = int(time.time() * 1000) + retry_ms
+                self.hooks.record_event(
+                    "maker_entry_order_cancel_failed",
+                    candidate_id=state.candidate.id,
+                    symbol=symbol,
+                    exchange=state.first_exchange_name,
+                    side=state.first_side,
+                    order_id=state.order_id,
+                    price=state.price,
+                    qty=state.target_qty,
+                    reason="order_disappeared_without_fill",
+                    cancel_result=cancel_result,
+                    retry_after_ms=state.cancel_retry_after_ms,
+                )
+                return None
+            pair = await self._complete_if_fill_visible(
+                state=state,
+                exchanges=exchanges,
+                config=config,
+                assumed_flat_until_ms=assumed_flat_until_ms,
+                reason="after_cancel:order_disappeared_without_fill",
+            )
+            if pair is not None:
+                return pair
             self.hooks.record_event(
-                "maker_entry_order_disappeared_without_fill",
+                "maker_entry_order_cancelled",
                 candidate_id=state.candidate.id,
                 symbol=symbol,
                 exchange=state.first_exchange_name,
                 side=state.first_side,
                 order_id=state.order_id,
+                price=state.price,
+                qty=state.target_qty,
+                reason="order_disappeared_without_fill",
+                cancel_result=cancel_result,
             )
             self.active = None
             return None
@@ -560,14 +695,75 @@ class MakerEntryEngine:
             return None
         if self._symbol_pause_active(symbol):
             return None
+        if not self._active_edge_still_valid(candidate, config):
+            return await self.cancel_active(
+                exchanges,
+                symbol,
+                "edge_deteriorated",
+                config,
+                assumed_flat_until_ms,
+            )
 
         next_price = self.hooks.target_price(candidate, state.first_exchange_name, state.first_side, exchanges, config)
         if next_price <= EPS:
-            await self.cancel_active(exchanges, symbol, "target_price_missing", config)
-            return None
+            return await self.cancel_active(exchanges, symbol, "target_price_missing", config, assumed_flat_until_ms)
         if self.hooks.price_changed(first_exchange, symbol, state.price, next_price, config):
-            await self.cancel_active(exchanges, symbol, "requote", config)
+            return await self.cancel_active(exchanges, symbol, "requote", config, assumed_flat_until_ms)
         return None
+
+    async def _complete_if_fill_visible(
+        self,
+        *,
+        state: MakerOrderState,
+        exchanges: dict[str, Any],
+        config: StrategyConfig,
+        assumed_flat_until_ms: dict[tuple[str, str], int],
+        reason: str,
+    ) -> OpenPairState | None:
+        first_exchange = exchanges[state.first_exchange_name]
+        symbol = state.candidate.symbol
+        settle_ms = int(max(config.entry_order_settle_sec, config.action_settle_wait_sec * 2.0, 0.5) * 1000)
+        deadline_ms = int(time.time() * 1000) + settle_ms
+        sleep_sec = max(min(float(config.action_settle_wait_sec), 0.25), 0.05)
+        while True:
+            post_qty_first = self.hooks.extract_position_qty(first_exchange.get_symbol_snapshot(symbol))
+            filled_qty = self.hooks.position_fill_delta(state.pre_qty_first, post_qty_first, state.first_side)
+            if filled_qty > EPS:
+                self.hooks.record_event(
+                    "maker_entry_fill_detected",
+                    candidate_id=state.candidate.id,
+                    symbol=symbol,
+                    first_exchange=state.first_exchange_name,
+                    first_side=state.first_side,
+                    order_id=state.order_id,
+                    target_qty=state.target_qty,
+                    filled_qty=filled_qty,
+                    price=state.price,
+                    reason=reason,
+                )
+                self.active = None
+                return await self.hooks.complete_after_first_fill(
+                    candidate=state.candidate,
+                    exchanges=exchanges,
+                    config=config,
+                    first_exchange_name=state.first_exchange_name,
+                    first_side=state.first_side,
+                    hedge_exchange_name=state.hedge_exchange_name,
+                    hedge_side=state.hedge_side,
+                    pre_qty_first=state.pre_qty_first,
+                    pre_qty_hedge=state.pre_qty_hedge,
+                    first_filled_qty=filled_qty,
+                    first_price_used=state.price,
+                    executable_qty=state.target_qty,
+                    assumed_flat_until_ms=assumed_flat_until_ms,
+                    entry_started_ms=state.submitted_ms,
+                    source="maker_entry_engine",
+                    first_order_id=state.order_id,
+                    first_client_order_id=state.order_id,
+                )
+            if int(time.time() * 1000) >= deadline_ms:
+                return None
+            await asyncio.sleep(sleep_sec)
 
     def _current_candidate_for_state(
         self,
@@ -599,6 +795,8 @@ class MakerEntryEngine:
         self,
         candidate: PairCandidate,
         state: MakerOrderState,
+        exchanges: dict[str, Any],
+        config: StrategyConfig,
     ) -> list[str]:
         own_order_reason = f"{state.first_exchange_name}:open_orders_exist"
         ignored = {
@@ -610,4 +808,28 @@ class MakerEntryEngine:
             reason
             for reason in self._hard_blocking_reasons(candidate.block_reasons)
             if reason not in ignored
+            and not self._is_active_stale_within_grace(reason, candidate.symbol, exchanges, config)
         ]
+
+    def _is_active_stale_within_grace(
+        self,
+        reason: str,
+        symbol: str,
+        exchanges: dict[str, Any],
+        config: StrategyConfig,
+    ) -> bool:
+        if not reason.endswith(":stale_orderbook"):
+            return False
+        exchange_name = reason.split(":", 1)[0]
+        exchange = exchanges.get(exchange_name)
+        if exchange is None:
+            return False
+        try:
+            health = (exchange.get_symbol_snapshot(symbol) or {}).get("health") or {}
+        except Exception:
+            return False
+        stale_age_ms = _safe_float(health.get("stale_age_ms"), -1.0)
+        if stale_age_ms < 0:
+            return False
+        active_stale_ms = float(config.maker_entry_engine_active_stale_sec) * 1000.0
+        return stale_age_ms <= active_stale_ms
