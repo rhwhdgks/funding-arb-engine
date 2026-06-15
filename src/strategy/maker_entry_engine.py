@@ -234,16 +234,29 @@ class MakerEntryEngine:
         config: StrategyConfig,
         symbols: list[str],
         assumed_flat_until_ms: dict[tuple[str, str], int],
+        manual_locked_symbols: set[str] | None = None,
     ) -> list[OpenPairState]:
         if not config.maker_entry_engine_enabled:
             return []
 
         managed_symbols = self.managed_symbols(config, symbols)
+        manual_locked_symbols = {symbol.upper() for symbol in (manual_locked_symbols or set())}
         if not managed_symbols:
             return []
 
         opened: list[OpenPairState] = []
         if self.active is not None:
+            if self.active.candidate.symbol.upper() in manual_locked_symbols:
+                cancelled_pair = await self.cancel_active(
+                    exchanges,
+                    self.active.candidate.symbol,
+                    "manual_position_locked",
+                    config,
+                    assumed_flat_until_ms,
+                )
+                if cancelled_pair is not None:
+                    opened.append(cancelled_pair)
+                return opened
             pair = await self._reconcile_active_order(
                 candidates=candidates,
                 open_pairs=open_pairs,
@@ -258,6 +271,7 @@ class MakerEntryEngine:
                     candidates=candidates,
                     open_pairs=open_pairs,
                     managed_symbols=managed_symbols,
+                    manual_locked_symbols=manual_locked_symbols,
                     config=config,
                 )
                 if replacement is not None:
@@ -290,7 +304,7 @@ class MakerEntryEngine:
         if any(pair.symbol.upper() in managed_symbols and pair.status not in {"closed", "failed"} for pair in open_pairs.values()):
             return opened
 
-        queue = self._candidate_queue(candidates, open_pairs, managed_symbols, config)
+        queue = self._candidate_queue(candidates, open_pairs, managed_symbols, config, manual_locked_symbols)
         candidate = queue[0] if queue else None
         if candidate is None:
             return opened
@@ -344,7 +358,9 @@ class MakerEntryEngine:
         open_pairs: dict[str, OpenPairState],
         managed_symbols: set[str],
         config: StrategyConfig,
+        manual_locked_symbols: set[str] | None = None,
     ) -> list[PairCandidate]:
+        manual_locked_symbols = {symbol.upper() for symbol in (manual_locked_symbols or set())}
         active_pair_symbols = {
             pair.symbol.upper()
             for pair in open_pairs.values()
@@ -354,6 +370,8 @@ class MakerEntryEngine:
         for candidate in candidates:
             symbol = candidate.symbol.upper()
             if symbol not in managed_symbols:
+                continue
+            if symbol in manual_locked_symbols:
                 continue
             if symbol in active_pair_symbols:
                 continue
@@ -389,6 +407,7 @@ class MakerEntryEngine:
         open_pairs: dict[str, OpenPairState],
         managed_symbols: set[str],
         config: StrategyConfig,
+        manual_locked_symbols: set[str] | None = None,
     ) -> PairCandidate | None:
         state = self.active
         if state is None:
@@ -398,7 +417,7 @@ class MakerEntryEngine:
         if state.submitted_ms + requote_ms > now_ms:
             return None
 
-        queue = self._candidate_queue(candidates, open_pairs, managed_symbols, config)
+        queue = self._candidate_queue(candidates, open_pairs, managed_symbols, config, manual_locked_symbols)
         if not queue:
             return None
         best = queue[0]
@@ -729,6 +748,15 @@ class MakerEntryEngine:
             post_qty_first = self.hooks.extract_position_qty(first_exchange.get_symbol_snapshot(symbol))
             filled_qty = self.hooks.position_fill_delta(state.pre_qty_first, post_qty_first, state.first_side)
             if filled_qty > EPS:
+                requester = getattr(first_exchange, "request_account_refresh", None)
+                if callable(requester):
+                    try:
+                        requester("maker_first_leg_fill", priority="urgent", symbol=symbol)
+                    except Exception as exc:
+                        print(
+                            f"[maker_entry_engine][account_refresh][warn] "
+                            f"exchange={state.first_exchange_name} symbol={symbol} error={exc!r}"
+                        )
                 self.hooks.record_event(
                     "maker_entry_fill_detected",
                     candidate_id=state.candidate.id,

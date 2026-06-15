@@ -10,6 +10,7 @@ from src.strategy.risk_gate import (
     RISK_MARGIN_MODE_NOT_CROSS,
     RISK_MARGIN_MODE_UNKNOWN,
 )
+from src.strategy.logging import log_startup_margin_mode_summary
 
 
 def normalize_margin_mode(value: Any) -> str:
@@ -164,8 +165,8 @@ async def check_startup_margin_mode_guard(
     if expected_mode != "cross":
         block_reasons.append(RISK_MARGIN_MODE_NOT_CROSS)
         print(
-            f"[strategy][startup][margin-mode][block] configured_margin_mode={margin_mode} "
-            f"normalized={expected_mode} reason={RISK_MARGIN_MODE_NOT_CROSS}"
+            f"[시작][마진모드][차단] 설정값={margin_mode} "
+            f"해석={expected_mode} 사유={RISK_MARGIN_MODE_NOT_CROSS}"
         )
 
     for exchange_name, exchange in exchanges.items():
@@ -193,13 +194,12 @@ async def check_startup_margin_mode_guard(
                     "source": source,
                 }
             )
-            print(
-                f"[strategy][startup][margin-mode] exchange={exchange_name} symbol={symbol} "
-                f"raw={raw_mode or 'None'} normalized={normalized_mode} source={source} ok={'Y' if ok else 'N'}"
-                + (f" reason={reason}" if reason else "")
-            )
-
     deduped = _dedupe_reasons(block_reasons)
+    log_startup_margin_mode_summary(
+        expected_mode=expected_mode,
+        checks=checks,
+        block_reasons=deduped,
+    )
     if record_event is not None:
         record_event(
             "startup_margin_mode_checked",
@@ -216,5 +216,5 @@ async def check_startup_margin_mode_guard(
             )
 
     if deduped:
-        print(f"[strategy][startup][entry-block] reasons={list(deduped)}")
+        print(f"[시작][진입차단] 사유={list(deduped)}")
     return deduped

@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 from dotenv import load_dotenv
+from src.core.api_pressure import record_api_call
 
 load_dotenv()
 
@@ -248,7 +249,7 @@ def _private_read_pause_response(path: str) -> tuple[int, dict[str, Any], dict[s
         f"[okx][private_read_pause] skip path={path} remaining_sec={remaining_ms / 1000:.1f}",
         cooldown_sec=5.0,
     )
-    return (
+    result = (
         503,
         {
             "code": "OKX_PRIVATE_READ_PAUSED",
@@ -258,6 +259,29 @@ def _private_read_pause_response(path: str) -> tuple[int, dict[str, Any], dict[s
         },
         {},
     )
+    status, data, headers = result
+    record_api_call(
+        exchange="okx",
+        method="GET",
+        path=path,
+        status=status,
+        data=data,
+        headers=headers,
+        local_pause=True,
+        private_read_pause_skip=True,
+    )
+    return result
+
+
+def get_private_read_pause_status() -> dict[str, Any]:
+    remaining_ms = max(_PRIVATE_READ_PAUSED_UNTIL_MS - _now_ms(), 0)
+    return {
+        "enabled": _private_read_pause_enabled(),
+        "paused": remaining_ms > 0,
+        "paused_until_ms": _PRIVATE_READ_PAUSED_UNTIL_MS,
+        "remaining_ms": remaining_ms,
+        "remaining_sec": remaining_ms / 1000.0,
+    }
 
 
 def _record_private_read_success(path: str) -> None:
@@ -287,6 +311,16 @@ def _record_private_read_transient(path: str, reason: str) -> None:
 
     now_ms = _now_ms()
     _PRIVATE_READ_PAUSED_UNTIL_MS = max(_PRIVATE_READ_PAUSED_UNTIL_MS, now_ms + pause_ms)
+    record_api_call(
+        exchange="okx",
+        method="GET",
+        path=path,
+        status=503,
+        data={"code": "OKX_PRIVATE_READ_PAUSE_STARTED", "reason": reason},
+        local_pause=True,
+        transient_reason=reason,
+        private_read_pause_started=True,
+    )
     _log_throttled(
         "okx_private_read_pause_started",
         f"[okx][private_read_pause][started] path={path} reason={reason} "
@@ -350,6 +384,7 @@ async def _request(
         connector = aiohttp.TCPConnector(family=socket.AF_INET) if OKX_FORCE_IPV4 else None
 
         transient_reason: str | None = None
+        request_started_ms = _now_ms()
         try:
             async with aiohttp.ClientSession(timeout=timeout_obj, connector=connector) as session:
                 async with session.request(method.upper(), url, headers=headers, data=body or None) as response:
@@ -361,18 +396,51 @@ async def _request(
                     headers_out = dict(response.headers)
             transient_reason = _classify_okx_transient(status, data)
         except (asyncio.TimeoutError, aiohttp.ClientConnectorError) as exc:
+            transient_reason = f"exc:{type(exc).__name__}"
+            record_api_call(
+                exchange="okx",
+                method=method,
+                path=path,
+                status=0,
+                data={"code": transient_reason},
+                latency_ms=max(_now_ms() - request_started_ms, 0),
+                transient_reason=transient_reason,
+                retry_attempt=not is_last,
+                retry_exhausted=is_last,
+            )
             if is_last:
                 if private_read_pause_path:
                     _record_private_read_transient(path, f"exc:{type(exc).__name__}")
                 raise
-            transient_reason = f"exc:{type(exc).__name__}"
 
         if transient_reason is None:
+            record_api_call(
+                exchange="okx",
+                method=method,
+                path=path,
+                status=status,
+                data=data,
+                headers=headers_out,
+                rate_limits=_build_rate_limits(headers_out),
+                latency_ms=max(_now_ms() - request_started_ms, 0),
+            )
             if private_read_pause_path:
                 _record_private_read_success(path)
             return status, data, headers_out
 
         if is_last:
+            record_api_call(
+                exchange="okx",
+                method=method,
+                path=path,
+                status=status,
+                data=data,
+                headers=headers_out,
+                rate_limits=_build_rate_limits(headers_out),
+                latency_ms=max(_now_ms() - request_started_ms, 0),
+                transient_reason=transient_reason,
+                retry_exhausted=True,
+            )
             if private_read_pause_path:
                 _record_private_read_transient(path, transient_reason)
             _log_throttled(
@@ -383,6 +451,18 @@ async def _request(
             )
             return status, data, headers_out
 
+        record_api_call(
+            exchange="okx",
+            method=method,
+            path=path,
+            status=status,
+            data=data,
+            headers=headers_out,
+            rate_limits=_build_rate_limits(headers_out),
+            latency_ms=max(_now_ms() - request_started_ms, 0),
+            transient_reason=transient_reason,
+            retry_attempt=True,
+        )
         backoff = backoff_base * (2 ** attempt)
         if backoff_jitter > 0:
             backoff *= 1.0 + random.uniform(-backoff_jitter, backoff_jitter)

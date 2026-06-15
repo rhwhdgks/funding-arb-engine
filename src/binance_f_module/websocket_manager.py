@@ -201,6 +201,8 @@ class WebSocketManager:
             "spread_bps": ((best_ask - best_bid) / best_ask * 10000.0) if best_ask > 0 else 0.0,
             "bid_qty_top": float(bids[0][1]),
             "ask_qty_top": float(asks[0][1]),
+            "bids": [[float(price), float(qty)] for price, qty in bids[:5]],
+            "asks": [[float(price), float(qty)] for price, qty in asks[:5]],
             "depth_levels": min(len(bids), len(asks)),
             "update_id_first": self._safe_int(payload.get("U")),
             "update_id_final": self._safe_int(payload.get("u")),

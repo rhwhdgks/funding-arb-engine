@@ -271,6 +271,15 @@ def load_strategy_config() -> StrategyConfig:
             os.getenv("STRATEGY_ENTRY_CONTROL_FILE", str(PROJECT_ROOT / "runtime" / "entry_control.json"))
         ),
         entry_control_fail_closed=parse_bool(os.getenv("STRATEGY_ENTRY_CONTROL_FAIL_CLOSED"), True),
+        position_ownership_file=Path(
+            os.getenv(
+                "POSITION_OWNERSHIP_FILE",
+                str(
+                    Path(os.getenv("STRATEGY_ENTRY_CONTROL_FILE", str(PROJECT_ROOT / "runtime" / "entry_control.json"))).parent
+                    / "position_ownership.json"
+                ),
+            )
+        ),
         live_event_log_path=Path(
             os.getenv("STRATEGY_LIVE_EVENT_LOG_PATH", str(PROJECT_ROOT / "logs" / "strategy_live.jsonl"))
         ),

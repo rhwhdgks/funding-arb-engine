@@ -532,6 +532,7 @@ def collect_pair_candidates(
     symbol_recent_close_ms: dict[str, int] | None = None,
     recent_close_block_logged_ms: dict[str, int] | None = None,
     startup_block_reasons: tuple[str, ...] = (),
+    manual_locked_symbols: set[str] | None = None,
 ) -> list[PairCandidate]:
     snapshots_by_exchange: dict[str, dict[str, Any]] = {
         exchange_name: {symbol: exchange.get_symbol_snapshot(symbol) for symbol in symbols}
@@ -587,4 +588,5 @@ def collect_pair_candidates(
         entry_control_store,
         balance_reports_by_exchange,
         startup_block_reasons,
+        manual_locked_symbols,
     )

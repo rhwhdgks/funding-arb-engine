@@ -124,6 +124,7 @@ class StrategyConfig:
     graceful_shutdown_flatten_positions: bool = True
     entry_control_file: Path = field(default_factory=lambda: PROJECT_ROOT / "runtime" / "entry_control.json")
     entry_control_fail_closed: bool = True
+    position_ownership_file: Path = field(default_factory=lambda: PROJECT_ROOT / "runtime" / "position_ownership.json")
     live_event_log_path: Path = field(default_factory=lambda: PROJECT_ROOT / "logs" / "strategy_live.jsonl")
     entry_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_ENTRY_FEE_BPS))
     close_fee_bps: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_CLOSE_FEE_BPS))

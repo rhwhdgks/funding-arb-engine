@@ -1,0 +1,1041 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Ops Console</title>
+  <style>
+    :root {
+      --bg: #101411;
+      --panel: #172019;
+      --panel-2: #202a21;
+      --line: #334236;
+      --text: #edf4ec;
+      --muted: #9da99d;
+      --good: #77d37b;
+      --warn: #f1c96b;
+      --bad: #ff7d70;
+      --accent: #9dc88d;
+      --ink: #071009;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(157, 200, 141, 0.16), transparent 34rem),
+        linear-gradient(135deg, #0f1411, #111812 48%, #172117);
+      color: var(--text);
+      font-family: "Noto Sans KR", "IBM Plex Sans", "Segoe UI", sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    header {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 1rem;
+      padding: 1rem 1.2rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(15, 20, 17, 0.9);
+      backdrop-filter: blur(10px);
+    }
+    h1 { margin: 0; font-size: 1.25rem; letter-spacing: -0.03em; }
+    .sub { color: var(--muted); font-size: 0.84rem; margin-top: 0.25rem; }
+    main { padding: 0.7rem; display: grid; gap: 0.7rem; }
+    .tabs { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+    .tab {
+      width: auto;
+      min-width: 10rem;
+      background: #202a21;
+      color: var(--text);
+      border: 1px solid var(--line);
+    }
+    .tab.active {
+      background: var(--accent);
+      color: var(--ink);
+      border-color: transparent;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: grid; gap: 1rem; }
+    .toolbar, .grid, .bottom { display: grid; gap: 0.7rem; }
+    .toolbar { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; }
+    .grid { grid-template-columns: minmax(0, 1.15fr) minmax(20rem, 0.7fr) minmax(0, 1.15fr); align-items: start; }
+    .topgrid { display: grid; grid-template-columns: minmax(18rem, 0.8fr) minmax(0, 1.6fr); gap: 0.7rem; align-items: start; }
+    .maingrid { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(17rem, 0.78fr); gap: 0.7rem; align-items: start; }
+    .leftcol { display: grid; gap: 0.7rem; }
+    .books { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; }
+    .bottom { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .card {
+      background: linear-gradient(180deg, rgba(32, 42, 33, 0.96), rgba(24, 32, 25, 0.96));
+      border: 1px solid var(--line);
+      border-radius: 0.6rem;
+      padding: 0.7rem 0.8rem;
+      box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.18);
+    }
+    .card h2 {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin: 0 0 0.55rem;
+      font-size: 0.92rem;
+    }
+    label { display: grid; gap: 0.35rem; color: var(--muted); font-size: 0.8rem; }
+    input, select, button {
+      width: 100%;
+      border-radius: 0.7rem;
+      border: 1px solid var(--line);
+      background: #101711;
+      color: var(--text);
+      padding: 0.66rem 0.72rem;
+      font: inherit;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: var(--ink);
+      font-weight: 750;
+      border: 0;
+    }
+    button.secondary { background: #283429; color: var(--text); border: 1px solid var(--line); }
+    button.danger { background: var(--bad); color: #1f0805; }
+    button.market { background: var(--warn); color: #2a1c05; }
+    button.hedge { background: #5bbfb0; color: #06201c; }
+    button:disabled { opacity: 0.48; cursor: not-allowed; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
+    .chips { display: flex; gap: 0.45rem; flex-wrap: wrap; justify-content: flex-end; }
+    .chip {
+      border: 1px solid var(--line);
+      padding: 0.3rem 0.55rem;
+      border-radius: 999px;
+      color: var(--muted);
+      background: rgba(24, 32, 25, 0.72);
+      font-size: 0.76rem;
+    }
+    .chip.good { color: var(--good); border-color: rgba(119, 211, 123, 0.45); }
+    .chip.warn { color: var(--warn); border-color: rgba(241, 201, 107, 0.45); }
+    .chip.bad { color: var(--bad); border-color: rgba(255, 125, 112, 0.45); }
+    .muted { color: var(--muted); }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .ask { color: var(--bad); }
+    .bid { color: var(--good); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 0.42rem 0.35rem; text-align: right; border-bottom: 1px solid rgba(51, 66, 54, 0.55); }
+    th { color: var(--muted); font-size: 0.74rem; font-weight: 600; }
+    td:first-child, th:first-child { text-align: left; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: rgba(157, 200, 141, 0.12); }
+    tr.selected-row td { background: rgba(157, 200, 141, 0.16); font-weight: 700; }
+    .bklabel { color: var(--muted); font-size: 0.66rem; font-weight: 400; margin-left: 0.2rem; }
+    .stack { display: grid; gap: 0.65rem; }
+    .metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.75rem; }
+    .sig { display: inline-flex; align-items: center; gap: 0.35rem; }
+    .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; display: inline-block; }
+    .dot.good { background: var(--good); }
+    .dot.warn { background: var(--warn); }
+    .dot.bad { background: var(--bad); }
+    .metric {
+      border: 1px solid rgba(51, 66, 54, 0.7);
+      border-radius: 0.85rem;
+      padding: 0.75rem;
+      background: rgba(12, 18, 14, 0.42);
+    }
+    .metric .label { color: var(--muted); font-size: 0.72rem; }
+    .metric .value { margin-top: 0.25rem; font-size: 1.15rem; font-weight: 800; }
+    .result,
+    .json {
+      overflow: auto;
+      max-height: 18rem;
+      white-space: pre-wrap;
+      background: #0c120e;
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      padding: 0.75rem;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+    .status-line {
+      min-height: 2.1rem;
+      border: 1px solid var(--line);
+      border-radius: 0.75rem;
+      padding: 0.55rem 0.7rem;
+      color: var(--muted);
+      background: rgba(12, 18, 14, 0.5);
+      font-size: 0.8rem;
+    }
+    .status-line.good { color: var(--good); border-color: rgba(119, 211, 123, 0.42); }
+    .status-line.warn { color: var(--warn); border-color: rgba(241, 201, 107, 0.42); }
+    .status-line.bad { color: var(--bad); border-color: rgba(255, 125, 112, 0.42); }
+    .order-preview {
+      display: grid;
+      gap: 0.45rem;
+      border: 1px solid rgba(51, 66, 54, 0.72);
+      border-radius: 0.85rem;
+      padding: 0.75rem;
+      background: rgba(12, 18, 14, 0.42);
+      font-size: 0.8rem;
+    }
+    .order-preview .line {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+    }
+    .order-preview .name { color: var(--muted); }
+    .order-preview .note { color: var(--muted); font-size: 0.74rem; line-height: 1.35; }
+    .arb-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: 0.7rem; }
+    .arb-cell {
+      border: 1px solid rgba(51, 66, 54, 0.7);
+      border-radius: 0.85rem;
+      padding: 0.7rem 0.8rem;
+      background: rgba(12, 18, 14, 0.42);
+      display: grid;
+      gap: 0.2rem;
+    }
+    .arb-cell .label { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+    .arb-cell .big { font-size: 1.5rem; font-weight: 800; letter-spacing: -0.03em; }
+    .arb-cell .sub { color: var(--muted); font-size: 0.74rem; }
+    .arb-cell.alert { border-color: rgba(255, 125, 112, 0.6); background: rgba(60, 18, 14, 0.4); }
+    .hint { color: var(--muted); font-size: 0.74rem; line-height: 1.4; margin-top: -0.2rem; }
+    .qty-quick { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.4rem; margin-top: -0.3rem; }
+    .qbtn { padding: 0.4rem 0.3rem; font-size: 0.8rem; font-weight: 700; background: #202a21; color: var(--text); border: 1px solid var(--line); }
+    .qbtn:hover { background: #283429; }
+    @media (max-width: 950px) {
+      header { position: static; flex-direction: column; }
+      .toolbar, .grid, .bottom, .metrics, .arb-grid, .topgrid, .maingrid, .books { grid-template-columns: 1fr; }
+      .chips { justify-content: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Ops Console</h1>
+      <div class="sub">resident runtime cache 기반 수동 운영 콘솔</div>
+    </div>
+    <div class="chips" id="statusChips"></div>
+  </header>
+
+  <main>
+    <nav class="tabs">
+      <button class="tab active" id="exchangeTab">거래소 현황 / 수동 주문</button>
+      <button class="tab" id="strategyTab">전략 런 대시보드</button>
+    </nav>
+
+    <section id="exchangePanel" class="tab-panel active">
+      <section class="toolbar">
+        <label>Symbol<select id="symbol"></select></label>
+        <label>Exchange A<select id="exchangeA"></select></label>
+        <label>Exchange B<select id="exchangeB"></select></label>
+      </section>
+
+      <section class="topgrid">
+        <section class="card" id="scannerCard">
+          <h2>심볼별 basis 스캐너 <span class="chip" id="scannerHint">클릭하면 선택</span></h2>
+          <div id="basisScanner"></div>
+        </section>
+
+        <section class="card" id="arbCard">
+          <h2>차익거래 요약 <span id="arbSymbolTag" class="chip"></span></h2>
+          <div id="arbSummary"></div>
+        </section>
+      </section>
+
+      <section class="maingrid">
+        <div class="leftcol">
+          <div class="books">
+            <div class="card"><h2><span id="titleA">Exchange A</span><span id="staleA" class="chip"></span></h2><div id="bookA"></div></div>
+            <div class="card"><h2><span id="titleB">Exchange B</span><span id="staleB" class="chip"></span></h2><div id="bookB"></div></div>
+          </div>
+          <div class="books">
+            <div class="card"><h2>Positions</h2><div id="positions"></div></div>
+            <div class="card"><h2>Open Orders</h2><div id="orders"></div></div>
+          </div>
+        </div>
+        <div class="card stack">
+          <h2>수동 주문 / 관리 <span class="chip warn">버튼별 실행</span></h2>
+          <div class="row">
+            <label>Exchange<select id="orderExchange"></select></label>
+            <label>Side<select id="side"><option>buy</option><option>sell</option></select></label>
+          </div>
+          <label>헷지 모드<select id="hedgeMode"><option value="auto" selected>체결 시 반대거래소 자동 헷지</option><option value="off">헷지 안 함 (단방향)</option></select></label>
+          <label>포지션 소유권<select id="ownershipMode"><option value="manual_only">내 수동 포지션 — 자동전략 잠금</option><option value="unmanaged">전략에 맡김 — 자동전략 관리 허용</option></select></label>
+          <div class="hint" id="ownershipHint"></div>
+          <label>Quantity<input id="quantity" type="number" step="any" placeholder="0.001" /></label>
+          <div class="qty-quick">
+            <button type="button" class="qbtn" data-frac="0.25">25%</button>
+            <button type="button" class="qbtn" data-frac="0.5">50%</button>
+            <button type="button" class="qbtn" data-frac="1">MAX</button>
+          </div>
+          <label>지정가 가격<input id="price" type="number" step="any" placeholder="지정가 주문 가격" /></label>
+          <div class="order-preview" id="orderEstimate"></div>
+          <div class="row">
+            <button id="limitBtn">지정가 주문 실행</button>
+            <button id="marketBtn" class="market">시장가 주문 실행</button>
+          </div>
+          <div class="row">
+            <button id="cancelBtn" class="secondary">미체결 주문 취소</button>
+            <button id="rebalanceBtn" class="hedge">헷지 균형 맞추기</button>
+          </div>
+          <div class="row">
+            <button id="flattenBtn" class="danger">선택 거래소만 청산</button>
+            <button id="closePairBtn" class="danger">페어 청산 (양쪽 동시)</button>
+          </div>
+          <div class="row">
+            <button id="pauseBtn" class="secondary">신규 진입 정지</button>
+            <button id="resumeBtn" class="secondary">신규 진입 재개</button>
+          </div>
+          <div class="status-line" id="entryControlStatus">신규 진입 상태 확인 중</div>
+          <div class="status-line" id="result">최근 수동 작업 없음</div>
+        </div>
+      </section>
+    </section>
+
+    <section id="strategyPanel" class="tab-panel">
+      <section class="metrics" id="strategyMetrics"></section>
+      <section class="bottom">
+        <div class="card"><h2>런 성과 (심볼별 실현손익)</h2><div id="strategyPerf"></div></div>
+        <div class="card"><h2>최신 후보 / 진입 차단</h2><div id="strategyCandidate"></div></div>
+      </section>
+      <section class="bottom">
+        <div class="card"><h2>런타임</h2><div id="strategyRuntime"></div></div>
+        <div class="card"><h2>API 사용량 (rate limit)</h2><div id="strategyApiPressure"></div></div>
+      </section>
+      <section class="card">
+        <h2>최근 이벤트 (거래/사고만)</h2>
+        <div id="strategyRecent"></div>
+      </section>
+      <section class="card">
+        <h2>리포트 산출물</h2>
+        <div id="strategyArtifacts"></div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let state = null;
+    let strategyState = null;
+
+    function fmt(v, d = 4) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "-";
+      return n.toLocaleString(undefined, { maximumFractionDigits: d });
+    }
+
+    function safeNumber(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    }
+
+    function setOptions(select, values) {
+      const current = select.value;
+      select.innerHTML = values.map(v => `<option value="${v}">${v}</option>`).join("");
+      if (values.includes(current)) select.value = current;
+    }
+
+    function chip(label, cls = "") {
+      return `<span class="chip ${cls}">${label}</span>`;
+    }
+
+    function fillOrderFromBook(exchange, side, price) {
+      $("orderExchange").value = exchange;
+      $("side").value = side === "ask" ? "buy" : "sell";
+      $("price").value = Number(price);
+      $("result").textContent = `호가 선택: ${exchange} ${side} ${price}`;
+      renderOrderEstimate();
+    }
+
+    function metric(label, value, cls = "") {
+      return `<div class="metric"><div class="label">${label}</div><div class="value ${cls}">${value}</div></div>`;
+    }
+
+    function setTab(name) {
+      const strategy = name === "strategy";
+      $("exchangeTab").classList.toggle("active", !strategy);
+      $("strategyTab").classList.toggle("active", strategy);
+      $("exchangePanel").classList.toggle("active", !strategy);
+      $("strategyPanel").classList.toggle("active", strategy);
+      if (strategy) refreshStrategy();
+    }
+
+    function selectedOrderState() {
+      const exchange = $("orderExchange").value;
+      const symbol = $("symbol").value;
+      return {
+        exchange,
+        symbol,
+        exchangeState: state?.exchanges?.[exchange],
+        symbolState: state?.exchanges?.[exchange]?.symbols?.[symbol],
+      };
+    }
+
+    function estimateOrderPrice(symbolState, mode = "market") {
+      const side = $("side").value;
+      if (mode === "limit") return safeNumber($("price").value);
+      const ob = symbolState?.orderbook || {};
+      return side === "buy" ? safeNumber(ob.best_ask) : safeNumber(ob.best_bid);
+    }
+
+    function previewLine(name, value, cls = "") {
+      return `<div class="line"><span class="name">${name}</span><strong class="${cls}">${value}</strong></div>`;
+    }
+
+    function renderOrderEstimate() {
+      if (!$("orderEstimate")) return;
+      const {exchangeState, symbolState} = selectedOrderState();
+      const report = exchangeState?.balance_report || {};
+      const qty = safeNumber($("quantity").value);
+      const price = estimateOrderPrice(symbolState);
+      const notional = qty > 0 && price > 0 ? qty * price : 0;
+      const available = safeNumber(report.available_balance_usd);
+      const asset = report.balance_asset_code || "USD";
+      const leverage = Math.max(safeNumber(state?.runtime?.strategy_leverage), 1);
+      const estimatedMargin = notional > 0 ? notional / leverage : 0;
+      const marginRemaining = available - estimatedMargin;
+      const balanceLine = marginRemaining >= 0
+        ? previewLine("예상 잔여 잔고", `${fmt(marginRemaining, 2)} ${asset}`, "good")
+        : previewLine("예상 부족 금액", `${fmt(Math.abs(marginRemaining), 2)} ${asset}`, "bad");
+
+      $("orderEstimate").innerHTML = [
+        previewLine("시장가 추정 체결가", price > 0 ? fmt(price, 8) : "-"),
+        previewLine("지정가 입력값", safeNumber($("price").value) > 0 ? fmt(safeNumber($("price").value), 8) : "-"),
+        previewLine("예상 주문금액", notional > 0 ? `${fmt(notional, 2)} USD` : "-"),
+        previewLine(`추정 필요 증거금 (${fmt(leverage, 2)}x)`, estimatedMargin > 0 ? `${fmt(estimatedMargin, 2)} USD` : "-"),
+        previewLine("사용가능 잔고", available > 0 ? `${fmt(available, 2)} ${asset}` : "-"),
+        notional > 0 && available > 0 ? balanceLine : "",
+      ].join("");
+    }
+
+    function visibleEntryReason(reason) {
+      if (!reason || reason === "ops_console_manual_pause" || reason === "ops_console_manual_resume") return "";
+      return ` - ${reason}`;
+    }
+
+    function bookTable(exchange, symbol) {
+      const s = state?.exchanges?.[exchange]?.symbols?.[symbol];
+      const ob = s?.orderbook || {};
+      const asks = [...(ob.asks || [])].reverse();
+      const bids = ob.bids || [];
+      const askRows = asks.map(l => `<tr class="clickable" onclick="fillOrderFromBook('${exchange}', 'ask', ${Number(l[0])})"><td class="ask">ask <span class="bklabel">롱진입/숏청산</span></td><td>${fmt(l[0], 8)}</td><td>${fmt(l[1], 6)}</td></tr>`).join("");
+      const bidRows = bids.map(l => `<tr class="clickable" onclick="fillOrderFromBook('${exchange}', 'bid', ${Number(l[0])})"><td class="bid">bid <span class="bklabel">숏진입/롱청산</span></td><td>${fmt(l[0], 8)}</td><td>${fmt(l[1], 6)}</td></tr>`).join("");
+      return `
+        <div class="muted">source=${ob.source || "-"} age=${ob.age_ms ?? "-"}ms spread=${fmt(ob.spread_bps, 3)}bps</div>
+        <table><thead><tr><th>side</th><th>price</th><th>qty</th></tr></thead><tbody>${askRows}${bidRows}</tbody></table>
+      `;
+    }
+
+    function fundingCountdown(ms) {
+      if (!ms || ms <= 0) return "-";
+      const remain = ms - Date.now();
+      if (remain <= 0) return "정산임박";
+      const h = Math.floor(remain / 3600000);
+      const m = Math.floor((remain % 3600000) / 60000);
+      return `${h}h ${String(m).padStart(2, "0")}m`;
+    }
+
+    function signClass(v) { return v > 1e-9 ? "good" : v < -1e-9 ? "bad" : "muted"; }
+
+    function renderArbSummary() {
+      const el = $("arbSummary");
+      if (!el || !state) return;
+      const symbol = $("symbol").value;
+      const a = $("exchangeA").value, b = $("exchangeB").value;
+      const exAll = Object.keys(state.exchanges || {});
+      const sa = state.exchanges?.[a]?.symbols?.[symbol];
+      const sb = state.exchanges?.[b]?.symbols?.[symbol];
+      $("arbSymbolTag").textContent = symbol ? `${symbol} · ${a.toUpperCase()} / ${b.toUpperCase()}` : "-";
+      if (!sa || !sb) { el.innerHTML = `<div class="muted">${symbol || ""} 데이터 수신 대기 중</div>`; return; }
+
+      const oba = sa.orderbook || {}, obb = sb.orderbook || {};
+      const midA = safeNumber(oba.mid), midB = safeNumber(obb.mid);
+      const mid = (midA > 0 && midB > 0) ? (midA + midB) / 2 : (midA || midB);
+      // executable entry edges (bps of mid): long X buy at X.ask, short Y sell at Y.bid
+      const edgeLongA = mid > 0 ? (safeNumber(obb.best_bid) - safeNumber(oba.best_ask)) / mid * 10000 : 0;
+      const edgeLongB = mid > 0 ? (safeNumber(oba.best_bid) - safeNumber(obb.best_ask)) / mid * 10000 : 0;
+      const best = edgeLongA >= edgeLongB
+        ? { bps: edgeLongA, long: a, short: b }
+        : { bps: edgeLongB, long: b, short: a };
+      const stale = sa.stale || sb.stale;
+
+      // net exposure across ALL exchanges for this symbol
+      let net = 0; const legs = [];
+      exAll.forEach(ex => {
+        const q = safeNumber(state.exchanges[ex]?.symbols?.[symbol]?.position?.qty);
+        net += q;
+        if (Math.abs(q) > 1e-9) legs.push(`${ex}:${fmt(q, 4)}`);
+      });
+      const hedged = Math.abs(net) < 1e-6;
+
+      // unrealized PnL (this symbol, all exchanges)
+      let upl = 0;
+      exAll.forEach(ex => { upl += safeNumber(state.exchanges[ex]?.symbols?.[symbol]?.position?.unrealized_profit); });
+
+      // funding: per leg rate (bps) + countdown + net funding per settlement on current position
+      const fa = sa.funding || {}, fb = sb.funding || {};
+      const rateA = safeNumber(fa.rate), rateB = safeNumber(fb.rate);
+      const nextMs = Math.min(...[fa.next_funding_time_ms, fb.next_funding_time_ms].filter(x => x > 0));
+      let netFunding = 0; // per settlement, USD; long pays positive rate, short receives
+      exAll.forEach(ex => {
+        const s = state.exchanges[ex]?.symbols?.[symbol];
+        const q = safeNumber(s?.position?.qty);
+        const mk = safeNumber(s?.funding?.mark_price) || safeNumber(s?.orderbook?.mid);
+        const r = safeNumber(s?.funding?.rate);
+        if (Math.abs(q) > 1e-9 && mk > 0) netFunding += -(q * mk * r);
+      });
+
+      // realized today (from strategy dashboard poll, may lag a few sec)
+      const pnl = strategyState?.pnl || {};
+      const todayRealized = safeNumber(pnl.today_realized_usd);
+      const runRealized = safeNumber(pnl.run_realized_usd);
+
+      el.innerHTML = `
+        <div class="arb-grid">
+          <div class="arb-cell">
+            <div class="label">진입 basis (실행가)</div>
+            <div class="big ${signClass(best.bps)}">${fmt(best.bps, 1)} bps</div>
+            <div class="sub">롱 ${best.long.toUpperCase()} / 숏 ${best.short.toUpperCase()}${stale ? " · ⚠STALE" : ""}</div>
+          </div>
+          <div class="arb-cell">
+            <div class="label">양방향 basis</div>
+            <div class="sub">롱${a.toUpperCase()}숏${b.toUpperCase()}: <strong class="${signClass(edgeLongA)}">${fmt(edgeLongA, 1)}</strong> bps</div>
+            <div class="sub">롱${b.toUpperCase()}숏${a.toUpperCase()}: <strong class="${signClass(edgeLongB)}">${fmt(edgeLongB, 1)}</strong> bps</div>
+          </div>
+          <div class="arb-cell ${hedged ? "" : "alert"}">
+            <div class="label">순노출 (헷지균형)</div>
+            <div class="big ${hedged ? "good" : "bad"}">${hedged ? "균형" : fmt(net, 4)}</div>
+            <div class="sub">${legs.length ? legs.join(" · ") : "포지션 없음"}</div>
+          </div>
+          <div class="arb-cell">
+            <div class="label">미실현 손익 (${symbol})</div>
+            <div class="big ${signClass(upl)}">${fmt(upl, 2)}</div>
+            <div class="sub">USD, 양 거래소 합산</div>
+          </div>
+          <div class="arb-cell">
+            <div class="label">펀딩 (${fmt(rateA * 10000, 2)} / ${fmt(rateB * 10000, 2)} bps)</div>
+            <div class="big ${signClass(netFunding)}">${fmt(netFunding, 4)}</div>
+            <div class="sub">정산당 순펀딩 USD · 다음정산 ${fundingCountdown(nextMs)}</div>
+          </div>
+          <div class="arb-cell">
+            <div class="label">실현 손익</div>
+            <div class="big ${signClass(todayRealized)}">${pnl.ok ? fmt(todayRealized, 2) : "-"}</div>
+            <div class="sub">오늘 USD · 런 누적 ${pnl.ok ? fmt(runRealized, 2) : "-"} (${pnl.run_trades ?? 0}건)</div>
+          </div>
+        </div>
+      `;
+    }
+
+    window.pickSymbol = function (sym) {
+      $("symbol").value = sym;
+      render();
+    };
+
+    function renderBasisScanner() {
+      const el = $("basisScanner");
+      if (!el || !state) return;
+      const a = $("exchangeA").value, b = $("exchangeB").value;
+      const cur = $("symbol").value;
+      const rows = (state.symbols || []).map(sym => {
+        const sa = state.exchanges?.[a]?.symbols?.[sym];
+        const sb = state.exchanges?.[b]?.symbols?.[sym];
+        const oba = sa?.orderbook || {}, obb = sb?.orderbook || {};
+        const midA = safeNumber(oba.mid), midB = safeNumber(obb.mid);
+        const mid = (midA > 0 && midB > 0) ? (midA + midB) / 2 : (midA || midB);
+        const edgeLongA = mid > 0 ? (safeNumber(obb.best_bid) - safeNumber(oba.best_ask)) / mid * 10000 : 0;
+        const edgeLongB = mid > 0 ? (safeNumber(oba.best_bid) - safeNumber(obb.best_ask)) / mid * 10000 : 0;
+        const best = edgeLongA >= edgeLongB
+          ? { bps: edgeLongA, long: a, short: b }
+          : { bps: edgeLongB, long: b, short: a };
+        const stale = sa?.stale || sb?.stale;
+        return { sym, best, stale };
+      }).sort((x, y) => y.best.bps - x.best.bps);
+
+      const body = rows.map(r => `
+        <tr class="clickable ${r.sym === cur ? "selected-row" : ""}" onclick="pickSymbol('${r.sym}')">
+          <td>${r.sym}</td>
+          <td class="num ${signClass(r.best.bps)}">${fmt(r.best.bps, 1)}</td>
+          <td>롱 ${r.best.long.toUpperCase()} / 숏 ${r.best.short.toUpperCase()}</td>
+          <td>${r.stale ? '<span class="bad">STALE</span>' : '<span class="good">live</span>'}</td>
+        </tr>`).join("");
+      el.innerHTML = `
+        <div class="muted">${a.toUpperCase()} ↔ ${b.toUpperCase()} · 실행가 기준 best basis (bps) 내림차순</div>
+        <table><thead><tr><th>심볼</th><th class="num">basis</th><th>방향</th><th>상태</th></tr></thead>
+        <tbody>${body || `<tr><td colspan="4" class="muted">데이터 없음</td></tr>`}</tbody></table>`;
+    }
+
+    function render() {
+      if (!state) return;
+      setOptions($("symbol"), state.symbols || []);
+      const exchanges = Object.keys(state.exchanges || {});
+      setOptions($("exchangeA"), exchanges);
+      setOptions($("exchangeB"), exchanges);
+      setOptions($("orderExchange"), exchanges);
+      if ($("exchangeA").value === $("exchangeB").value && exchanges.length > 1) $("exchangeB").value = exchanges[1];
+      renderOrderEstimate();
+
+      const symbol = $("symbol").value;
+      const a = $("exchangeA").value;
+      const b = $("exchangeB").value;
+      $("titleA").textContent = a.toUpperCase();
+      $("titleB").textContent = b.toUpperCase();
+      $("bookA").innerHTML = bookTable(a, symbol);
+      $("bookB").innerHTML = bookTable(b, symbol);
+
+      const sa = state.exchanges?.[a]?.symbols?.[symbol];
+      const sb = state.exchanges?.[b]?.symbols?.[symbol];
+      $("staleA").textContent = sa?.stale ? "STALE" : "FRESH";
+      $("staleA").className = `chip ${sa?.stale ? "bad" : "good"}`;
+      $("staleB").textContent = sb?.stale ? "STALE" : "FRESH";
+      $("staleB").className = `chip ${sb?.stale ? "bad" : "good"}`;
+
+      $("statusChips").innerHTML = [
+        chip(`mode=${state.mode || "-"}`),
+        chip(`symbols=${(state.symbols || []).length}`),
+        chip(`source=${state.runtime?.symbols_source || "-"}`),
+        chip(state.runtime?.entry_control?.entry_paused ? "entry paused" : "entry active", state.runtime?.entry_control?.entry_paused ? "warn" : "good"),
+        chip(state.runtime?.web_trading_enabled ? "web trading on" : "web trading off", state.runtime?.web_trading_enabled ? "warn" : "")
+      ].join("");
+
+      const entryControl = state.runtime?.entry_control || {};
+      const paused = Boolean(entryControl.entry_paused);
+      const reason = visibleEntryReason(entryControl.reason);
+      $("entryControlStatus").textContent = paused
+        ? `신규 진입 상태: 정지${reason}`
+        : "신규 진입 상태: 허용";
+      $("entryControlStatus").className = `status-line ${paused ? "warn" : "good"}`;
+
+      const positionRows = exchanges.flatMap(ex => {
+        const ss = state.exchanges?.[ex]?.symbols || {};
+        return Object.values(ss).map(s => `<tr><td>${ex}</td><td>${s.symbol}</td><td>${fmt(s.position.qty, 8)}</td><td>${fmt(s.position.entry_price, 8)}</td><td>${fmt(s.position.unrealized_profit, 4)}</td></tr>`);
+      }).join("");
+      $("positions").innerHTML = `<table><thead><tr><th>ex</th><th>symbol</th><th>qty</th><th>entry</th><th>upl</th></tr></thead><tbody>${positionRows}</tbody></table>`;
+
+      const orderRows = exchanges.flatMap(ex => {
+        const ss = state.exchanges?.[ex]?.symbols || {};
+        return Object.values(ss).flatMap(s => (s.open_orders || []).map(o => `<tr><td>${ex}</td><td>${s.symbol}</td><td>${o.side || "-"}</td><td>${fmt(o.price, 8)}</td><td>${fmt(o.amount || o.qty || o.size, 8)}</td><td>${o.uuid || o.order_id || o.client_order_id || "-"}</td></tr>`));
+      }).join("");
+      $("orders").innerHTML = `<table><thead><tr><th>ex</th><th>symbol</th><th>side</th><th>price</th><th>qty</th><th>id</th></tr></thead><tbody>${orderRows || `<tr><td colspan="6" class="muted">no open orders</td></tr>`}</tbody></table>`;
+
+      renderArbSummary();
+      renderBasisScanner();
+    }
+
+    function renderKeyValueTable(obj) {
+      const rows = Object.entries(obj || {}).map(([k, v]) => `<tr><td>${k}</td><td>${Array.isArray(v) || typeof v === "object" ? JSON.stringify(v) : v ?? "-"}</td></tr>`).join("");
+      return `<table><tbody>${rows || `<tr><td class="muted">empty</td><td></td></tr>`}</tbody></table>`;
+    }
+
+    const NOISE_EVENTS = new Set(["api_pressure_summary", "candidate_scan_summary"]);
+
+    const REASON_KO = {
+      "max_open_pairs_reached": "최대 동시 페어 수 도달",
+      "net_edge_below_threshold": "기대수익 임계 미달",
+      "net_edge_below_usd_threshold": "기대수익 임계 미달",
+      "net_edge_below_bps_threshold": "기대수익 임계 미달",
+      "funding_payment_required": "펀딩 지불 조건 미충족",
+      "effective_funding_below_usd_threshold": "유효 펀딩 USD 임계 미달",
+      "existing_position": "기존 포지션 보유",
+      "stale_orderbook": "호가 데이터 지연",
+      "ws_not_ready": "웹소켓 미준비",
+      "not_ready": "준비 안 됨",
+      "ask_missing": "매도호가 없음",
+      "bid_missing": "매수호가 없음",
+      "open_orders_exist": "미체결 주문 존재",
+      "account_snapshot_stale": "계정 스냅샷 지연",
+      "symbol_pair_exists": "동일 심볼 페어 이미 보유",
+      "symbol_side_order_exists": "동일 심볼/방향 주문 존재",
+      "exposure_cap_exceeded": "노출 한도 초과",
+      "exposure_equity_unavailable": "자본 정보 없음",
+      "insufficient_margin": "증거금 부족",
+      "manual_position_locked": "수동 포지션 잠금",
+      "entry_paused": "신규 진입 정지됨",
+      "rate_limit_pressure": "API 사용량 압박",
+      "margin_mode_check_failed": "마진모드 확인 실패",
+      "margin_mode_not_cross": "마진모드 cross 아님",
+      "margin_mode_unknown": "마진모드 불명",
+      "cannot_trade": "거래 불가",
+      "cannot_submit_order": "주문 제출 불가",
+      "target_qty_zero": "목표 수량 0",
+      "common_executable_qty_zero": "공통 체결가능 수량 0",
+    };
+    const PREFIX_KO = { risk: "리스크", market: "시장", account: "계정", funding: "펀딩" };
+
+    function reasonKo(key) {
+      if (REASON_KO[key]) return REASON_KO[key];
+      const parts = String(key).split(":");
+      if (parts.length >= 2) {
+        const last = parts[parts.length - 1];
+        const head = parts.slice(0, -1).join(":");
+        const suffixKo = last.split("|").map(s => REASON_KO[s] || s).join(" / ");
+        const isExchange = /^(binance|okx|gateio)$/.test(head);
+        const headKo = isExchange ? head.toUpperCase() : (PREFIX_KO[head] || head);
+        return `${headKo} · ${suffixKo}`;
+      }
+      return key;
+    }
+
+    function shortTime(iso) {
+      if (!iso) return "-";
+      // 2026-06-15T08:32:28Z -> 08:32:28
+      const m = String(iso).match(/T(\d{2}:\d{2}:\d{2})/);
+      return m ? m[1] : iso;
+    }
+
+    function apiRiskLevel(row) {
+      const usage = Math.max(
+        safeNumber(row.max_request_weight_usage_1m),
+        safeNumber(row.max_order_count_usage_1m),
+        safeNumber(row.max_order_count_usage_10s)
+      );
+      const bad = safeNumber(row.rate_limit_violations) > 0 || safeNumber(row.ip_ban_events) > 0;
+      if (bad || usage >= 0.85) return { cls: "bad", label: "위험" };
+      if (usage >= 0.5 || safeNumber(row.retry_exhausted) > 0) return { cls: "warn", label: "주의" };
+      return { cls: "good", label: "정상" };
+    }
+
+    function renderStrategy() {
+      if (!strategyState) return;
+      const runtime = strategyState.runtime || {};
+      const health = strategyState.health || {};
+      const events = strategyState.events || {};
+      const candidate = strategyState.candidate || {};
+      const api = strategyState.api_pressure || {};
+      const pnl = strategyState.pnl || {};
+      const running = !!runtime.running;
+      const danger = Number(health.danger_total || 0);
+
+      const todayNet = pnl.ok ? safeNumber(pnl.today_realized_usd) - safeNumber(pnl.today_fee_usd) : null;
+      const runNet = pnl.ok ? safeNumber(pnl.run_realized_usd) - safeNumber(pnl.run_fee_usd) : null;
+      const enterable = candidate.enterable_candidates ?? 0;
+      const totalCand = candidate.total_candidates ?? 0;
+
+      $("strategyMetrics").innerHTML = [
+        metric("런타임", running ? "RUNNING" : "STOPPED", running ? "good" : "bad"),
+        metric("오늘 손익 (net)", todayNet === null ? "-" : fmt(todayNet, 2), todayNet === null ? "" : signClass(todayNet)),
+        metric("런 누적 (net)", runNet === null ? "-" : `${fmt(runNet, 2)}`, runNet === null ? "" : signClass(runNet)),
+        metric("오늘 체결수", pnl.ok ? (pnl.today_trades ?? 0) : "-"),
+        metric("진입 가능", `${enterable}/${totalCand}`, enterable > 0 ? "good" : ""),
+        metric("danger", danger, danger ? "bad" : "good"),
+      ].join("");
+
+      // --- 런 성과: 심볼별 실현손익 ---
+      const bySymbol = pnl.by_symbol || [];
+      if (pnl.ok) {
+        const perfRows = bySymbol.map(s => {
+          const net = safeNumber(s.realized_usd) - safeNumber(s.fee_usd);
+          return `<tr><td>${s.symbol}</td><td class="num">${s.trades}</td><td class="num ${signClass(s.realized_usd)}">${fmt(s.realized_usd, 4)}</td><td class="num">${fmt(s.fee_usd, 4)}</td><td class="num ${signClass(net)}">${fmt(net, 4)}</td></tr>`;
+        }).join("");
+        $("strategyPerf").innerHTML = `
+          <div class="muted">오늘 ${pnl.today_trades ?? 0}건 · 진입 ${events.counts?.pair_opened || 0} / 청산 ${events.counts?.pair_closed || 0}</div>
+          <table><thead><tr><th>symbol</th><th class="num">체결</th><th class="num">실현</th><th class="num">수수료</th><th class="num">net</th></tr></thead>
+          <tbody>${perfRows || `<tr><td colspan="5" class="muted">오늘 체결 없음</td></tr>`}</tbody></table>`;
+      } else {
+        $("strategyPerf").innerHTML = `<div class="muted">PnL DB 조회 불가 ${pnl.error ? "(" + pnl.error + ")" : ""}</div>`;
+      }
+
+      // --- 최신 후보 / 진입 차단 ---
+      const top = candidate.top_candidate || candidate.top_blocked_candidate || {};
+      const edgeBps = safeNumber(top.expected_net_edge_bps);
+      // net_edge USD/bps 게이트는 사실상 같은 의미라 하나로 병합
+      const mergedReasons = {};
+      Object.entries(candidate.reason_counts || {}).forEach(([k, v]) => {
+        const key = (k === "net_edge_below_usd_threshold" || k === "net_edge_below_bps_threshold")
+          ? "net_edge_below_threshold" : k;
+        mergedReasons[key] = Math.max(mergedReasons[key] || 0, v);
+      });
+      const reasonRows = Object.entries(mergedReasons)
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, v]) => `<tr><td>${reasonKo(k)}</td><td class="num">${v}</td></tr>`).join("");
+      $("strategyCandidate").innerHTML = `
+        <div class="muted">${shortTime(candidate.latest_ts_utc)} · 후보 ${totalCand} · 진입가능 <strong class="${enterable > 0 ? "good" : "muted"}">${enterable}</strong></div>
+        <table><tbody>
+          <tr><td>top 후보</td><td>${top.symbol || "-"} ${top.pair || ""}</td></tr>
+          <tr><td>expected edge</td><td class="${signClass(edgeBps)}">${fmt(edgeBps, 1)} bps · ${fmt(top.expected_net_edge_usd, 4)} USD</td></tr>
+          <tr><td>진입 가능?</td><td class="${top.can_enter ? "good" : "warn"}">${top.can_enter ? "YES" : "NO"}</td></tr>
+        </tbody></table>
+        <div class="muted" style="margin-top:0.4rem">차단 사유</div>
+        <table><tbody>${reasonRows || `<tr><td class="muted">없음</td></tr>`}</tbody></table>`;
+
+      // --- 런타임 ---
+      $("strategyRuntime").innerHTML = renderKeyValueTable({
+        pid: runtime.pid || "-",
+        running: runtime.running,
+        started_at: shortTime(runtime.started_at_iso),
+        duration: runtime.duration || "-",
+        symbols: runtime.symbols || "-",
+        entry_paused: runtime.entry_control?.entry_paused || false,
+        entry_pause_reason: visibleEntryReason(runtime.entry_control?.reason).replace(" - ", "") || "-",
+      });
+
+      // --- API 사용량: 신호등 + 상세 ---
+      const apiRows = Object.entries(api.exchanges || {}).map(([ex, row]) => {
+        const r = apiRiskLevel(row);
+        const usage = Math.max(safeNumber(row.max_request_weight_usage_1m), safeNumber(row.max_order_count_usage_1m));
+        return `<tr><td><span class="sig"><span class="dot ${r.cls}"></span>${ex} ${r.label}</span></td><td class="num">${fmt(usage * 100, 1)}%</td><td class="num">${row.remote_calls || 0}</td><td class="num ${safeNumber(row.rate_limit_violations) ? "bad" : ""}">${row.rate_limit_violations || 0}</td></tr>`;
+      }).join("");
+      $("strategyApiPressure").innerHTML = `
+        <div class="muted">${shortTime(api.latest_ts_utc)} · ${fmt(api.window_sec, 0)}s 윈도우 · usage = 1분 한도 대비</div>
+        <table><thead><tr><th>거래소</th><th class="num">사용률</th><th class="num">호출</th><th class="num">위반</th></tr></thead><tbody>${apiRows || `<tr><td colspan="4" class="muted">집계 없음</td></tr>`}</tbody></table>`;
+
+      // --- 최근 이벤트: 노이즈 제외 ---
+      const meaningful = (events.recent || []).filter(r => !NOISE_EVENTS.has(r.event_type));
+      const recentRows = meaningful.slice().reverse().map(row => {
+        const detail = row.symbol || row.pair?.symbol || row.reason || "-";
+        const isDanger = /fail|overfill|pending|danger|rollback/.test(String(row.event_type));
+        return `<tr><td>${shortTime(row.ts_utc)}</td><td class="${isDanger ? "bad" : ""}">${row.event_type || "-"}</td><td>${detail}</td></tr>`;
+      }).join("");
+      $("strategyRecent").innerHTML = `<table><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead><tbody>${recentRows || `<tr><td colspan="3" class="muted">거래/사고 이벤트 없음 (스캔만 진행 중)</td></tr>`}</tbody></table>`;
+
+      // --- artifacts ---
+      const artifactRows = Object.entries(strategyState.artifacts || {}).map(([name, row]) => `<tr><td>${name}</td><td class="mono">${String(row.path).split("/").pop()}</td><td>${new Date(row.mtime_ms).toLocaleString()}</td></tr>`).join("");
+      $("strategyArtifacts").innerHTML = `<table><thead><tr><th>type</th><th>file</th><th>updated</th></tr></thead><tbody>${artifactRows || `<tr><td colspan="3" class="muted">no artifacts</td></tr>`}</tbody></table>`;
+    }
+
+    async function refresh() {
+      const res = await fetch("/api/state");
+      state = await res.json();
+      render();
+    }
+
+    async function refreshStrategy() {
+      const res = await fetch("/api/strategy/state");
+      strategyState = await res.json();
+      renderStrategy();
+    }
+
+    function explainError(status, detail) {
+      const text = String(detail || "");
+      if (text.includes("web trading disabled")) {
+        return "실거래 버튼이 비활성화되어 있습니다. .env에서 ENABLE_WEB_TRADING=1을 켜야 합니다.";
+      }
+      if (text.includes("action token is required")) {
+        return "실행 권한 토큰이 설정되어 있지만 화면에 입력되지 않았습니다.";
+      }
+      if (text.includes("invalid action token")) {
+        return "실행 권한 토큰이 올바르지 않습니다.";
+      }
+      if (text.includes("stale market data")) {
+        const age = text.match(/age_ms=([^\\s]+)/)?.[1];
+        return `시장 데이터가 오래되어 주문을 막았습니다.${age ? ` 현재 age=${age}ms` : ""}`;
+      }
+      if (text.includes("missing runtime state")) {
+        return "콘솔이 해당 거래소/심볼 상태를 아직 읽지 못했습니다. 잠시 후 다시 시도하세요.";
+      }
+      if (text.includes("rate-limit pressure")) {
+        return "거래소 API 사용량 압박이 있어 주문을 막았습니다. 잠시 기다리세요.";
+      }
+      if (text.includes("strategy has active pair")) {
+        return "전략이 이미 같은 심볼 페어를 보유 중이라 수동 주문을 막았습니다.";
+      }
+      if (text.includes("runtime missing symbol")) {
+        return "콘솔 런타임에 없는 심볼입니다. STRATEGY_SYMBOLS와 콘솔을 확인하세요.";
+      }
+      if (text.includes("exchange not configured")) {
+        return "콘솔에 설정되지 않은 거래소입니다.";
+      }
+      if (text.includes("reduce_only limit order")) {
+        return "콘솔 MVP에서는 reduce-only 지정가 주문을 지원하지 않습니다. 포지션 정리 버튼을 사용하세요.";
+      }
+      if (text.includes("flatten-symbol requires confirm")) {
+        return "포지션 정리는 확인값이 필요합니다. 화면의 확인창을 통해 실행하세요.";
+      }
+      if (status === 422) {
+        return "입력값 형식이 맞지 않습니다. 거래소, 수량, 가격을 확인하세요.";
+      }
+      if (status === 403) {
+        return "권한 문제로 요청이 거절되었습니다. 토큰과 실거래 활성화 상태를 확인하세요.";
+      }
+      if (status >= 500) {
+        return "콘솔 서버 또는 거래소 호출 중 예외가 발생했습니다. 로그를 확인하세요.";
+      }
+      return text || "알 수 없는 이유로 요청이 실패했습니다.";
+    }
+
+    function successMessage(path, action) {
+      if (path.includes("/api/runtime/pause-entry")) {
+        return "신규 진입 정지 완료.";
+      }
+      if (path.includes("/api/runtime/resume-entry")) {
+        return "신규 진입 재개 완료.";
+      }
+      return `${action} 요청 완료. Positions/Open Orders에서 결과를 확인하세요.`;
+    }
+
+    async function post(path, body) {
+      const headers = {"Content-Type": "application/json"};
+      const res = await fetch(path, {method: "POST", headers, body: JSON.stringify(body)});
+      const data = await res.json();
+      const ok = Boolean(data.ok);
+      const action = data.action || data.mode || path.split("/").slice(-1)[0];
+      $("result").textContent = ok
+        ? successMessage(path, action)
+        : `요청 실패: ${explainError(res.status, data.detail || JSON.stringify(data))}`;
+      await refresh();
+    }
+
+    function orderPayload() {
+      return {
+        exchange: $("orderExchange").value,
+        symbol: $("symbol").value,
+        side: $("side").value,
+        quantity: Number($("quantity").value),
+        price: Number($("price").value),
+        hedge_mode: $("hedgeMode").value,
+        ownership_mode: $("ownershipMode").value,
+      };
+    }
+
+    function orderConfirmText(payload, orderType) {
+      const sideKo = payload.side === "buy" ? "매수" : "매도";
+      const hedgeKo = payload.hedge_mode === "auto" ? "체결 시 자동 헷지 ON" : "헷지 없음";
+      const symbolState = state?.exchanges?.[payload.exchange]?.symbols?.[payload.symbol];
+      const ob = symbolState?.orderbook || {};
+      const price = orderType === "limit"
+        ? safeNumber(payload.price)
+        : (payload.side === "buy" ? safeNumber(ob.best_ask) : safeNumber(ob.best_bid));
+      const notional = payload.quantity > 0 && price > 0 ? payload.quantity * price : 0;
+      return [
+        `[실거래 ${orderType === "limit" ? "지정가" : "시장가"} 주문 확인]`,
+        `거래소: ${payload.exchange.toUpperCase()}`,
+        `심볼: ${payload.symbol}`,
+        `방향: ${sideKo} (${payload.side})`,
+        `수량: ${payload.quantity}`,
+        orderType === "limit" ? `지정가: ${payload.price}` : `예상체결가: ${price > 0 ? fmt(price, 8) : "-"}`,
+        `예상금액: ${notional > 0 ? fmt(notional, 2) + " USD" : "-"}`,
+        `${hedgeKo}`,
+        `실제 자금으로 주문이 나갑니다. 진행할까요?`,
+      ].join("\n");
+    }
+
+    $("marketBtn").onclick = () => {
+      const payload = orderPayload();
+      if (!confirm(orderConfirmText(payload, "market"))) return;
+      post("/api/order/live-market", {
+        exchange: payload.exchange,
+        symbol: payload.symbol,
+        side: payload.side,
+        quantity: payload.quantity,
+        hedge_mode: payload.hedge_mode,
+        ownership_mode: payload.ownership_mode
+      });
+    };
+    $("limitBtn").onclick = () => {
+      const payload = orderPayload();
+      if (!confirm(orderConfirmText(payload, "limit"))) return;
+      post("/api/order/live-limit", payload);
+    };
+    $("cancelBtn").onclick = () => {
+      if (!confirm(`${$("orderExchange").value.toUpperCase()} ${$("symbol").value} 미체결 주문을 전부 취소합니다. 진행할까요?`)) return;
+      post("/api/orders/cancel-symbol", {exchange: $("orderExchange").value, symbol: $("symbol").value});
+    };
+    $("flattenBtn").onclick = () => {
+      const symbol = $("symbol").value;
+      const ex = $("orderExchange").value;
+      const exAll = Object.keys(state?.exchanges || {});
+      const thisQty = safeNumber(state?.exchanges?.[ex]?.symbols?.[symbol]?.position?.qty);
+      const otherLegs = exAll
+        .filter(e => e !== ex)
+        .map(e => `${e.toUpperCase()}: ${fmt(safeNumber(state?.exchanges?.[e]?.symbols?.[symbol]?.position?.qty), 4)}`);
+      const msg = [
+        `[선택 거래소만 청산 확인]`,
+        `심볼: ${symbol}`,
+        `청산 대상: ${ex.toUpperCase()} (현재 ${fmt(thisQty, 4)})`,
+        `남는 반대편: ${otherLegs.join("  ") || "없음"}`,
+        `이 거래소 leg만 시장가 청산합니다.`,
+        `반대편 헷지가 깨져 단방향 노출이 남을 수도 있습니다.`,
+        `진행할까요?`,
+      ].join("\n");
+      if (confirm(msg)) {
+        post("/api/positions/flatten-symbol", {symbol, exchange: ex, confirm: true});
+      }
+    };
+    $("closePairBtn").onclick = () => {
+      if (confirm(`${$("symbol").value} 페어를 양쪽 거래소에서 동시에 시장가 청산합니다. 진행할까요?`)) {
+        post("/api/positions/flatten-symbol", {symbol: $("symbol").value, confirm: true});
+      }
+    };
+    $("rebalanceBtn").onclick = () => {
+      const symbol = $("symbol").value;
+      const exAll = Object.keys(state?.exchanges || {});
+      let net = 0; const legs = [];
+      exAll.forEach(ex => {
+        const q = safeNumber(state.exchanges[ex]?.symbols?.[symbol]?.position?.qty);
+        net += q;
+        legs.push(`${ex.toUpperCase()}: ${fmt(q, 4)}`);
+      });
+      if (Math.abs(net) < 1e-9) {
+        $("result").textContent = `${symbol} 이미 헷지 균형 (순노출 0). 자동 헷지 불필요.`;
+        return;
+      }
+      // smaller-|qty| leg grows to match; side reduces net toward 0
+      let target = exAll[0], minAbs = Infinity;
+      exAll.forEach(ex => {
+        const aq = Math.abs(safeNumber(state.exchanges[ex]?.symbols?.[symbol]?.position?.qty));
+        if (aq < minAbs) { minAbs = aq; target = ex; }
+      });
+      const side = net > 0 ? "sell" : "buy";
+      const msg = [
+        `[헷지 균형 맞추기 확인]`,
+        `심볼: ${symbol}`,
+        `현재 포지션: ${legs.join("  ")}`,
+        `순노출(net): ${fmt(net, 4)}`,
+        `→ ${target.toUpperCase()}에 ${side === "sell" ? "매도" : "매수"} ${fmt(Math.abs(net), 4)} 시장가`,
+        `   (양쪽 leg를 같은 크기로 맞춰 순노출 0으로)`,
+        `실제 자금으로 헷지 주문이 나갑니다. 진행할까요?`,
+      ].join("\n");
+      if (confirm(msg)) {
+        post("/api/positions/rebalance-hedge", {symbol, confirm: true});
+      }
+    };
+    $("pauseBtn").onclick = () => post("/api/runtime/pause-entry", {reason: "ops_console_manual_pause"});
+    $("resumeBtn").onclick = () => post("/api/runtime/resume-entry", {reason: "ops_console_manual_resume"});
+    $("exchangeTab").onclick = () => setTab("exchange");
+    $("strategyTab").onclick = () => setTab("strategy");
+    function applyQtyFraction(frac) {
+      const {exchangeState, symbolState} = selectedOrderState();
+      const report = exchangeState?.balance_report || {};
+      const available = safeNumber(report.available_balance_usd);
+      const leverage = Math.max(safeNumber(state?.runtime?.strategy_leverage), 1);
+      const price = estimateOrderPrice(symbolState, $("price").value > 0 ? "limit" : "market");
+      if (available <= 0 || price <= 0) {
+        $("result").textContent = "수량 계산 불가: 잔고 또는 가격 정보 없음.";
+        return;
+      }
+      // MAX(frac=1)은 수수료 여유로 2% 깎음
+      const safety = frac >= 1 ? 0.98 : 1;
+      const notional = available * leverage * frac * safety;
+      let qty = notional / price;
+      // 보기 좋게 내림: 큰 수량은 정수, 작은 수량은 소수
+      const decimals = qty >= 1000 ? 0 : qty >= 1 ? 2 : 6;
+      const f = Math.pow(10, decimals);
+      qty = Math.floor(qty * f) / f;
+      $("quantity").value = qty;
+      renderOrderEstimate();
+    }
+
+    function renderOwnershipHint() {
+      const mode = $("ownershipMode").value;
+      $("ownershipHint").textContent = mode === "manual_only"
+        ? "이 심볼을 내 수동 포지션으로 기록 → 자동전략이 진입/정리하지 않음 (잠금)."
+        : "소유권 기록 안 함 → 자동전략이 이 심볼을 평소처럼 관리(정리·복구)할 수 있음.";
+    }
+    $("ownershipMode").addEventListener("change", renderOwnershipHint);
+    renderOwnershipHint();
+    document.querySelectorAll(".qbtn").forEach(btn =>
+      btn.addEventListener("click", () => applyQtyFraction(parseFloat(btn.dataset.frac)))
+    );
+    ["quantity", "price"].forEach(id => $(id).addEventListener("input", renderOrderEstimate));
+    ["side", "orderExchange"].forEach(id => $(id).addEventListener("change", renderOrderEstimate));
+    ["symbol", "exchangeA", "exchangeB"].forEach(id => $(id).addEventListener("change", render));
+
+    refresh();
+    refreshStrategy();
+    setInterval(refresh, 1000);
+    setInterval(refreshStrategy, 3000);
+  </script>
+</body>
+</html>

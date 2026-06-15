@@ -9,7 +9,8 @@ Binance Futures와 OKX Futures의 funding/가격 괴리를 관찰하고, 페어 
 - 메인 운영 경로는 Binance Futures / OKX Futures pair trading입니다.
 - 전략 진입점은 [main.py](main.py), 실제 루프와 상태 관리는 [strategy.py](strategy.py)에 있습니다.
 - 거래소 모듈은 `api.py`, `websocket_manager.py`, `exchange.py` 구조를 유지합니다.
-- 신규 진입 전 RiskGate가 active pair, open order, margin mode, exposure cap, manual pause, rate-limit pressure를 확인합니다.
+- 신규 진입 전 RiskGate가 active pair, open order, margin mode, exposure cap, manual pause, manual ownership lock, rate-limit pressure를 확인합니다.
+- Ops Console 수동 주문은 `manual_only` ownership으로 기록해 strategy recovery/shutdown이 임의로 건드리지 않게 할 수 있습니다.
 - close, recovery, shutdown flatten은 신규 진입 gate와 분리해 포지션 중립성을 우선합니다.
 - structured JSONL 로그, 선택적 MariaDB persistence, final PASS/FAIL report로 운영 결과를 확인합니다.
 
@@ -78,6 +79,15 @@ STRATEGY_ENV_FILE=.env scripts/runtime/entry_pause.sh on manual_pause
 STRATEGY_ENV_FILE=.env scripts/runtime/entry_pause.sh off manual_resume
 STRATEGY_ENV_FILE=.env scripts/runtime/entry_pause.sh status
 ```
+
+수동 확인/주문은 Ops Console로 봅니다. 기본 권장값은 로컬 전용 바인딩입니다.
+
+```bash
+STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
+STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
+```
+
+`OPS_CONSOLE_HOST=127.0.0.1`이면 같은 PC의 `http://127.0.0.1:8010`에서만 접속됩니다. 폰이나 다른 장비에서 접속할 목적이면 VPN/터널과 action token을 같이 사용합니다.
 
 final report에서 우선 확인하는 신호는 overfill, close failure, close pending, danger log, DB open-like order, live position/open order 잔존 여부입니다. 체결이 없는 run도 시장 조건상 정상일 수 있으므로, 수익성 평가와 운영 안정성 평가는 분리해서 봅니다.
 

@@ -4,6 +4,7 @@ import time
 from collections import defaultdict
 from copy import deepcopy
 from typing import Any, Optional
+from src.core.account_refresh import AccountRefreshScheduler
 from src.ops.persistence.balance_report import build_balance_report
 from src.ops.persistence.event_hooks import (
     build_cancel_all_request_payload,
@@ -141,6 +142,14 @@ class Exchange:
         self.cancel_cooldown_sec = cancel_cooldown_sec
         self.market_order_followup_delay_sec = float(os.getenv("MARKET_ORDER_FOLLOWUP_DELAY_SEC", "0.6"))
         self.market_order_followup_trade_limit = int(os.getenv("MARKET_ORDER_FOLLOWUP_TRADE_LIMIT", "20"))
+        self.account_refresh_scheduler_enabled = _env_bool("ACCOUNT_REFRESH_SCHEDULER_ENABLED", True)
+        self.account_refresh_scheduler = AccountRefreshScheduler(
+            exchange=self.persist_name,
+            refresh_func=self._refresh_account_once,
+            enabled=self.account_refresh_scheduler_enabled,
+            event_logger=self._log_account_refresh_event,
+        )
+        self._last_account_refresh_backup_log_ms = 0
 
         self._event_queues: dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         self.websocket = None
@@ -279,6 +288,7 @@ class Exchange:
             "guard_last_reason": self._summary_meta.get("guard_last_reason", ""),
             "guard_issue_count": int(self._summary_meta.get("guard_issue_count", 0) or 0),
             "last_periodic_request_ms": int(self._summary_meta.get("last_periodic_request_ms", 0) or 0),
+            "account_refresh": self.get_account_refresh_status(),
         }
 
 
@@ -299,6 +309,50 @@ class Exchange:
 
         self.reconcile_status = self._build_runtime_summary()
         return deepcopy(self.reconcile_status)
+
+    def _log_account_refresh_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        reason = str(payload.get("reason") or "")
+        pending_reason_count = int(payload.get("pending_reason_count") or 0)
+        if reason.startswith("backup_poll") and pending_reason_count <= 1:
+            return
+        print(
+            f"[{self.name}][account_refresh] event={event_type} "
+            f"exchange={payload.get('exchange')} reason={payload.get('reason')} "
+            f"priority={payload.get('priority')} symbol={payload.get('symbol') or ''} "
+            f"pending_reason_count={payload.get('pending_reason_count')} "
+            f"elapsed_since_last_refresh_ms={payload.get('elapsed_since_last_refresh_ms')} "
+            f"success={payload.get('success')} error={payload.get('error') or ''}"
+        )
+
+    async def _refresh_account_once(self, reason: str) -> bool:
+        attempt_ms = int(time.time() * 1000)
+        account_data, asset_data = await get_accounts()
+        if account_data is None or asset_data is None:
+            self._refresh_runtime_summary(
+                refresh_source=f"account_refresh:{reason}",
+                error="empty_account_response",
+                touch_attempt=False,
+            )
+            return False
+        self.update_account_state(account_data, asset_data)
+        self.account_snapshot_last_sync_ms = attempt_ms
+        self._refresh_runtime_summary(
+            refresh_source=f"account_refresh:{reason}",
+            error="",
+            touch_attempt=False,
+        )
+        return True
+
+    def request_account_refresh(self, reason: str, priority: str = "normal", symbol: str | None = None) -> bool:
+        if not self.account_refresh_scheduler_enabled:
+            return False
+        return self.account_refresh_scheduler.request(reason, priority=priority, symbol=symbol)
+
+    def get_account_refresh_status(self) -> dict[str, Any]:
+        scheduler = getattr(self, "account_refresh_scheduler", None)
+        if scheduler is None:
+            return {"enabled": False}
+        return scheduler.snapshot_status()
 
 
     def get_symbol_funding_state(self, ticker: str) -> dict[str, Any]:
@@ -389,15 +443,22 @@ class Exchange:
         await self.reconcile_state(reason="startup", include_funding=True)
 
         self._running = True
-        self._tasks = [
-            asyncio.create_task(self.run_account(), name=f"{self.name}-run_account"),
-            asyncio.create_task(self.run_order(), name=f"{self.name}-run_order"),
-            asyncio.create_task(self.run_public(), name=f"{self.name}-run_public"),
-            asyncio.create_task(self.run_check_open_orders(), name=f"{self.name}-run_check_open_orders"),
-            asyncio.create_task(self.run_funding(), name=f"{self.name}-run_funding"),
-            asyncio.create_task(self.run_health(), name=f"{self.name}-run_health"),
-            asyncio.create_task(self.run_reconcile_guard(), name=f"{self.name}-run_reconcile_guard"),
-        ]
+        self._tasks = []
+        if self.account_refresh_scheduler_enabled:
+            self._tasks.append(
+                asyncio.create_task(self.account_refresh_scheduler.run(), name=f"{self.name}-account_refresh")
+            )
+        self._tasks.extend(
+            [
+                asyncio.create_task(self.run_account(), name=f"{self.name}-run_account"),
+                asyncio.create_task(self.run_order(), name=f"{self.name}-run_order"),
+                asyncio.create_task(self.run_public(), name=f"{self.name}-run_public"),
+                asyncio.create_task(self.run_check_open_orders(), name=f"{self.name}-run_check_open_orders"),
+                asyncio.create_task(self.run_funding(), name=f"{self.name}-run_funding"),
+                asyncio.create_task(self.run_health(), name=f"{self.name}-run_health"),
+                asyncio.create_task(self.run_reconcile_guard(), name=f"{self.name}-run_reconcile_guard"),
+            ]
+        )
 
         if not simple_stdout_enabled():
             print(f"[{self.name}] tasks created")
@@ -515,6 +576,10 @@ class Exchange:
         self._summary_meta["last_reason"] = reason
         self._summary_meta["last_attempt_ms"] = attempt_ms
 
+        if include_account and self.account_refresh_scheduler_enabled and reason != "startup":
+            self.request_account_refresh(f"reconcile:{reason}", priority="urgent")
+            include_account = False
+
         if include_account:
             try:
                 account_data, asset_data = await get_accounts()
@@ -598,8 +663,12 @@ class Exchange:
 
         async def _runner():
             try:
+                include_account = True
+                if self.account_refresh_scheduler_enabled:
+                    self.request_account_refresh(f"auto_reconcile:{reason}", priority="normal")
+                    include_account = False
                 await self.reconcile_state(
-                    include_account=True,
+                    include_account=include_account,
                     include_open_orders=True,
                     include_funding=False,
                     reason=reason,
@@ -714,6 +783,10 @@ class Exchange:
 
     async def run_account(self):
         while self._running:
+            if self.account_refresh_scheduler_enabled:
+                self.request_account_refresh("backup_poll", priority="normal")
+                await asyncio.sleep(max(self.account_interval, self.account_refresh_scheduler.min_interval_sec))
+                continue
             try:
                 account_data, asset_data = await get_accounts()
                 if account_data is not None and asset_data is not None:

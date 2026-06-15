@@ -14,6 +14,7 @@ RISK_MARGIN_MODE_CHECK_FAILED = "risk:margin_mode_check_failed"
 RISK_EXPOSURE_CAP_EXCEEDED = "risk:exposure_cap_exceeded"
 RISK_EXPOSURE_EQUITY_UNAVAILABLE = "risk:exposure_equity_unavailable"
 RISK_RATE_LIMIT_PRESSURE = "risk:rate_limit_pressure"
+RISK_MANUAL_POSITION_LOCKED = "risk:manual_position_locked"
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,7 @@ class OrderSlot:
 class RiskGateContext:
     active_symbols: frozenset[str]
     open_order_slots: frozenset[OrderSlot]
+    manual_locked_symbols: frozenset[str] = frozenset()
     entry_control_reasons: tuple[str, ...] = ()
     startup_block_reasons: tuple[str, ...] = ()
 
@@ -82,6 +84,9 @@ def evaluate_entry_risk(
 
     if normalized_symbol and normalized_symbol in context.active_symbols:
         reasons.append(RISK_SYMBOL_PAIR_EXISTS)
+
+    if normalized_symbol and normalized_symbol in context.manual_locked_symbols:
+        reasons.append(RISK_MANUAL_POSITION_LOCKED)
 
     for planned_slot in planned_order_slots:
         if any(_order_slots_match(planned_slot, open_slot) for open_slot in context.open_order_slots):

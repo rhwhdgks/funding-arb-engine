@@ -76,6 +76,40 @@ def is_forever_duration(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"0", "forever", "infinite", "infinity", "none", "unlimited"}
 
 
+def boolish(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def strategy_execution_profile(meta: dict) -> str:
+    raw = str(meta.get("execution_profile") or "").strip().lower().replace("-", "_")
+    if raw in {"auto_trade", "monitor", "dry_run"}:
+        return raw
+    has_profile_fields = any(
+        key in meta
+        for key in (
+            "enable_live",
+            "auto_enter_enabled",
+            "maker_entry_engine_enabled",
+        )
+    )
+    if not has_profile_fields:
+        return "legacy_unknown"
+    if not boolish(meta.get("enable_live")):
+        return "dry_run"
+    if boolish(meta.get("auto_enter_enabled")) or boolish(meta.get("maker_entry_engine_enabled")):
+        return "auto_trade"
+    return "monitor"
+
+
+def is_no_entry_profile(meta: dict) -> bool:
+    has_entry_flags = "auto_enter_enabled" in meta or "maker_entry_engine_enabled" in meta
+    return strategy_execution_profile(meta) in {"monitor", "dry_run"} or (
+        has_entry_flags
+        and not boolish(meta.get("auto_enter_enabled"))
+        and not boolish(meta.get("maker_entry_engine_enabled"))
+    )
+
+
 def run_cmd(root: Path, cmd: str, timeout: int = 60) -> str:
     try:
         completed = subprocess.run(
@@ -187,6 +221,25 @@ def evaluate_soak(
     critical_lines: list[str],
 ) -> dict:
     checks: list[dict] = []
+
+    profile = strategy_execution_profile(meta)
+    add_check(
+        checks,
+        "PASS",
+        "strategy_execution_profile_declared",
+        (
+            f"profile={profile} enable_live={meta.get('enable_live')} "
+            f"auto_enter={meta.get('auto_enter_enabled')} "
+            f"maker_engine={meta.get('maker_entry_engine_enabled')}"
+        ),
+    )
+    if is_no_entry_profile(meta):
+        add_check(
+            checks,
+            "PASS",
+            "new_entries_disabled_expected",
+            "monitor/no-entry run; pair_opened=0 is normal",
+        )
 
     runtime_started = event_counts.get("runtime_started", 0)
     runtime_stopped = event_counts.get("runtime_stopped", 0)
@@ -403,10 +456,13 @@ def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
     stdout_path = root / str(meta.get("stdout_log") or "test_server/logs/strategy_live.out")
     jsonl_path = root / str(meta.get("jsonl_log") or "test_server/logs/strategy_live.jsonl")
     stdout_text = stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else ""
-    marker = f"strategy live runtime start duration={meta.get('duration')}"
-    marker_index = stdout_text.rfind(marker)
-    if marker_index < 0:
-        marker_index = stdout_text.rfind("strategy live runtime start duration=")
+    markers = (
+        f"[런타임][시작] 기간={meta.get('duration')}",
+        "[런타임][시작] 기간=",
+        f"strategy live runtime start duration={meta.get('duration')}",
+        "strategy live runtime start duration=",
+    )
+    marker_index = max((stdout_text.rfind(marker) for marker in markers), default=-1)
     run_stdout = stdout_text[marker_index:] if marker_index >= 0 else stdout_text
     run_lines = [line for line in run_stdout.splitlines() if line.strip()]
     critical_patterns = (
@@ -501,6 +557,11 @@ def render_summary_markdown(payload: dict) -> str:
     lines.append(f"- run_duration: {meta.get('duration')}")
     if payload.get("observed_duration_ms"):
         lines.append(f"- observed_duration: {format_duration_ms(int(payload.get('observed_duration_ms') or 0))}")
+    lines.append(f"- execution_profile: {strategy_execution_profile(meta)}")
+    lines.append(f"- enable_live: {meta.get('enable_live')}")
+    lines.append(f"- auto_enter_enabled: {meta.get('auto_enter_enabled')}")
+    lines.append(f"- maker_entry_engine_enabled: {meta.get('maker_entry_engine_enabled')}")
+    lines.append(f"- auto_close_enabled: {meta.get('auto_close_enabled')}")
     lines.append(f"- env_file: {meta.get('env_file')}")
     lines.append(f"- status_after_wait: `{payload.get('status_text')}`")
     lines.append(f"- stdout_log: {payload.get('stdout_log')}")

@@ -9,15 +9,49 @@ from typing import Any
 import mariadb
 from dotenv import load_dotenv
 
-load_dotenv()
-
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 LEGACY_SCHEMA_PATH = PROJECT_ROOT / "sql" / "mariadb_schema.sql"
 TRADING_DEV_SCHEMA_PATH = PROJECT_ROOT / "sql" / "trading_dev_schema.sql"
+DEFAULT_DB_NAME = "trading_dev"
+DB_PERSISTENCE_TRUE_VALUES = {"1", "true", "on"}
+DB_ENV_KEYS = (
+    "MARIADB_HOST",
+    "MARIADB_PORT",
+    "MARIADB_USER",
+    "MARIADB_PASSWORD",
+    "MARIADB_DATABASE",
+)
+DB_REQUIRED_ENV_KEYS = ("MARIADB_HOST", "MARIADB_USER", "MARIADB_DATABASE")
+
+
+def _resolve_env_file_path(raw_path: str) -> Path:
+    env_path = Path(raw_path).expanduser()
+    if not env_path.is_absolute():
+        env_path = PROJECT_ROOT / env_path
+    return env_path
+
+
+def _load_persistence_env() -> None:
+    env_file = os.getenv("STRATEGY_ENV_FILE")
+    if env_file:
+        env_path = _resolve_env_file_path(env_file)
+        if env_path.exists():
+            load_dotenv(env_path, override=True)
+        # Keep DB writes explicit to the selected strategy env.
+        # This prevents a later bare load_dotenv() from enabling DB via root .env.
+        os.environ.setdefault("ENABLE_DB_PERSISTENCE", "0")
+        for key in DB_ENV_KEYS:
+            os.environ.setdefault(key, "3306" if key == "MARIADB_PORT" else "")
+        return
+
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+
+_load_persistence_env()
 
 
 def resolve_default_schema_path() -> Path:
-    database_name = os.getenv("MARIADB_DATABASE", "trading").strip().lower()
+    database_name = (os.getenv("MARIADB_DATABASE") or DEFAULT_DB_NAME).strip().lower()
     if database_name == "trading_dev" and TRADING_DEV_SCHEMA_PATH.exists():
         return TRADING_DEV_SCHEMA_PATH
     return LEGACY_SCHEMA_PATH
@@ -27,27 +61,15 @@ DEFAULT_SCHEMA_PATH = resolve_default_schema_path()
 
 
 def _env_flag(key: str, default: str = "0") -> bool:
-    return os.getenv(key, default).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return os.getenv(key, default).strip().lower() in DB_PERSISTENCE_TRUE_VALUES
 
 
 def db_env_configured() -> bool:
-    return any(
-        os.getenv(key) not in (None, "")
-        for key in (
-            "MARIADB_HOST",
-            "MARIADB_PORT",
-            "MARIADB_USER",
-            "MARIADB_PASSWORD",
-            "MARIADB_DATABASE",
-        )
-    )
+    return all((os.getenv(key) or "").strip() for key in DB_REQUIRED_ENV_KEYS)
 
 
 def db_persistence_enabled() -> bool:
-    raw = os.getenv("ENABLE_DB_PERSISTENCE")
-    if raw is not None:
-        return _env_flag("ENABLE_DB_PERSISTENCE", "0")
-    return db_env_configured()
+    return _env_flag("ENABLE_DB_PERSISTENCE", "0") and db_env_configured()
 
 
 @dataclass
@@ -60,12 +82,13 @@ class DbConfig:
 
     @classmethod
     def from_env(cls) -> "DbConfig":
+        port_text = (os.getenv("MARIADB_PORT") or "3306").strip()
         return cls(
-            host=os.getenv("MARIADB_HOST", "127.0.0.1").strip(),
-            port=int(os.getenv("MARIADB_PORT", "3306").strip()),
-            user=os.getenv("MARIADB_USER", "trader").strip(),
+            host=(os.getenv("MARIADB_HOST") or "127.0.0.1").strip(),
+            port=int(port_text or "3306"),
+            user=(os.getenv("MARIADB_USER") or "trader").strip(),
             password=os.getenv("MARIADB_PASSWORD", ""),
-            database=os.getenv("MARIADB_DATABASE", "trading").strip(),
+            database=(os.getenv("MARIADB_DATABASE") or DEFAULT_DB_NAME).strip(),
         )
 
 

@@ -30,6 +30,26 @@ def emit_hedge_event(
         print(f"[strategy][hedge_event][warn] event_type={event_type} error={exc!r}")
 
 
+def request_account_refresh_if_available(
+    exchange: Any,
+    reason: str,
+    *,
+    priority: str = "normal",
+    symbol: str | None = None,
+) -> None:
+    requester = getattr(exchange, "request_account_refresh", None)
+    if not callable(requester):
+        return
+    try:
+        requester(reason, priority=priority, symbol=symbol)
+    except Exception as exc:
+        print(
+            f"[strategy][account_refresh][warn] "
+            f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+            f"reason={reason} symbol={symbol or ''} error={exc!r}"
+        )
+
+
 async def execute_residual_hedge(
     *,
     stage_label: str,
@@ -144,6 +164,12 @@ async def execute_residual_hedge(
             if isinstance(market_result, dict) and not market_result.get("error"):
                 last_order_id = market_result.get("order_id")
                 last_client_order_id = market_result.get("client_order_id") or market_result.get("uuid")
+                request_account_refresh_if_available(
+                    exchange,
+                    f"{stage_label}_hedge_market_order",
+                    priority="urgent",
+                    symbol=symbol,
+                )
             if market_result and market_result.get("error"):
                 print(f"[strategy][{market_log_prefix}][market][error] {market_log_text} 오류 result={market_result}")
             if fast_ack_enabled and market_result and not market_result.get("error"):

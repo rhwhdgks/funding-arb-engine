@@ -88,6 +88,9 @@ fi
 : "${STRATEGY_APPROVAL_MODE:=auto}"
 : "${STRATEGY_AUTO_ENTER_ENABLED:=1}"
 : "${STRATEGY_AUTO_CLOSE_ENABLED:=1}"
+: "${STRATEGY_MAKER_ENGINE_ENABLED:=0}"
+: "${STRATEGY_MAKER_ENGINE_SYMBOLS:=}"
+: "${STRATEGY_EXECUTION_PROFILE:=}"
 : "${STRATEGY_ACCOUNT_LABEL:=real}"
 : "${STRATEGY_LOGIC:=funding fee}"
 : "${STRATEGY_EXCHANGES:=binance,okx}"
@@ -122,10 +125,64 @@ fi
 : "${STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS:=1}"
 : "${STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS:=1}"
 : "${STRATEGY_STOP_GRACE_SEC:=180}"
+: "${ENABLE_DB_PERSISTENCE:=0}"
+: "${MARIADB_HOST:=}"
+: "${MARIADB_PORT:=3306}"
+: "${MARIADB_USER:=}"
+: "${MARIADB_PASSWORD:=}"
+: "${MARIADB_DATABASE:=trading_dev}"
+
+is_truthy() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$value" in
+    1|true|yes|on|y)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+normalize_execution_profile() {
+  local profile
+  profile="$(printf '%s' "${STRATEGY_EXECUTION_PROFILE:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$profile" in
+    monitor|observe|observer|no-entry|no_entry)
+      STRATEGY_EXECUTION_PROFILE="monitor"
+      STRATEGY_AUTO_ENTER_ENABLED=0
+      STRATEGY_MAKER_ENGINE_ENABLED=0
+      ;;
+    auto|auto-trade|auto_trade|live)
+      STRATEGY_EXECUTION_PROFILE="auto_trade"
+      ;;
+    dry-run|dry_run|paper)
+      STRATEGY_EXECUTION_PROFILE="dry_run"
+      STRATEGY_ENABLE_LIVE=0
+      ;;
+    "")
+      if ! is_truthy "$STRATEGY_ENABLE_LIVE"; then
+        STRATEGY_EXECUTION_PROFILE="dry_run"
+      elif is_truthy "$STRATEGY_AUTO_ENTER_ENABLED" || is_truthy "$STRATEGY_MAKER_ENGINE_ENABLED"; then
+        STRATEGY_EXECUTION_PROFILE="auto_trade"
+      else
+        STRATEGY_EXECUTION_PROFILE="monitor"
+      fi
+      ;;
+    *)
+      echo "[run_strategy_live] invalid STRATEGY_EXECUTION_PROFILE=${STRATEGY_EXECUTION_PROFILE}" >&2
+      echo "[run_strategy_live] expected one of: auto_trade, monitor, dry_run" >&2
+      exit 1
+      ;;
+  esac
+}
+
+normalize_execution_profile
 
 usage() {
   cat <<'EOF'
-usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report|final-report|opportunity-report]
+usage: scripts/runtime/run_strategy_live.sh [start|stop|status|logs|jsonl|summary|report|health|db-smoke|drill|final-report|opportunity-report]
 
 commands:
   start   start background live strategy runtime
@@ -135,8 +192,16 @@ commands:
   jsonl   tail -f structured live event jsonl
   summary print current-run live event summary
   report  show current exchange report snapshot
+  health  show ops health for runtime, collector, DB, and recent logs
+  db-smoke  verify DB persistence is isolated from core runtime paths
+  drill   run non-destructive ops drill checks; pass --apply-pause-drill for pause/resume mutation
   final-report  write final PASS/FAIL report for the latest run
   opportunity-report  write candidate opportunity/no-entry report for the latest run
+
+execution profiles:
+  STRATEGY_EXECUTION_PROFILE=auto_trade  normal live auto-entry runtime
+  STRATEGY_EXECUTION_PROFILE=monitor     live reads/close safety, no new entries
+  STRATEGY_EXECUTION_PROFILE=dry_run     no live execution
 EOF
 }
 
@@ -216,14 +281,25 @@ PY
   "script_path": "${STRATEGY_SCRIPT_PATH_ABS}",
   "stdout_log": "${STDOUT_LOG}",
   "jsonl_log": "${JSONL_LOG}",
+  "execution_profile": "${STRATEGY_EXECUTION_PROFILE}",
+  "enable_live": "${STRATEGY_ENABLE_LIVE}",
+  "approval_mode": "${STRATEGY_APPROVAL_MODE}",
+  "auto_enter_enabled": "${STRATEGY_AUTO_ENTER_ENABLED}",
+  "auto_close_enabled": "${STRATEGY_AUTO_CLOSE_ENABLED}",
+  "maker_entry_engine_enabled": "${STRATEGY_MAKER_ENGINE_ENABLED}",
+  "maker_entry_engine_symbols": "${STRATEGY_MAKER_ENGINE_SYMBOLS}",
   "symbols": "${STRATEGY_SYMBOLS}",
   "exchanges": "${STRATEGY_EXCHANGES}",
   "account_label": "${STRATEGY_ACCOUNT_LABEL}",
   "logic": "${STRATEGY_LOGIC}",
   "leverage": "${STRATEGY_LEVERAGE}",
+  "order_notional_usd": "${STRATEGY_ORDER_NOTIONAL_USD}",
+  "max_open_pairs": "${STRATEGY_MAX_OPEN_PAIRS}",
   "max_gross_leverage": "${STRATEGY_MAX_GROSS_LEVERAGE}",
   "max_long_leverage": "${STRATEGY_MAX_LONG_LEVERAGE}",
   "max_short_leverage": "${STRATEGY_MAX_SHORT_LEVERAGE}",
+  "db_persistence": "${ENABLE_DB_PERSISTENCE}",
+  "db_database": "${MARIADB_DATABASE}",
   "rate_limit_guard_enabled": "${STRATEGY_RATE_LIMIT_GUARD_ENABLED}",
   "rate_limit_usage_threshold": "${STRATEGY_RATE_LIMIT_USAGE_THRESHOLD}",
   "entry_funding_forecast_sec": "${STRATEGY_ENTRY_FUNDING_FORECAST_SEC}",
@@ -236,7 +312,7 @@ EOF
   (
     trap 'rm -f "$PID_FILE"' EXIT
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] strategy live runtime start duration=${RUN_DURATION} script=${STRATEGY_SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
+    echo "[$ts] [런타임][시작] 기간=${RUN_DURATION} 스크립트=${STRATEGY_SCRIPT_PATH_ABS}" >> "$STDOUT_LOG"
 
     cd "$STRATEGY_WORKDIR_ABS"
     run_cmd=()
@@ -251,8 +327,11 @@ EOF
     flock -n "$LOCK_FILE" env \
       STRATEGY_ENABLE_LIVE="$STRATEGY_ENABLE_LIVE" \
       STRATEGY_APPROVAL_MODE="$STRATEGY_APPROVAL_MODE" \
+      STRATEGY_EXECUTION_PROFILE="$STRATEGY_EXECUTION_PROFILE" \
       STRATEGY_AUTO_ENTER_ENABLED="$STRATEGY_AUTO_ENTER_ENABLED" \
       STRATEGY_AUTO_CLOSE_ENABLED="$STRATEGY_AUTO_CLOSE_ENABLED" \
+      STRATEGY_MAKER_ENGINE_ENABLED="$STRATEGY_MAKER_ENGINE_ENABLED" \
+      STRATEGY_MAKER_ENGINE_SYMBOLS="$STRATEGY_MAKER_ENGINE_SYMBOLS" \
       STRATEGY_ACCOUNT_LABEL="$STRATEGY_ACCOUNT_LABEL" \
       STRATEGY_LOGIC="$STRATEGY_LOGIC" \
       STRATEGY_EXCHANGES="$STRATEGY_EXCHANGES" \
@@ -286,6 +365,12 @@ EOF
       STRATEGY_GRACEFUL_SHUTDOWN_ENABLED="$STRATEGY_GRACEFUL_SHUTDOWN_ENABLED" \
       STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS="$STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS" \
       STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS="$STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS" \
+      ENABLE_DB_PERSISTENCE="$ENABLE_DB_PERSISTENCE" \
+      MARIADB_HOST="$MARIADB_HOST" \
+      MARIADB_PORT="$MARIADB_PORT" \
+      MARIADB_USER="$MARIADB_USER" \
+      MARIADB_PASSWORD="$MARIADB_PASSWORD" \
+      MARIADB_DATABASE="$MARIADB_DATABASE" \
       STRATEGY_LIVE_EVENT_LOG_PATH="$JSONL_LOG" \
       STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" \
       "${run_cmd[@]}" >> "$STDOUT_LOG" 2>&1
@@ -293,7 +378,7 @@ EOF
     status=$?
     set -e
     ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    echo "[$ts] strategy live runtime exit status=${status}" >> "$STDOUT_LOG"
+    echo "[$ts] [런타임][종료] 상태코드=${status}" >> "$STDOUT_LOG"
     exit "$status"
   ) &
 
@@ -370,6 +455,21 @@ show_report() {
   TARGET_EXCHANGES="$STRATEGY_EXCHANGES" SYMBOLS="$STRATEGY_SYMBOLS" STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/report.py --wait-ws-sec 1 --trade-limit 3
 }
 
+show_health() {
+  ensure_runtime
+  STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/ops_health_report.py --env-file "$STRATEGY_ENV_FILE" "$@"
+}
+
+show_db_smoke() {
+  ensure_runtime
+  STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/db_persistence_smoke.py "$@"
+}
+
+show_drill() {
+  ensure_runtime
+  STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/ops_drill.py --env-file "$STRATEGY_ENV_FILE" "$@"
+}
+
 show_final_report() {
   ensure_runtime
   STRATEGY_ENV_FILE="$STRATEGY_ENV_FILE" "$PYTHON_BIN" -u scripts/ops/final_run_report.py --env-file "$STRATEGY_ENV_FILE" --meta "$RUN_META_FILE" "$@"
@@ -436,6 +536,15 @@ case "$ACTION" in
     ;;
   report)
     show_report
+    ;;
+  health)
+    show_health "$@"
+    ;;
+  db-smoke)
+    show_db_smoke "$@"
+    ;;
+  drill)
+    show_drill "$@"
     ;;
   final-report)
     show_final_report "$@"

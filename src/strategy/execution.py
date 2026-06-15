@@ -122,6 +122,25 @@ def schedule_trade_history_sync_if_available(exchange: Any, symbol: str, order_r
         )
 
 
+def request_account_refresh_if_available(
+    exchange: Any,
+    reason: str,
+    *,
+    priority: str = "normal",
+    symbol: str | None = None,
+) -> None:
+    requester = getattr(exchange, "request_account_refresh", None)
+    if not callable(requester):
+        return
+    try:
+        requester(reason, priority=priority, symbol=symbol)
+    except Exception as exc:
+        print(
+            f"[strategy][account_refresh][warn] "
+            f"exchange={exchange_runtime_name(exchange)} reason={reason} symbol={symbol or ''} error={exc!r}"
+        )
+
+
 def market_freshness_payload(exchange: Any, symbol: str, submit_start_ms: int) -> dict[str, Any]:
     try:
         snapshot = exchange.get_symbol_snapshot(symbol)
@@ -215,6 +234,12 @@ def log_entry_first_leg_progress(
         reason=reason,
     )
     schedule_trade_history_sync_if_available(exchange, symbol, order_result)
+    request_account_refresh_if_available(
+        exchange,
+        f"{log_prefix}_first_leg_fill:{reason}",
+        priority="urgent",
+        symbol=symbol,
+    )
 
 
 def entry_order_settle_sec(config: Any) -> float:

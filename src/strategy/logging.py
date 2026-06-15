@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -20,6 +21,35 @@ def fmt_usd(value: Any) -> str:
 
 def fmt_bps(value: Any) -> str:
     return f"{_safe_float(value):.2f}"
+
+
+def _enabled_text(value: Any) -> str:
+    return "켜짐" if bool(value) else "꺼짐"
+
+
+def _join_values(values: Any) -> str:
+    if values is None:
+        return "-"
+    if isinstance(values, (list, tuple, set)):
+        return ",".join(str(value) for value in values) or "-"
+    return str(values)
+
+
+def _env_enabled(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _korean_close_mode(value: Any) -> str:
+    text = str(value or "")
+    mapping = {
+        "maker_then_taker": "메이커대기후시장가",
+        "market": "시장가",
+        "taker": "시장가",
+    }
+    return mapping.get(text, text or "-")
 
 
 def korean_side(side: Any) -> str:
@@ -70,6 +100,81 @@ def korean_close_reason(reason: Any) -> str:
         "shutdown": "종료정리",
     }
     return mapping.get(reason_text, reason_text or "확인")
+
+
+def log_strategy_config_summary(*, config: Any, symbols: list[str]) -> None:
+    mode = "실거래" if bool(getattr(config, "enable_live", False)) else "모의"
+    maker_symbols = getattr(config, "maker_entry_engine_symbols", None) or symbols
+    symbol_text = _join_values(symbols[:8]) + ("..." if len(symbols) > 8 else "")
+    maker_symbol_text = _join_values(list(maker_symbols)[:8]) + ("..." if len(maker_symbols) > 8 else "")
+    print(
+        "[시작][설정] "
+        f"모드={mode} 거래소={_join_values(getattr(config, 'exchange_names', []))} "
+        f"심볼={symbol_text} 주문금액USD={fmt_usd(getattr(config, 'order_notional_usd', 0.0))} "
+        f"최대페어={getattr(config, 'max_open_pairs', '-')} 레버리지={getattr(config, 'leverage', '-')} "
+        f"진입기준={fmt_bps(getattr(config, 'min_expected_net_edge_bps', 0.0))}bps "
+        f"체결후기준={fmt_bps(getattr(config, 'entry_post_fill_min_net_edge_bps', 0.0))}bps "
+        f"메이커큐={_enabled_text(getattr(config, 'maker_entry_engine_enabled', False))} "
+        f"메이커심볼={maker_symbol_text} 큐허용폭={fmt_bps(getattr(config, 'maker_entry_engine_queue_edge_gap_bps', 0.0))}bps "
+        f"청산방식={_korean_close_mode(getattr(config, 'close_execution_mode', '-'))} "
+        f"DB저장={_enabled_text(_env_enabled('ENABLE_DB_PERSISTENCE'))}"
+    )
+
+
+def log_startup_margin_mode_summary(
+    *,
+    expected_mode: str,
+    checks: list[dict[str, Any]],
+    block_reasons: Any,
+) -> None:
+    reason_list = list(block_reasons or [])
+    ok_count = sum(1 for row in checks if row.get("ok"))
+    unknown_nonblocking = [
+        row
+        for row in checks
+        if not row.get("ok") and not row.get("reason") and str(row.get("normalized_mode") or "") == "unknown"
+    ]
+    checked_count = len(checks)
+    if reason_list:
+        sample = ",".join(
+            f"{row.get('exchange')}:{row.get('symbol')}:{row.get('reason')}"
+            for row in checks
+            if row.get("reason")
+        )
+        print(
+            "[시작][마진모드][차단] "
+            f"기준={expected_mode} 차단사유={','.join(reason_list)} 대상={sample or '-'}"
+        )
+        return
+    suffix = ""
+    if unknown_nonblocking:
+        suffix = " 설명=거래소 스냅샷에 마진모드가 없어 차단하지 않고 진행"
+    print(
+        "[시작][마진모드] "
+        f"통과 기준={expected_mode} 확인완료={ok_count}/{checked_count} "
+        f"미확인={len(unknown_nonblocking)}{suffix}"
+    )
+
+
+def log_startup_bootstrap_summary(
+    *,
+    exchange_count: int,
+    symbol_count: int,
+    leverage: Any,
+    failures: list[Any] | None = None,
+) -> None:
+    failures = failures or []
+    if failures:
+        print(
+            "[시작][거래소준비][경고] "
+            f"실패={len(failures)}개 거래소={exchange_count} 심볼={symbol_count} "
+            f"예시={failures[:3]}"
+        )
+        return
+    print(
+        "[시작][거래소준비] "
+        f"완료 거래소={exchange_count} 심볼={symbol_count} 레버리지={leverage}"
+    )
 
 
 def log_entry_attempt(

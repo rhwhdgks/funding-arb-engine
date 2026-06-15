@@ -8,7 +8,9 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
 from src.core.action_gate import ActionGate
+from src.core.api_pressure import flush_api_pressure
 from dotenv import load_dotenv
+from src.ops.position_ownership import active_manual_symbols
 from src.ops.persistence.entry_quality import schedule_entry_quality_persist
 from src.ops.persistence.runtime import build_runtime_persistence_from_env
 from src.core.exchange_registry import build_exchange
@@ -35,6 +37,7 @@ from src.strategy.logging import (
     log_entry_attempt,
     log_entry_blocked,
     log_hedge_incomplete,
+    korean_side,
     log_micro_partial,
     log_overfill,
     log_pair_close_attempt,
@@ -43,6 +46,8 @@ from src.strategy.logging import (
     log_pair_closed_detected,
     log_pair_opened,
     log_residual_ignored,
+    log_startup_bootstrap_summary,
+    log_strategy_config_summary,
 )
 from src.strategy.maker_entry_engine import MakerEntryEngine, MakerEntryHooks
 from src.strategy.risk_gate import (
@@ -71,6 +76,7 @@ from src.strategy.models import (
 from src.strategy.margin_mode_guard import check_startup_margin_mode_guard
 from src.strategy.exposure_guard import ExposureCapConfig, evaluate_exposure_caps
 from src.strategy.rate_limit_guard import RateLimitGuardConfig, evaluate_rate_limit_guard
+from src.strategy.runtime_log_filter import install_runtime_log_filter
 from src.strategy.execution import (
     wait_for_position_fill as _execution_wait_for_position_fill,
     wait_for_position_close as _execution_wait_for_position_close,
@@ -839,6 +845,7 @@ def build_risk_gate_context(
     exchanges: dict[str, Any],
     entry_control_store: EntryControlStore | None,
     startup_block_reasons: tuple[str, ...] = (),
+    manual_locked_symbols: set[str] | None = None,
 ) -> RiskGateContext:
     active_symbols = frozenset(
         pair.symbol.upper()
@@ -858,6 +865,7 @@ def build_risk_gate_context(
     return RiskGateContext(
         active_symbols=active_symbols,
         open_order_slots=frozenset(open_order_slots),
+        manual_locked_symbols=frozenset(symbol.upper() for symbol in (manual_locked_symbols or set())),
         entry_control_reasons=entry_control_reasons,
         startup_block_reasons=tuple(startup_block_reasons or ()),
     )
@@ -871,8 +879,9 @@ def evaluate_candidate_risk_now(
     entry_control_store: EntryControlStore | None,
     balance_reports_by_exchange: dict[str, dict[str, Any]] | None = None,
     startup_block_reasons: tuple[str, ...] = (),
+    manual_locked_symbols: set[str] | None = None,
 ) -> RiskGateDecision:
-    context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons)
+    context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons, manual_locked_symbols)
     exposure_result = candidate_exposure_guard_result(candidate, config, balance_reports_by_exchange)
     rate_limit_result = candidate_rate_limit_guard_result(candidate, exchanges, config)
     details: dict[str, Any] = {}
@@ -904,8 +913,9 @@ def apply_risk_gate_blocks(
     entry_control_store: EntryControlStore | None,
     balance_reports_by_exchange: dict[str, dict[str, Any]] | None = None,
     startup_block_reasons: tuple[str, ...] = (),
+    manual_locked_symbols: set[str] | None = None,
 ) -> list[PairCandidate]:
-    context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons)
+    context = build_risk_gate_context(open_pairs, exchanges, entry_control_store, startup_block_reasons, manual_locked_symbols)
     for candidate in candidates:
         exposure_result = candidate_exposure_guard_result(candidate, config, balance_reports_by_exchange)
         rate_limit_result = candidate_rate_limit_guard_result(candidate, exchanges, config)
@@ -975,6 +985,26 @@ def mark_symbol_recently_closed(
     if symbol_recent_close_ms is None:
         return
     symbol_recent_close_ms[str(symbol).upper()] = now_ms()
+
+
+def request_account_refresh(
+    exchange: Any,
+    reason: str,
+    priority: str = "normal",
+    symbol: str | None = None,
+) -> bool:
+    requester = getattr(exchange, "request_account_refresh", None)
+    if not callable(requester):
+        return False
+    try:
+        return bool(requester(reason, priority=priority, symbol=symbol))
+    except Exception as exc:
+        print(
+            f"[strategy][account_refresh][warn] "
+            f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+            f"reason={reason} symbol={symbol or ''} error={exc!r}"
+        )
+        return False
 
 
 def candidate_symbol_is_strong_flat(
@@ -1374,15 +1404,15 @@ def print_emergency_flatten_dust(
     exchange_name = getattr(exchange, "persist_name", getattr(exchange, "name", "unknown"))
     suffix = "" if closed_qty is None else f" closed_qty={closed_qty:.12f}"
     print(
-        f"[strategy][pair_close][dust] 실행 불가능한 소량 잔량으로 flat 간주 "
-        f"reason={reason} exchange={exchange_name} symbol={symbol} side={preview.get('side')} "
-        f"qty={_safe_float(preview.get('raw_qty')):.12f} "
-        f"close_qty={_safe_float(preview.get('close_qty')):.12f} "
-        f"min_executable_qty={_safe_float(preview.get('min_executable_qty')):.12f} "
-        f"price={_safe_float(preview.get('price')):.8f} "
-        f"notional_usd={_safe_float(preview.get('notional_usd')):.8f} "
-        f"min_notional_usd={_safe_float(preview.get('min_notional_usd')):.8f} "
-        f"price_source={preview.get('price_source')}{suffix}"
+        f"[페어종료][소량잔량] 정리불가소량으로 flat 간주 "
+        f"사유={reason} 거래소={exchange_name} 심볼={symbol} 방향={korean_side(preview.get('side'))} "
+        f"수량={_safe_float(preview.get('raw_qty')):.12f} "
+        f"정리수량={_safe_float(preview.get('close_qty')):.12f} "
+        f"최소수량={_safe_float(preview.get('min_executable_qty')):.12f} "
+        f"가격={_safe_float(preview.get('price')):.8f} "
+        f"명목USD={_safe_float(preview.get('notional_usd')):.8f} "
+        f"최소명목USD={_safe_float(preview.get('min_notional_usd')):.8f} "
+        f"가격출처={preview.get('price_source')}{suffix}"
     )
 
 
@@ -1869,7 +1899,7 @@ async def refresh_symbol_state(
     symbol: str,
     reason: str,
     *,
-    include_account: bool = True,
+    include_account: bool = False,
     include_open_orders: bool = True,
     include_funding: bool = False,
 ) -> None:
@@ -1989,6 +2019,12 @@ async def emergency_flatten_symbol_state_detailed(
                 is_close=use_reduce_only_market_close(exchange, current_qty, side),
             )
             if not (market_result and market_result.get("error")):
+                request_account_refresh(
+                    exchange,
+                    "emergency_flatten_market_order",
+                    priority="urgent",
+                    symbol=symbol,
+                )
                 resolved_close_qty = await resolve_effective_order_qty(
                     exchange=exchange,
                     symbol=symbol,
@@ -2040,9 +2076,9 @@ async def emergency_flatten_symbol_state_detailed(
                 result.error_message = error_message
                 result.temporarily_unavailable = temporarily_unavailable
                 print(
-                    f"[strategy][pair_close][market_warn] 페어 종료 주문 경고 "
-                    f"exchange={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
-                    f"symbol={symbol} reason={failure_reason} result={market_result}"
+                    f"[페어종료][경고] 시장가 종료 주문 실패 "
+                    f"거래소={getattr(exchange, 'persist_name', getattr(exchange, 'name', 'unknown'))} "
+                    f"심볼={symbol} 사유={failure_reason} 결과={market_result}"
                 )
                 await asyncio.sleep(0.8)
         except Exception as exc:
@@ -2052,8 +2088,8 @@ async def emergency_flatten_symbol_state_detailed(
             result.error_message = error_message
             result.temporarily_unavailable = temporarily_unavailable
             print(
-                f"[strategy][pair_close][market_warn] 페어 종료 주문 오류 "
-                f"symbol={symbol} reason={failure_reason} error={exc}"
+                f"[페어종료][경고] 시장가 종료 주문 오류 "
+                f"심볼={symbol} 사유={failure_reason} 오류={exc}"
             )
             await asyncio.sleep(0.8)
 
@@ -2162,6 +2198,12 @@ async def close_leg_market_qty(
             result.temporarily_unavailable = temporarily_unavailable
             return result
 
+        request_account_refresh(
+            exchange,
+            "close_leg_market_order",
+            priority="urgent",
+            symbol=symbol,
+        )
         await asyncio.sleep(config.action_settle_wait_sec)
         resolved_qty = await resolve_effective_order_qty(
             exchange=exchange,
@@ -2342,10 +2384,10 @@ async def restore_pair_neutrality_after_close_failure(
     if payload["neutralized"]:
         record_live_event(config, "pair_neutralized_after_close_failure", **payload)
         print(
-            f"[strategy][close][neutralized] pair_id={getattr(pair_like, 'pair_id', '')} symbol={symbol} "
-            f"residual={residual_exchange}:{residual_qty:.6f} "
-            f"fallback={fallback_exchange_name}:{fallback_side}:{fallback_qty:.6f} "
-            f"remaining_net={payload.get('remaining_net_qty', 0.0):.6f}"
+            f"[복구][중립화완료] pair_id={getattr(pair_like, 'pair_id', '')} 심볼={symbol} "
+            f"잔여={residual_exchange}:{residual_qty:.6f} "
+            f"대체헷지={fallback_exchange_name}:{fallback_side}:{fallback_qty:.6f} "
+            f"남은순수량={payload.get('remaining_net_qty', 0.0):.6f}"
         )
     return payload
 
@@ -2424,7 +2466,7 @@ def install_shutdown_signal_handlers(
 
     def request_shutdown(signame: str) -> None:
         if not shutdown_requested.is_set():
-            print(f"[strategy][shutdown] stop 요청 수신 signal={signame}")
+            print(f"[종료][요청] stop 신호 수신 signal={signame}")
             record_reason = signame.lower()
             shutdown_reason["reason"] = record_reason
             shutdown_requested.set()
@@ -2465,8 +2507,10 @@ async def cancel_shutdown_open_orders(
     symbols: list[str],
     exchanges: dict[str, Any],
     config: StrategyConfig,
+    skip_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
-    summary: dict[str, Any] = {"attempted": 0, "failed": []}
+    skip_symbols = {symbol.upper() for symbol in (skip_symbols or set())}
+    summary: dict[str, Any] = {"attempted": 0, "failed": [], "skipped_manual_locked": []}
     if not config.enable_live or not config.graceful_shutdown_cancel_orders:
         return summary
 
@@ -2475,6 +2519,9 @@ async def cancel_shutdown_open_orders(
         if not callable(cancel_all):
             continue
         for symbol in symbols:
+            if symbol.upper() in skip_symbols:
+                summary["skipped_manual_locked"].append({"exchange": exchange_name, "symbol": symbol})
+                continue
             try:
                 summary["attempted"] += 1
                 result = await cancel_all(symbol)
@@ -2489,8 +2536,8 @@ async def cancel_shutdown_open_orders(
                     {"exchange": exchange_name, "symbol": symbol, "error": str(exc)[:300]}
                 )
                 print(
-                    f"[strategy][shutdown][cancel][warn] exchange={exchange_name} "
-                    f"symbol={symbol} error={exc}"
+                    f"[종료][주문취소][경고] 거래소={exchange_name} "
+                    f"심볼={symbol} 오류={exc}"
                 )
 
     return summary
@@ -2501,13 +2548,18 @@ async def flatten_shutdown_symbols(
     symbols: list[str],
     exchanges: dict[str, Any],
     config: StrategyConfig,
+    skip_symbols: set[str] | None = None,
 ) -> dict[str, Any]:
-    summary: dict[str, Any] = {"checked": 0, "failed": [], "assumed_flat": []}
+    skip_symbols = {symbol.upper() for symbol in (skip_symbols or set())}
+    summary: dict[str, Any] = {"checked": 0, "failed": [], "assumed_flat": [], "skipped_manual_locked": []}
     if not config.enable_live or not config.graceful_shutdown_flatten_positions:
         return summary
 
     for exchange_name, exchange in exchanges.items():
         for symbol in symbols:
+            if symbol.upper() in skip_symbols:
+                summary["skipped_manual_locked"].append({"exchange": exchange_name, "symbol": symbol})
+                continue
             summary["checked"] += 1
             try:
                 ok, assumed_flat = await emergency_flatten_symbol_state(
@@ -2524,8 +2576,8 @@ async def flatten_shutdown_symbols(
                     {"exchange": exchange_name, "symbol": symbol, "error": str(exc)[:300]}
                 )
                 print(
-                    f"[strategy][shutdown][flatten][warn] exchange={exchange_name} "
-                    f"symbol={symbol} error={exc}"
+                    f"[종료][포지션정리][경고] 거래소={exchange_name} "
+                    f"심볼={symbol} 오류={exc}"
                 )
     return summary
 
@@ -2535,12 +2587,21 @@ async def collect_remaining_positions(
     symbols: list[str],
     exchanges: dict[str, Any],
     config: StrategyConfig,
+    skip_symbols: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    skip_symbols = {symbol.upper() for symbol in (skip_symbols or set())}
     remaining: list[dict[str, Any]] = []
     for exchange_name, exchange in exchanges.items():
         for symbol in symbols:
+            if symbol.upper() in skip_symbols:
+                continue
             try:
-                await refresh_symbol_state(exchange, symbol, "strategy_shutdown_final_check")
+                await refresh_symbol_state(
+                    exchange,
+                    symbol,
+                    "strategy_shutdown_final_check",
+                    include_account=True,
+                )
                 qty = effective_position_qty(
                     exchange.get_symbol_snapshot(symbol),
                     exchange,
@@ -2562,18 +2623,36 @@ async def graceful_shutdown_flatten(
     open_pairs: dict[str, OpenPairState],
     config: StrategyConfig,
     assumed_flat_until_ms: dict[tuple[str, str], int],
+    manual_locked_symbols: set[str] | None = None,
 ) -> None:
     if not config.enable_live or not config.graceful_shutdown_enabled:
         return
 
+    manual_locked_symbols = {
+        symbol.upper()
+        for symbol in (manual_locked_symbols if manual_locked_symbols is not None else active_manual_symbols(config.position_ownership_file))
+    }
     pair_ids = sorted(open_pairs.keys())
     print(
-        f"[strategy][shutdown] 안전 종료 정리 시작 reason={reason} "
-        f"open_pairs={len(pair_ids)} symbols={len(symbols)}"
+        f"[종료][정리시작] 사유={reason} "
+        f"오픈페어={len(pair_ids)} 심볼수={len(symbols)} 수동관리={sorted(manual_locked_symbols)}"
     )
-    record_live_event(config, "shutdown_cleanup_started", reason=reason, open_pair_ids=pair_ids)
+    record_live_event(
+        config,
+        "shutdown_cleanup_started",
+        reason=reason,
+        open_pair_ids=pair_ids,
+        manual_locked_symbols=sorted(manual_locked_symbols),
+    )
+    for exchange in exchanges.values():
+        request_account_refresh(exchange, "shutdown_cleanup_before", priority="urgent")
 
-    cancel_before = await cancel_shutdown_open_orders(symbols=symbols, exchanges=exchanges, config=config)
+    cancel_before = await cancel_shutdown_open_orders(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
 
     closed_pairs: list[str] = []
     pending_pairs: list[str] = []
@@ -2588,16 +2667,33 @@ async def graceful_shutdown_flatten(
                 pending_pairs.append(pair_id)
         except Exception as exc:
             pending_pairs.append(pair_id)
-            print(f"[strategy][shutdown][close][warn] pair_id={pair_id} error={exc}")
+            print(f"[종료][페어종료][경고] pair_id={pair_id} 오류={exc}")
 
-    cancel_after = await cancel_shutdown_open_orders(symbols=symbols, exchanges=exchanges, config=config)
-    flatten_summary = await flatten_shutdown_symbols(symbols=symbols, exchanges=exchanges, config=config)
-    remaining_positions = await collect_remaining_positions(symbols=symbols, exchanges=exchanges, config=config)
+    cancel_after = await cancel_shutdown_open_orders(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
+    flatten_summary = await flatten_shutdown_symbols(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
+    for exchange in exchanges.values():
+        request_account_refresh(exchange, "shutdown_cleanup_after", priority="urgent")
+    remaining_positions = await collect_remaining_positions(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
 
     if remaining_positions:
-        print(f"[strategy][shutdown][warn] 잔여 포지션 확인 remaining={remaining_positions}")
+        print(f"[종료][정리경고] 잔여포지션={remaining_positions}")
     else:
-        print("[strategy][shutdown] 안전 종료 정리 완료 positions=flat")
+        print("[종료][정리완료] 잔여포지션=없음")
 
     record_live_event(
         config,
@@ -2609,6 +2705,7 @@ async def graceful_shutdown_flatten(
         cancel_after=cancel_after,
         flatten=flatten_summary,
         remaining_positions=remaining_positions,
+        manual_locked_symbols=sorted(manual_locked_symbols),
     )
 
 
@@ -2839,8 +2936,8 @@ async def recover_account_imbalances(
                         right_qty=right_qty,
                     )
                     print(
-                        f"[strategy][account-hedge] 계정 기준 균형 포지션 편입 pair_id={recovered_pair.pair_id} "
-                        f"symbol={symbol} qty={recovered_pair.qty:.6f}"
+                        f"[복구][페어편입] pair_id={recovered_pair.pair_id} "
+                        f"심볼={symbol} 수량={recovered_pair.qty:.6f}"
                     )
                 continue
 
@@ -2849,8 +2946,8 @@ async def recover_account_imbalances(
                 hedge_exchange = exchanges[hedge_exchange_name]
                 if exchange_has_symbol_waiting_order(hedge_exchange, symbol):
                     print(
-                        f"[strategy][account-hedge][skip] 대기 주문 존재 symbol={symbol} "
-                        f"hedge={hedge_exchange_name}:{hedge_side}"
+                        f"[복구][대기] 심볼={symbol} 사유=대기주문존재 "
+                        f"헷지={hedge_exchange_name}:{hedge_side}"
                     )
                     continue
 
@@ -2863,16 +2960,16 @@ async def recover_account_imbalances(
                 hedge_qty = normalize_exchange_qty_for_order(hedge_exchange, symbol, raw_target_qty, hedge_price)
                 if hedge_qty <= EPS:
                     print(
-                        f"[strategy][account-hedge][skip] 최소 주문 단위 미만 symbol={symbol} "
-                        f"left={left_exchange}:{left_qty:.12f} right={right_exchange}:{right_qty:.12f} "
-                        f"hedge={hedge_exchange_name}:{hedge_side} raw_qty={raw_target_qty:.12f}"
+                        f"[복구][대기] 심볼={symbol} 사유=최소주문수량미만 "
+                        f"좌측={left_exchange}:{left_qty:.12f} 우측={right_exchange}:{right_qty:.12f} "
+                        f"헷지={hedge_exchange_name}:{hedge_side} 원수량={raw_target_qty:.12f}"
                     )
                     continue
 
                 print(
-                    f"[strategy][account-hedge] 계정 합산 불균형 감지 symbol={symbol} "
-                    f"left={left_exchange}:{left_qty:.6f} right={right_exchange}:{right_qty:.6f} "
-                    f"hedge={hedge_exchange_name}:{hedge_side} qty={hedge_qty:.6f}"
+                    f"[복구][불균형감지] 심볼={symbol} "
+                    f"좌측={left_exchange}:{left_qty:.6f} 우측={right_exchange}:{right_qty:.6f} "
+                    f"헷지={hedge_exchange_name}:{hedge_side} 수량={hedge_qty:.6f}"
                 )
                 pre_qty = extract_position_qty(hedge_exchange.get_symbol_snapshot(symbol))
                 try:
@@ -2900,16 +2997,16 @@ async def recover_account_imbalances(
                     )
                 except Exception as exc:
                     print(
-                        f"[strategy][account-hedge][warn] 후보 실행 오류 symbol={symbol} "
-                        f"hedge={hedge_exchange_name}:{hedge_side} qty={hedge_qty:.6f} error={exc}"
+                        f"[복구][경고] 심볼={symbol} 사유=헷지주문오류 "
+                        f"헷지={hedge_exchange_name}:{hedge_side} 수량={hedge_qty:.6f} 오류={exc}"
                     )
                     continue
 
                 if hedge_execution.remaining_qty > EPS:
                     print(
-                        f"[strategy][account-hedge][warn] 헤지 미완료 symbol={symbol} "
-                        f"hedge={hedge_exchange_name}:{hedge_side} requested={hedge_qty:.6f} "
-                        f"filled={hedge_execution.filled_qty:.6f} remaining={hedge_execution.remaining_qty:.6f}"
+                        f"[복구][경고] 심볼={symbol} 사유=헷지미완료 "
+                        f"헷지={hedge_exchange_name}:{hedge_side} 요청={hedge_qty:.6f} "
+                        f"체결={hedge_execution.filled_qty:.6f} 잔량={hedge_execution.remaining_qty:.6f}"
                     )
                     if hedge_execution.filled_qty > EPS:
                         hedge_completed = True
@@ -2939,13 +3036,13 @@ async def recover_account_imbalances(
                     remaining_net_qty = left_qty_after + right_qty_after
                     if abs(remaining_net_qty) <= EPS:
                         print(
-                            f"[strategy][account-hedge] 오픈 페어 잔량 정리 완료 symbol={symbol} "
-                            f"left_qty={left_qty_after:.6f} right_qty={right_qty_after:.6f}"
+                            f"[복구][잔량정리완료] 심볼={symbol} "
+                            f"좌측수량={left_qty_after:.6f} 우측수량={right_qty_after:.6f}"
                         )
                     else:
                         print(
-                            f"[strategy][account-hedge] 오픈 페어 잔량 유지 symbol={symbol} "
-                            f"left_qty={left_qty_after:.6f} right_qty={right_qty_after:.6f}"
+                            f"[복구][잔량유지] 심볼={symbol} "
+                            f"좌측수량={left_qty_after:.6f} 우측수량={right_qty_after:.6f}"
                         )
                     break
                 recovered_pair = build_recovered_pair_from_positions(
@@ -2959,8 +3056,8 @@ async def recover_account_imbalances(
                 )
                 if recovered_pair is None:
                     print(
-                        f"[strategy][account-hedge][warn] 헤지 후 페어 편입 불가 symbol={symbol} "
-                        f"left_qty={left_qty_after:.6f} right_qty={right_qty_after:.6f}"
+                        f"[복구][경고] 심볼={symbol} 사유=페어편입불가 "
+                        f"좌측수량={left_qty_after:.6f} 우측수량={right_qty_after:.6f}"
                     )
                     break
 
@@ -2979,8 +3076,8 @@ async def recover_account_imbalances(
                     hedge_qty=hedge_qty,
                 )
                 print(
-                    f"[strategy][account-hedge] 계정 기준 복구 완료 pair_id={recovered_pair.pair_id} "
-                    f"symbol={symbol} qty={recovered_pair.qty:.6f}"
+                    f"[복구][완료] pair_id={recovered_pair.pair_id} "
+                    f"심볼={symbol} 수량={recovered_pair.qty:.6f}"
                 )
                 break
 
@@ -3016,8 +3113,8 @@ async def enter_pair_limit_then_hedge(
             failures=bootstrap_failures,
         )
         print(
-            f"[strategy][enter][abort] bootstrap_failed symbol={symbol} "
-            f"failures={bootstrap_failures}"
+            f"[진입][중단] 심볼={symbol} 사유=거래소준비실패 "
+            f"상세={bootstrap_failures}"
         )
         return None
 
@@ -3039,8 +3136,8 @@ async def enter_pair_limit_then_hedge(
     )
     if executable_qty <= EPS:
         print(
-            f"[strategy][enter][abort] common_executable_qty_zero symbol={symbol} "
-            f"requested={candidate.target_qty:.6f} candidate_exec={candidate.executable_qty:.6f}"
+            f"[진입][중단] 심볼={symbol} 사유=공통주문수량없음 "
+            f"요청={candidate.target_qty:.6f} 후보수량={candidate.executable_qty:.6f}"
         )
         return None
 
@@ -3057,8 +3154,8 @@ async def enter_pair_limit_then_hedge(
     )
     if margin_guard_reasons:
         print(
-            f"[strategy][enter][abort] insufficient_available_margin symbol={symbol} "
-            f"reasons={margin_guard_reasons}"
+            f"[진입][차단] 심볼={symbol} 사유=증거금부족 "
+            f"상세={margin_guard_reasons}"
         )
         return None
 
@@ -3066,7 +3163,7 @@ async def enter_pair_limit_then_hedge(
     pre_qty_hedge = extract_position_qty(hedge_exchange.get_symbol_snapshot(symbol))
 
     if first_price <= 0:
-        print(f"[strategy][enter][abort] first leg price missing exchange={first_exchange_name} symbol={symbol}")
+        print(f"[진입][중단] 심볼={symbol} 거래소={first_exchange_name} 사유=첫주문가격없음")
         return None
 
     print_verbose(
@@ -3131,16 +3228,16 @@ async def enter_pair_limit_then_hedge(
                 price=_safe_float(first_flatten_preview.get("price"), 0.0),
             )
             print(
-                f"[strategy][enter][late_fill_dust_ignored] symbol={symbol} "
-                f"first_filled={first_filled_qty:.6f} hedgeable={hedgeable_first_fill_qty:.6f} "
-                f"first_flattenable={first_flattenable_qty:.6f} first_flatten_min_qty={first_flatten_min_qty:.6f} "
-                f"hedge_min_qty={hedge_min_qty:.6f}"
+                f"[진입][소량체결무시] 심볼={symbol} "
+                f"첫체결={first_filled_qty:.6f} 헷지가능={hedgeable_first_fill_qty:.6f} "
+                f"정리가능={first_flattenable_qty:.6f} 정리최소={first_flatten_min_qty:.6f} "
+                f"헷지최소={hedge_min_qty:.6f}"
             )
             return None
         print(
-            f"[strategy][enter][abort] 첫 체결 전량 헤지 불가 symbol={symbol} "
-            f"first_filled={first_filled_qty:.6f} hedgeable={hedgeable_first_fill_qty:.6f} "
-            f"hedge_min_qty={hedge_min_qty:.6f}"
+            f"[진입][중단] 심볼={symbol} 사유=첫체결헷지불가 "
+            f"첫체결={first_filled_qty:.6f} 헷지가능={hedgeable_first_fill_qty:.6f} "
+            f"헷지최소={hedge_min_qty:.6f}"
         )
         flattened = await emergency_flatten_symbol(
             first_exchange,
@@ -3208,12 +3305,12 @@ async def enter_pair_limit_then_hedge(
     )
     if not post_fill_edge_decision.can_hedge:
         print(
-            f"[strategy][enter][abort] first_fill_edge_bad symbol={symbol} "
-            f"actual_open_edge_bps={post_fill_edge_decision.actual_open_edge_bps:.4f} "
-            f"threshold_bps={post_fill_edge_decision.min_open_edge_bps:.4f} "
-            f"actual_net_edge_bps={post_fill_edge_decision.actual_estimated_net_edge_bps:.4f} "
-            f"net_threshold_bps={post_fill_edge_decision.min_net_edge_bps:.4f} "
-            f"reason={post_fill_edge_decision.reason}"
+            f"[진입][중단] 심볼={symbol} 사유=체결후갭악화 "
+            f"실제오픈bps={post_fill_edge_decision.actual_open_edge_bps:.4f} "
+            f"오픈기준bps={post_fill_edge_decision.min_open_edge_bps:.4f} "
+            f"실제예상순bps={post_fill_edge_decision.actual_estimated_net_edge_bps:.4f} "
+            f"순기준bps={post_fill_edge_decision.min_net_edge_bps:.4f} "
+            f"상세={post_fill_edge_decision.reason}"
         )
         flattened = await emergency_flatten_symbol(
             first_exchange,
@@ -3902,7 +3999,7 @@ async def complete_entry_after_maker_first_fill(
             exchanges[candidate.long_exchange],
             symbol,
             f"{reason_prefix}_long",
-            include_account=True,
+            include_account=False,
             include_open_orders=False,
             include_funding=False,
         )
@@ -3910,7 +4007,7 @@ async def complete_entry_after_maker_first_fill(
             exchanges[candidate.short_exchange],
             symbol,
             f"{reason_prefix}_short",
-            include_account=True,
+            include_account=False,
             include_open_orders=False,
             include_funding=False,
         )
@@ -4518,6 +4615,18 @@ async def close_pair_limit_then_hedge(
     if close_state == "closed":
         pair.status = "closed"
         pair.assumed_flat_exchanges = [pair.long_exchange, pair.short_exchange]
+        request_account_refresh(
+            exchanges[pair.long_exchange],
+            "pair_close_complete",
+            priority="urgent",
+            symbol=pair.symbol,
+        )
+        request_account_refresh(
+            exchanges[pair.short_exchange],
+            "pair_close_complete",
+            priority="urgent",
+            symbol=pair.symbol,
+        )
         log_pair_closed(pair_id=pair.pair_id)
         record_live_event(config, "pair_closed", pair=pair_event_payload(pair))
         return True
@@ -4525,8 +4634,8 @@ async def close_pair_limit_then_hedge(
     if close_state == "balanced_open":
         pair.status = "close_pending"
         print(
-            f"[strategy][close][warn] 전량 청산 후 균형 포지션 잔존 pair_id={pair.pair_id} "
-            f"remaining_pair_qty={pair.qty:.6f} flattened={flattened}"
+            f"[페어종료][보류] pair_id={pair.pair_id} 사유=균형포지션잔존 "
+            f"잔여페어수량={pair.qty:.6f} 청산시도성공={flattened}"
         )
         record_live_event(
             config,
@@ -4553,9 +4662,9 @@ async def close_pair_limit_then_hedge(
     )
     pair.status = "close_pending"
     print(
-        f"[strategy][close][warn] 청산 보류 pair_id={pair.pair_id} "
-        f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "
-        f"state={close_state}"
+        f"[페어종료][보류] pair_id={pair.pair_id} 사유=청산후불균형 "
+        f"롱수량={long_qty_after:.6f} 숏수량={short_qty_after:.6f} "
+        f"상태={close_state}"
     )
     record_live_event(
         config,
@@ -4656,12 +4765,12 @@ async def manage_open_pairs(
             if current_ms - pair.last_direction_mismatch_log_ms >= int(config.danger_log_cooldown_sec * 1000):
                 if is_micro_residual:
                     print(
-                        f"[strategy][pair][micro_residual][info] pair_id={pair_id} "
-                        f"exchange={residual_exchange_name} side={residual_side} "
-                        f"residual_qty={abs(residual_qty_signed):.6f} "
-                        f"residual_notional_usd={micro_payload['notional_usd']:.4f} "
-                        f"residual_ratio={micro_payload['ratio']:.6f} "
-                        f"long_qty={long_qty:.6f} short_qty={short_qty:.6f}"
+                        f"[페어][소량잔량] pair_id={pair_id} "
+                        f"거래소={residual_exchange_name} 방향={residual_side} "
+                        f"잔량={abs(residual_qty_signed):.6f} "
+                        f"명목USD={micro_payload['notional_usd']:.4f} "
+                        f"비율={micro_payload['ratio']:.6f} "
+                        f"롱수량={long_qty:.6f} 숏수량={short_qty:.6f}"
                     )
                     record_live_event(
                         config,
@@ -4726,10 +4835,10 @@ async def manage_open_pairs(
                 pair.assumed_flat_exchanges = sorted(forced_flat_exchanges)
                 register_pair_assumed_flat(pair, assumed_flat_until_ms, config)
                 if is_micro_residual:
-                    print(f"[strategy][pair][micro_residual][info] 정리 후 페어 종료 pair_id={pair_id}")
+                    print(f"[페어][종료완료] pair_id={pair_id} 사유=소량잔량정리")
                     event_type = "pair_closed_after_micro_residual_cleanup"
                 else:
-                    print(f"[strategy][pair] 복구 후 페어 종료 pair_id={pair_id}")
+                    print(f"[복구][페어종료완료] pair_id={pair_id}")
                     event_type = "pair_closed_after_recovery"
                 record_live_event(
                     config,
@@ -4744,17 +4853,17 @@ async def manage_open_pairs(
             if mismatch_state == "balanced_open":
                 pair.status = "open"
                 print(
-                    f"[strategy][pair] 복구 후 균형 포지션 유지 pair_id={pair_id} "
-                    f"remaining_pair_qty={pair.qty:.6f}"
+                    f"[복구][페어유지] pair_id={pair_id} "
+                    f"잔여페어수량={pair.qty:.6f}"
                 )
                 record_live_event(config, "pair_recovered_balanced_open", pair=pair_event_payload(pair))
                 continue
             pair.status = "recovery_pending"
             if current_ms - pair.last_direction_mismatch_log_ms >= int(config.danger_log_cooldown_sec * 1000):
                 print(
-                    f"[strategy][pair][warn] 복구 대기 pair_id={pair_id} "
-                    f"long_qty_after={long_qty_after:.6f} short_qty_after={short_qty_after:.6f} "
-                    f"state={mismatch_state} residual_gap={residual_gap:.6f}"
+                    f"[복구][대기] pair_id={pair_id} "
+                    f"롱수량={long_qty_after:.6f} 숏수량={short_qty_after:.6f} "
+                    f"상태={mismatch_state} 잔량차이={residual_gap:.6f}"
                 )
                 pair.last_direction_mismatch_log_ms = current_ms
             continue
@@ -4835,8 +4944,8 @@ async def manage_open_pairs(
                 del open_pairs[pair_id]
             elif not ok:
                 print(
-                    f"[strategy][pair][warn] 자동 청산 미완료 pair_id={pair_id} "
-                    f"status={pair.status}"
+                    f"[페어종료][경고] 자동청산미완료 pair_id={pair_id} "
+                    f"상태={pair.status}"
                 )
                 record_live_event(
                     config,
@@ -4939,6 +5048,7 @@ async def handle_command(
             entry_control_store,
             balance_reports_by_exchange=collect_balance_reports_by_exchange(exchanges),
             startup_block_reasons=startup_block_reasons,
+            manual_locked_symbols=active_manual_symbols(config.position_ownership_file),
         )
         if not risk_decision.allowed:
             apply_risk_decision_to_candidate(candidate, risk_decision)
@@ -4998,6 +5108,7 @@ def collect_candidates(
     symbol_recent_close_ms: dict[str, int] | None = None,
     recent_close_block_logged_ms: dict[str, int] | None = None,
     startup_block_reasons: tuple[str, ...] = (),
+    manual_locked_symbols: set[str] | None = None,
 ) -> list[PairCandidate]:
     candidate_build_hooks = CandidateBuildHooks(
         compute_common_executable_qty=compute_common_executable_qty,
@@ -5026,6 +5137,7 @@ def collect_candidates(
         symbol_recent_close_ms,
         recent_close_block_logged_ms,
         startup_block_reasons,
+        manual_locked_symbols,
     )
 
 
@@ -5037,39 +5149,7 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         else f"{config.min_effective_funding_usd}"
     )
     if simple_stdout_enabled(config):
-        print(
-            f"[strategy][config] mode={live_mode} exchanges={config.exchange_names} "
-            f"symbols={symbols[:8]}{'...' if len(symbols) > 8 else ''} "
-            f"notional_usd={config.order_notional_usd} "
-            f"auto_enter={config.auto_enter_enabled} auto_close={config.auto_close_enabled} "
-            f"first_leg_role={config.first_leg_role} max_open_pairs={config.max_open_pairs} "
-            f"entry_price_mode={config.entry_first_leg_price_mode} "
-            f"entry_spread_bps={config.entry_spread_bps} "
-            f"entry_cancel_buffer_bps={config.entry_cancel_buffer_bps} "
-            f"entry_marketable_bps={config.entry_first_leg_marketable_bps} "
-            f"maker_engine={config.maker_entry_engine_enabled} "
-            f"maker_symbols={config.maker_entry_engine_symbols} "
-            f"maker_replace_bps={config.maker_entry_engine_replace_edge_bps} "
-            f"maker_queue_gap_bps={config.maker_entry_engine_queue_edge_gap_bps} "
-            f"maker_transient_pause={config.maker_entry_engine_transient_pause_sec}s "
-            f"maker_stale_pause={config.maker_entry_engine_stale_pause_sec}s "
-            f"maker_q4_fast_hedge={config.maker_entry_q4_fast_hedge} "
-            f"hedge_fast_ack={config.hedge_fast_ack} "
-            f"close_mode={config.close_execution_mode} "
-            f"account_imbalance_hedge={config.account_imbalance_hedge_enabled} "
-            f"leverage={config.leverage} margin_mode={config.margin_mode} "
-            f"margin_mode_guard={config.startup_margin_mode_guard_enabled} "
-            f"max_gross_lev={config.max_gross_leverage} "
-            f"rate_limit_guard={config.rate_limit_guard_enabled} "
-            f"rate_limit_threshold={config.rate_limit_guard_usage_threshold} "
-            f"funding_payment_only={config.require_funding_payment} "
-            f"entry_settle={config.entry_order_settle_sec}s "
-            f"post_fill_check={config.entry_post_fill_edge_check_enabled} "
-            f"post_fill_net_bps={config.entry_post_fill_min_net_edge_bps} "
-            f"entry_cooldown={config.entry_order_cooldown_sec}s "
-            f"close_spread_confirm={config.close_spread_confirm_count}/{config.close_spread_confirm_sec}s "
-            f"entry_control_file={config.entry_control_file}"
-        )
+        log_strategy_config_summary(config=config, symbols=symbols)
         return
     print("\n[strategy][config]")
     print(f"mode={live_mode}")
@@ -5127,6 +5207,7 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
     print(
         f"entry_control_file={config.entry_control_file} "
         f"entry_control_fail_closed={config.entry_control_fail_closed} "
+        f"position_ownership_file={config.position_ownership_file} "
         f"leverage={config.leverage} "
         f"margin_mode={config.margin_mode} "
         f"startup_margin_mode_guard_enabled={config.startup_margin_mode_guard_enabled}"
@@ -5177,6 +5258,7 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
 
 async def strategy_loop() -> None:
     config = load_strategy_config()
+    install_runtime_log_filter()
 
     def _persistence_log(message: str, payload: Any | None = None) -> None:
         print_verbose(None, message if payload is None else f"{message} {payload}")
@@ -5247,18 +5329,12 @@ async def strategy_loop() -> None:
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         )
         startup_bootstrap_failures = await bootstrap_strategy_symbols_once(exchanges, symbols, config)
-        if startup_bootstrap_failures:
-            print(
-                "[strategy][startup][bootstrap][warn] "
-                f"failures={len(startup_bootstrap_failures)} "
-                f"sample={startup_bootstrap_failures[:3]}"
-            )
-        else:
-            print_verbose(
-                config,
-                "[strategy][startup][bootstrap] "
-                f"exchanges={list(exchanges.keys())} symbols={len(symbols)} leverage={config.leverage}",
-            )
+        log_startup_bootstrap_summary(
+            exchange_count=len(exchanges),
+            symbol_count=len(symbols),
+            leverage=config.leverage,
+            failures=startup_bootstrap_failures,
+        )
 
         if runtime_persistence.enabled:
             snapshot_task = asyncio.create_task(
@@ -5310,6 +5386,7 @@ async def strategy_loop() -> None:
                 break
 
             prune_assumed_flat(assumed_flat_until_ms)
+            manual_locked_symbols = active_manual_symbols(config.position_ownership_file)
 
             candidates = collect_candidates(
                 symbols,
@@ -5321,6 +5398,7 @@ async def strategy_loop() -> None:
                 symbol_recent_close_ms=symbol_recent_close_ms,
                 recent_close_block_logged_ms=recent_close_block_logged_ms,
                 startup_block_reasons=startup_block_reasons,
+                manual_locked_symbols=manual_locked_symbols,
             )
 
             last_recompute_ts = time.monotonic()
@@ -5360,11 +5438,13 @@ async def strategy_loop() -> None:
                     config=config,
                     symbols=symbols,
                     assumed_flat_until_ms=assumed_flat_until_ms,
+                    manual_locked_symbols=manual_locked_symbols,
                 )
                 for pair in maker_pairs:
                     open_pairs[pair.pair_id] = pair
 
             if not shutdown_requested.is_set():
+                recovery_skip_symbols = set(maker_entry_engine.active_symbols()) | set(manual_locked_symbols)
                 await recover_account_imbalances(
                     symbols=symbols,
                     exchanges=exchanges,
@@ -5372,7 +5452,7 @@ async def strategy_loop() -> None:
                     open_pairs=open_pairs,
                     assumed_flat_until_ms=assumed_flat_until_ms,
                     next_retry_ms_by_key=account_imbalance_next_retry_ms,
-                    skip_symbols=maker_entry_engine.active_symbols(),
+                    skip_symbols=recovery_skip_symbols,
                 )
 
             if not shutdown_requested.is_set() and config.enable_live and config.auto_enter_enabled:
@@ -5419,6 +5499,7 @@ async def strategy_loop() -> None:
                             entry_control_store,
                             balance_reports_by_exchange=collect_balance_reports_by_exchange(exchanges),
                             startup_block_reasons=startup_block_reasons,
+                            manual_locked_symbols=manual_locked_symbols,
                         )
                         if not risk_decision.allowed:
                             apply_risk_decision_to_candidate(candidate, risk_decision)
@@ -5486,9 +5567,10 @@ async def strategy_loop() -> None:
                 open_pairs=open_pairs,
                 config=config,
                 assumed_flat_until_ms=assumed_flat_until_ms,
+                manual_locked_symbols=active_manual_symbols(config.position_ownership_file),
             )
         except Exception as exc:
-            print(f"[strategy][shutdown][error] cleanup_failed error={exc}")
+            print(f"[종료][정리오류] 오류={exc}")
             record_live_event(
                 config,
                 "shutdown_cleanup_error",
@@ -5505,6 +5587,7 @@ async def strategy_loop() -> None:
             open_pair_ids=sorted(open_pairs.keys()),
             reason=shutdown_reason.get("reason") or "normal_exit",
         )
+        flush_api_pressure(force=True)
 
         if snapshot_task is not None:
             snapshot_task.cancel()

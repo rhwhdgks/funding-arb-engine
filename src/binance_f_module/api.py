@@ -11,6 +11,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 from dotenv import load_dotenv
+from src.core.api_pressure import record_api_call
 
 load_dotenv()
 
@@ -426,8 +427,19 @@ async def _request(
 
     paused = _local_rest_pause_response(path)
     if paused is not None:
+        status, data, paused_headers = paused
+        record_api_call(
+            exchange="binance",
+            method=method,
+            path=path,
+            status=status,
+            data=data,
+            headers=paused_headers,
+            local_pause=True,
+        )
         return paused
 
+    request_started_ms = _now_ms()
     headers = {"Content-Type": "application/json"}
     if BINANCE_API_KEY:
         headers["X-MBX-APIKEY"] = BINANCE_API_KEY
@@ -451,11 +463,22 @@ async def _request(
             except Exception:
                 data = await response.text()
             response_headers = dict(response.headers)
+            rate_limits = _build_rate_limits(response_headers)
             _update_rest_rate_limit_state(
                 path=path,
                 status=response.status,
                 data=data,
                 headers=response_headers,
+            )
+            record_api_call(
+                exchange="binance",
+                method=method,
+                path=path,
+                status=response.status,
+                data=data,
+                headers=response_headers,
+                rate_limits=rate_limits,
+                latency_ms=max(_now_ms() - request_started_ms, 0),
             )
             rate_limit_pause = _classify_rate_limit_response(response.status, data)
             if rate_limit_pause is not None:

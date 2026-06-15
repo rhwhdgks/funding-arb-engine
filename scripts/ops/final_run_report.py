@@ -60,6 +60,41 @@ def parse_csv(raw: Any, fallback: list[str] | None = None, *, lower: bool = Fals
     return [item.upper() for item in values]
 
 
+def boolish(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def strategy_execution_profile(run_meta: dict[str, Any]) -> str:
+    raw = str(run_meta.get("execution_profile") or "").strip().lower().replace("-", "_")
+    if raw in {"auto_trade", "monitor", "dry_run"}:
+        return raw
+    has_profile_fields = any(
+        key in run_meta
+        for key in (
+            "enable_live",
+            "auto_enter_enabled",
+            "maker_entry_engine_enabled",
+        )
+    )
+    if not has_profile_fields:
+        return "legacy_unknown"
+    if not boolish(run_meta.get("enable_live")):
+        return "dry_run"
+    if boolish(run_meta.get("auto_enter_enabled")) or boolish(run_meta.get("maker_entry_engine_enabled")):
+        return "auto_trade"
+    return "monitor"
+
+
+def is_no_entry_profile(run_meta: dict[str, Any]) -> bool:
+    profile = strategy_execution_profile(run_meta)
+    has_entry_flags = "auto_enter_enabled" in run_meta or "maker_entry_engine_enabled" in run_meta
+    return profile in {"monitor", "dry_run"} or (
+        has_entry_flags
+        and not boolish(run_meta.get("auto_enter_enabled"))
+        and not boolish(run_meta.get("maker_entry_engine_enabled"))
+    )
+
+
 def safe_label(label: str | None) -> str:
     text = (label or "latest").strip()
     text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
@@ -185,6 +220,8 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
     close_reason_counts = Counter(str(row.get("close_reason") or "unknown") for row in pair_rows)
 
     return {
+        "execution_profile": strategy_execution_profile(run_meta),
+        "new_entries_disabled_expected": is_no_entry_profile(run_meta),
         "run_rows": len(run_rows),
         "pair_opened": int(event_counts.get("pair_opened", 0)),
         "pair_closed": closed_count,
@@ -204,6 +241,165 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
         "top_enterable_symbols": dict(top_enterable_symbol_counts.most_common(10)),
         "entry_quality": build_entry_quality_report(run_rows),
         "pairs": pair_rows,
+    }
+
+
+def _sum_counter(target: Counter[str], raw: dict[str, Any]) -> None:
+    for key, value in (raw or {}).items():
+        try:
+            target[str(key)] += int(value or 0)
+        except Exception:
+            continue
+
+
+def build_api_pressure_report(run_meta: dict[str, Any]) -> dict[str, Any]:
+    run_rows = load_run_rows_from_meta(run_meta)
+    summaries = [row for row in run_rows if row.get("event_type") == "api_pressure_summary"]
+    checks: list[dict[str, str]] = []
+
+    if not summaries:
+        checks.append(check("WARN", "api_pressure_data_present", "no_api_pressure_summary_events"))
+        return {
+            "generated_at_ms": now_ms(),
+            "verdict": "WARN",
+            "fail_count": 0,
+            "warn_count": 1,
+            "checks": checks,
+            "console_monitor_readiness": "WARN",
+            "exchanges": {},
+        }
+
+    warn_usage_ratio = safe_float(os.getenv("API_PRESSURE_BINANCE_WARN_USAGE_RATIO"), 0.75)
+    fail_usage_ratio = safe_float(os.getenv("API_PRESSURE_BINANCE_FAIL_USAGE_RATIO"), 0.95)
+    exchange_rows: dict[str, dict[str, Any]] = {}
+
+    for row in summaries:
+        for exchange_name, raw in (row.get("exchanges") or {}).items():
+            exchange_name = str(exchange_name).lower()
+            bucket = exchange_rows.setdefault(
+                exchange_name,
+                {
+                    "remote_calls": 0,
+                    "local_skips": 0,
+                    "by_category": Counter(),
+                    "by_path": Counter(),
+                    "status_counts": Counter(),
+                    "error_code_counts": Counter(),
+                    "transient_counts": Counter(),
+                    "latency_ms_max": 0.0,
+                    "retry_attempts": 0,
+                    "retry_exhausted": 0,
+                    "private_read_pause_started": 0,
+                    "private_read_pause_skips": 0,
+                    "rate_limit_violations": 0,
+                    "ip_ban_events": 0,
+                    "max_request_weight_usage_1m": 0.0,
+                    "max_order_count_usage_10s": 0.0,
+                    "max_order_count_usage_1m": 0.0,
+                },
+            )
+            bucket["remote_calls"] += int(raw.get("remote_calls") or 0)
+            bucket["local_skips"] += int(raw.get("local_skips") or 0)
+            _sum_counter(bucket["by_category"], raw.get("by_category") or {})
+            _sum_counter(bucket["by_path"], raw.get("by_path") or {})
+            _sum_counter(bucket["status_counts"], raw.get("status_counts") or {})
+            _sum_counter(bucket["error_code_counts"], raw.get("error_code_counts") or {})
+            _sum_counter(bucket["transient_counts"], raw.get("transient_counts") or {})
+            bucket["latency_ms_max"] = max(safe_float(bucket.get("latency_ms_max")), safe_float(raw.get("latency_ms_max")))
+            bucket["retry_attempts"] += int(raw.get("retry_attempts") or 0)
+            bucket["retry_exhausted"] += int(raw.get("retry_exhausted") or 0)
+            bucket["private_read_pause_started"] += int(raw.get("private_read_pause_started") or 0)
+            bucket["private_read_pause_skips"] += int(raw.get("private_read_pause_skips") or 0)
+            bucket["rate_limit_violations"] += int(raw.get("rate_limit_violations") or 0)
+            bucket["ip_ban_events"] += int(raw.get("ip_ban_events") or 0)
+            bucket["max_request_weight_usage_1m"] = max(
+                safe_float(bucket.get("max_request_weight_usage_1m")),
+                safe_float(raw.get("max_request_weight_usage_1m")),
+            )
+            bucket["max_order_count_usage_10s"] = max(
+                safe_float(bucket.get("max_order_count_usage_10s")),
+                safe_float(raw.get("max_order_count_usage_10s")),
+            )
+            bucket["max_order_count_usage_1m"] = max(
+                safe_float(bucket.get("max_order_count_usage_1m")),
+                safe_float(raw.get("max_order_count_usage_1m")),
+            )
+
+    top_limit = max(1, int(safe_float(os.getenv("API_PRESSURE_TOP_ENDPOINT_LIMIT"), 10)))
+    serializable_exchanges: dict[str, dict[str, Any]] = {}
+    for exchange_name, bucket in sorted(exchange_rows.items()):
+        max_binance_usage = max(
+            safe_float(bucket.get("max_request_weight_usage_1m")),
+            safe_float(bucket.get("max_order_count_usage_10s")),
+            safe_float(bucket.get("max_order_count_usage_1m")),
+        )
+        serializable_exchanges[exchange_name] = {
+            **{
+                key: value
+                for key, value in bucket.items()
+                if not isinstance(value, Counter)
+            },
+            "by_category": dict(bucket["by_category"].most_common()),
+            "by_path": dict(bucket["by_path"].most_common(top_limit)),
+            "status_counts": dict(bucket["status_counts"].most_common()),
+            "error_code_counts": dict(bucket["error_code_counts"].most_common()),
+            "transient_counts": dict(bucket["transient_counts"].most_common()),
+            "max_binance_usage_ratio": max_binance_usage,
+        }
+
+        if exchange_name == "binance":
+            if int(bucket.get("ip_ban_events") or 0) > 0:
+                checks.append(check("FAIL", "binance_ip_ban_events_zero", f"ip_ban_events={bucket['ip_ban_events']}"))
+            else:
+                checks.append(check("PASS", "binance_ip_ban_events_zero", "ip_ban_events=0"))
+            if int(bucket.get("rate_limit_violations") or 0) > 0:
+                checks.append(
+                    check("FAIL", "binance_rate_limit_violations_zero", f"violations={bucket['rate_limit_violations']}")
+                )
+            else:
+                checks.append(check("PASS", "binance_rate_limit_violations_zero", "violations=0"))
+            if max_binance_usage >= fail_usage_ratio:
+                checks.append(
+                    check("FAIL", "binance_usage_below_fail_threshold", f"max_usage={max_binance_usage:.3f}")
+                )
+            elif max_binance_usage >= warn_usage_ratio:
+                checks.append(check("WARN", "binance_usage_below_warn_threshold", f"max_usage={max_binance_usage:.3f}"))
+            else:
+                checks.append(check("PASS", "binance_usage_below_warn_threshold", f"max_usage={max_binance_usage:.3f}"))
+            if int(bucket.get("local_skips") or 0) > 0:
+                checks.append(check("WARN", "binance_local_pause_skips_zero", f"local_skips={bucket['local_skips']}"))
+
+        if exchange_name == "okx":
+            if int(bucket.get("rate_limit_violations") or 0) > 0:
+                checks.append(check("FAIL", "okx_rate_limit_violations_zero", f"violations={bucket['rate_limit_violations']}"))
+            else:
+                checks.append(check("PASS", "okx_rate_limit_violations_zero", "violations=0"))
+            transient_count = sum(int(value or 0) for value in bucket["transient_counts"].values())
+            pause_count = int(bucket.get("private_read_pause_started") or 0) + int(bucket.get("private_read_pause_skips") or 0)
+            retry_exhausted = int(bucket.get("retry_exhausted") or 0)
+            if transient_count or pause_count or retry_exhausted:
+                checks.append(
+                    check(
+                        "WARN",
+                        "okx_transient_pressure_zero",
+                        f"transient={transient_count} private_pause={pause_count} retry_exhausted={retry_exhausted}",
+                    )
+                )
+            else:
+                checks.append(check("PASS", "okx_transient_pressure_zero", "transient=0 private_pause=0 retry_exhausted=0"))
+
+    checks.append(check("PASS", "api_pressure_data_present", f"summaries={len(summaries)}"))
+    fail_count = sum(1 for item in checks if item["status"] == "FAIL")
+    warn_count = sum(1 for item in checks if item["status"] == "WARN")
+    return {
+        "generated_at_ms": now_ms(),
+        "summary_count": len(summaries),
+        "verdict": "FAIL" if fail_count else ("WARN" if warn_count else "PASS"),
+        "fail_count": fail_count,
+        "warn_count": warn_count,
+        "checks": checks,
+        "console_monitor_readiness": "FAIL" if fail_count else ("WARN" if warn_count else "PASS"),
+        "exchanges": serializable_exchanges,
     }
 
 
@@ -535,6 +731,20 @@ def db_error_report(exc: Exception, *, since_ms: int, run_meta: dict[str, Any]) 
     }
 
 
+def db_skipped_report(reason: str, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "generated_at_ms": now_ms(),
+        "since_ms": since_ms,
+        "since_utc": iso_utc(since_ms),
+        "run_meta": run_meta,
+        "verdict": "WARN",
+        "fail_count": 0,
+        "warn_count": 1,
+        "checks": [check("WARN", "order_trade_reconcile_query_ok", reason)],
+        "summary": {"skipped": reason},
+    }
+
+
 def render_db_error_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Order/Trade DB Reconcile Report",
@@ -586,6 +796,7 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     db_report = payload.get("order_trade_reconcile") or {}
     live_report = payload.get("live_flat") or {}
     symbol_price_report = payload.get("symbol_price") or {}
+    api_pressure = payload.get("api_pressure") or {}
     performance = payload.get("strategy_performance") or {}
     artifacts = payload.get("artifacts") or {}
     event_counts = afterrun.get("event_counts") or {}
@@ -609,6 +820,12 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- run_started_at_utc: {run_meta.get('started_at_iso')}")
     lines.append(f"- requested_duration: {run_meta.get('duration')}")
     lines.append(f"- observed_duration: {format_duration_ms(int(afterrun.get('observed_duration_ms') or 0))}")
+    lines.append(f"- execution_profile: {strategy_execution_profile(run_meta)}")
+    lines.append(f"- enable_live: {run_meta.get('enable_live')}")
+    lines.append(f"- auto_enter_enabled: {run_meta.get('auto_enter_enabled')}")
+    lines.append(f"- maker_entry_engine_enabled: {run_meta.get('maker_entry_engine_enabled')}")
+    lines.append(f"- auto_close_enabled: {run_meta.get('auto_close_enabled')}")
+    lines.append(f"- max_open_pairs: {run_meta.get('max_open_pairs')}")
     lines.append(f"- env_file: {run_meta.get('env_file')}")
     lines.append(f"- stdout_log: {run_meta.get('stdout_log')}")
     lines.append(f"- jsonl_log: {run_meta.get('jsonl_log')}")
@@ -641,6 +858,8 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- {key}: {event_counts.get(key, 0)}")
     lines.append("")
     lines.append("## Strategy Performance")
+    lines.append(f"- execution_profile: {performance.get('execution_profile') or strategy_execution_profile(run_meta)}")
+    lines.append(f"- new_entries_disabled_expected: {performance.get('new_entries_disabled_expected')}")
     lines.append(f"- pair_opened: {performance.get('pair_opened', 0)}")
     lines.append(f"- pair_closed: {performance.get('pair_closed', 0)}")
     lines.append(f"- total_close_pnl_usd: {float(performance.get('total_close_pnl_usd') or 0):.6f}")
@@ -679,7 +898,10 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
                 f"{row.get('close_reason') or '-'} |"
             )
     else:
-        lines.append("- no closed pairs in this run")
+        if performance.get("new_entries_disabled_expected"):
+            lines.append("- no closed pairs in this run; expected for monitor/no-entry profile")
+        else:
+            lines.append("- no closed pairs in this run; treated as neutral, not a failure")
     lines.append("")
     entry_quality = performance.get("entry_quality") or {}
     lines.append("## Entry Quality")
@@ -764,6 +986,31 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
             f"symbols={row.get('latest_symbol_count')}/{row.get('expected_symbol_count')}"
         )
     lines.append("")
+    lines.append("## API Pressure")
+    lines.extend(render_check_lines(api_pressure.get("checks") or []))
+    lines.append(f"- console_monitor_readiness: {api_pressure.get('console_monitor_readiness') or '-'}")
+    lines.append(f"- summary_count: {api_pressure.get('summary_count', 0)}")
+    for exchange_name, row in sorted((api_pressure.get("exchanges") or {}).items()):
+        lines.append(
+            f"- {exchange_name}: remote_calls={row.get('remote_calls', 0)} "
+            f"local_skips={row.get('local_skips', 0)} "
+            f"rate_limit_violations={row.get('rate_limit_violations', 0)} "
+            f"retry_exhausted={row.get('retry_exhausted', 0)} "
+            f"max_binance_usage={float(row.get('max_binance_usage_ratio') or 0):.3f}"
+        )
+        by_category = row.get("by_category") or {}
+        if by_category:
+            lines.append("- " + exchange_name + "_by_category: " + ", ".join(f"{k}={v}" for k, v in by_category.items()))
+        by_path = row.get("by_path") or {}
+        if by_path:
+            lines.append("- " + exchange_name + "_top_paths: " + ", ".join(f"{k}={v}" for k, v in by_path.items()))
+        errors = row.get("error_code_counts") or {}
+        if errors:
+            lines.append("- " + exchange_name + "_error_codes: " + ", ".join(f"{k}={v}" for k, v in errors.items()))
+        transients = row.get("transient_counts") or {}
+        if transients:
+            lines.append("- " + exchange_name + "_transients: " + ", ".join(f"{k}={v}" for k, v in transients.items()))
+    lines.append("")
     lines.append("## Artifacts")
     for key, value in artifacts.items():
         lines.append(f"- {key}: {value}")
@@ -829,18 +1076,22 @@ def main() -> int:
     since_ms = int(run_meta.get("started_at_ms") or 0)
     db_markdown = ""
     try:
-        from src.ops.persistence.db import get_db_connection
+        from src.ops.persistence.db import db_persistence_enabled, get_db_connection
 
-        conn = get_db_connection()
-        try:
-            db_report = build_order_trade_report(
-                conn,
-                since_ms=since_ms,
-                run_meta=run_meta,
-            )
-        finally:
-            conn.close()
-        db_markdown = render_order_trade_markdown(db_report)
+        if db_persistence_enabled():
+            conn = get_db_connection()
+            try:
+                db_report = build_order_trade_report(
+                    conn,
+                    since_ms=since_ms,
+                    run_meta=run_meta,
+                )
+            finally:
+                conn.close()
+            db_markdown = render_order_trade_markdown(db_report)
+        else:
+            db_report = db_skipped_report("db_persistence_disabled", since_ms=since_ms, run_meta=run_meta)
+            db_markdown = render_db_error_markdown(db_report)
     except Exception as exc:
         db_report = db_error_report(exc, since_ms=since_ms, run_meta=run_meta)
         db_markdown = render_db_error_markdown(db_report)
@@ -864,24 +1115,31 @@ def main() -> int:
             )
         )
     try:
-        symbol_price = collect_symbol_price_report(
-            exchanges=exchanges,
-            symbols=symbols,
-            interval_sec=float(os.getenv("SYMBOL_PRICE_INTERVAL_SEC", "60") or 60),
-        )
+        from src.ops.persistence.db import db_persistence_enabled
+
+        if db_persistence_enabled():
+            symbol_price = collect_symbol_price_report(
+                exchanges=exchanges,
+                symbols=symbols,
+                interval_sec=float(os.getenv("SYMBOL_PRICE_INTERVAL_SEC", "60") or 60),
+            )
+        else:
+            symbol_price = symbol_price_error_report(RuntimeError("db_persistence_disabled"))
     except Exception as exc:
         symbol_price = symbol_price_error_report(exc)
     strategy_performance = build_strategy_performance_report(run_meta)
+    api_pressure = build_api_pressure_report(run_meta)
 
     component_checks = [
         verdict_to_check("afterrun_summary_passed", afterrun_payload.get("verdict") or {}),
         verdict_to_check("order_trade_reconcile_passed", db_report),
         verdict_to_check("live_exchange_flat_passed", live_flat),
         verdict_to_check("symbol_price_collector_passed", symbol_price),
+        verdict_to_check("api_pressure_passed", api_pressure),
     ]
     final = build_final_verdict(
         component_checks,
-        [afterrun_payload.get("verdict") or {}, db_report, live_flat, symbol_price],
+        [afterrun_payload.get("verdict") or {}, db_report, live_flat, symbol_price, api_pressure],
         allow_warnings=args.allow_warnings,
     )
     payload = {
@@ -893,6 +1151,7 @@ def main() -> int:
         "order_trade_reconcile": db_report,
         "live_flat": live_flat,
         "symbol_price": symbol_price,
+        "api_pressure": api_pressure,
         "strategy_performance": strategy_performance,
         "artifacts": {
             "afterrun_summary_md": str(afterrun_output),

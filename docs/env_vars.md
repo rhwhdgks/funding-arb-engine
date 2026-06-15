@@ -8,7 +8,8 @@
 - `.env`, `.env.notion`, `test_server/.env`는 git에 올리지 않습니다.
 - 런처는 `STRATEGY_ENV_FILE`로 사용할 env 파일을 고릅니다.
 - 자주 바꾸는 운영값만 env로 노출하고, 낮은 수준의 튜닝값은 코드 기본값을 우선합니다.
-- DB 설정은 선택사항입니다. DB 변수가 없거나 persistence가 비활성화되면 런타임은 DB write를 skip하고 계속 실행할 수 있습니다.
+- DB 설정은 명시적 opt-in입니다. `ENABLE_DB_PERSISTENCE=1`(또는 `true`, `on`)이고 DB 접속값이 채워진 경우에만 DB write를 켭니다.
+- DB 변수가 없거나 `ENABLE_DB_PERSISTENCE=0`이면 런타임은 DB write를 skip하고 전략과 비DB 리포트 일부를 계속 실행할 수 있습니다.
 
 ## 파일별 역할
 
@@ -33,6 +34,7 @@
 | 진입/청산 계열 | expected edge, funding forecast, hold, take-profit, stop-loss, close mode |
 | 런타임 계열 | log path, pid/lock/run metadata path, stdout style |
 | entry control 계열 | pause control 파일 경로, fail-closed 여부 |
+| Ops Console 계열 | 수동 주문 콘솔 host/port, 실거래 버튼, action token |
 
 ## `test_server/.env`
 
@@ -46,6 +48,14 @@
 
 테스트 서버라고 해도 주문 실행 경로는 실제 거래소 테스트 환경을 호출할 수 있습니다. 중지할 때는 프로세스를 직접 죽이기보다 런처의 `stop`을 사용합니다.
 
+## DB Persistence
+
+- 운영 DB는 `trading_dev` 하나를 사용하고, row 구분은 `STRATEGY_ACCOUNT_LABEL`과 `STRATEGY_LOGIC`으로 합니다.
+- `STRATEGY_ACCOUNT_LABEL`은 계정/환경 구분값입니다. 예: `real`, `test`.
+- `STRATEGY_LOGIC`은 전략 로직 구분값입니다. 기본값은 `funding fee`입니다.
+- `ENABLE_DB_PERSISTENCE`를 비우거나 `0`으로 두면 DB 접속값이 있더라도 전략 DB write는 비활성화됩니다.
+- DB를 켤 때만 `ENABLE_DB_PERSISTENCE=1`과 `MARIADB_HOST`, `MARIADB_USER`, `MARIADB_DATABASE=trading_dev`를 채웁니다. `MARIADB_PORT` 기본값은 `3306`입니다.
+
 ## Notion Env
 
 Notion 연동은 trading runtime 필수값이 아닙니다. 별도 env 파일로 분리하고, 운영 코드 설명이나 공개 문서에는 토큰 값을 적지 않습니다.
@@ -58,6 +68,19 @@ Notion 연동은 trading runtime 필수값이 아닙니다. 별도 env 파일로
 | `FX_*` | FX collector의 실행 주기, 로그/runtime 파일, node 실행 경로 |
 
 보조 수집기는 전략과 별도로 start/stop/status/logs/once 명령을 지원합니다. 자세한 명령은 [runbook.md](runbook.md)를 봅니다.
+
+## Ops Console Env
+
+| 변수 | 역할 |
+| --- | --- |
+| `OPS_CONSOLE_HOST` | console 서버 bind host. 로컬 전용은 `127.0.0.1`, 외부 장비 접속은 `0.0.0.0` |
+| `OPS_CONSOLE_PORT` | console 서버 포트. 기본 `8010` |
+| `ENABLE_WEB_TRADING` | console 실주문 버튼 활성화 여부 |
+| `OPS_CONSOLE_ACTION_TOKEN_REQUIRED` | 실행 요청에 `X-OPS-TOKEN`을 요구할지 여부 |
+| `OPS_CONSOLE_ACTION_TOKEN` | 주문/청산/entry pause 실행 요청용 토큰 |
+| `OPS_CONSOLE_STALE_MS` | console 주문 전 market data stale 판단 기준 |
+
+기본 운영은 `OPS_CONSOLE_HOST=127.0.0.1`입니다. 같은 PC 브라우저에서만 console을 볼 수 있고, 별도 token 없이도 로컬 운영이 가능합니다. 폰이나 다른 장비에서 접속하려면 VPN/터널과 action token을 같이 둡니다.
 
 ## 운영 메모
 
