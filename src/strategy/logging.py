@@ -104,9 +104,7 @@ def korean_close_reason(reason: Any) -> str:
 
 def log_strategy_config_summary(*, config: Any, symbols: list[str]) -> None:
     mode = "실거래" if bool(getattr(config, "enable_live", False)) else "모의"
-    maker_symbols = getattr(config, "maker_entry_engine_symbols", None) or symbols
     symbol_text = _join_values(symbols[:8]) + ("..." if len(symbols) > 8 else "")
-    maker_symbol_text = _join_values(list(maker_symbols)[:8]) + ("..." if len(maker_symbols) > 8 else "")
     print(
         "[시작][설정] "
         f"모드={mode} 거래소={_join_values(getattr(config, 'exchange_names', []))} "
@@ -115,8 +113,9 @@ def log_strategy_config_summary(*, config: Any, symbols: list[str]) -> None:
         f"진입기준={fmt_bps(getattr(config, 'min_expected_net_edge_bps', 0.0))}bps "
         f"체결후기준={fmt_bps(getattr(config, 'entry_post_fill_min_net_edge_bps', 0.0))}bps "
         f"메이커큐={_enabled_text(getattr(config, 'maker_entry_engine_enabled', False))} "
-        f"메이커심볼={maker_symbol_text} 큐허용폭={fmt_bps(getattr(config, 'maker_entry_engine_queue_edge_gap_bps', 0.0))}bps "
+        f"메이커심볼={symbol_text} 큐허용폭={fmt_bps(getattr(config, 'maker_entry_engine_queue_edge_gap_bps', 0.0))}bps "
         f"청산방식={_korean_close_mode(getattr(config, 'close_execution_mode', '-'))} "
+        f"청산FeeGate={_enabled_text(getattr(config, 'normal_close_fee_gate_enabled', False))} "
         f"DB저장={_enabled_text(_env_enabled('ENABLE_DB_PERSISTENCE'))}"
     )
 

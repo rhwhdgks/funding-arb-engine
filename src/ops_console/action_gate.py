@@ -17,6 +17,12 @@ TERMINAL_PAIR_EVENTS = {
     "pair_closed_after_micro_residual_cleanup",
     "pair_closed_after_shutdown",
 }
+_ACTIVE_STRATEGY_SYMBOLS_PROVIDER = None
+
+
+def set_active_strategy_symbols_provider(provider) -> None:
+    global _ACTIVE_STRATEGY_SYMBOLS_PROVIDER
+    _ACTIVE_STRATEGY_SYMBOLS_PROVIDER = provider
 
 
 def web_trading_enabled() -> bool:
@@ -34,6 +40,17 @@ def strategy_event_log_path() -> Path:
 def active_strategy_symbols(max_lines: int = 20000) -> dict[str, str]:
     if not parse_bool(os.getenv("OPS_CONSOLE_STRATEGY_CONFLICT_CHECK", "1"), True):
         return {}
+    if callable(_ACTIVE_STRATEGY_SYMBOLS_PROVIDER):
+        try:
+            provided = _ACTIVE_STRATEGY_SYMBOLS_PROVIDER()
+        except Exception:
+            provided = None
+        if isinstance(provided, dict):
+            return {
+                str(pair_id): normalize_symbol(str(symbol))
+                for pair_id, symbol in provided.items()
+                if str(symbol).strip()
+            }
 
     path = strategy_event_log_path()
     if not path.exists():
@@ -117,4 +134,3 @@ def assert_live_action_allowed(
     assert_symbol_not_stale(snapshot, exchange, symbol)
     if check_strategy_conflict:
         assert_no_strategy_conflict(symbol)
-

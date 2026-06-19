@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -11,9 +12,26 @@ from src.core.action_gate import ActionGate
 from src.core.api_pressure import flush_api_pressure
 from dotenv import load_dotenv
 from src.ops.position_ownership import active_manual_symbols
+from src.ops.orphan_guard import active_orphan_symbols, active_orphans, mark_orphan, clear_orphan
 from src.ops.persistence.entry_quality import schedule_entry_quality_persist
 from src.ops.persistence.runtime import build_runtime_persistence_from_env
-from src.core.exchange_registry import build_exchange
+from src.ops_console.action_gate import assert_action_token
+from src.ops_console.actions import (
+    cancel_symbol as console_cancel_symbol,
+    flatten_symbol as console_flatten_symbol,
+    live_limit_order as console_live_limit_order,
+    live_market_order as console_live_market_order,
+    paper_order as console_paper_order,
+    rebalance_hedge as console_rebalance_hedge,
+)
+from src.ops_console.embedded import (
+    EmbeddedControlServer,
+    StrategyControlCommand,
+    StrategyControlService,
+    record_control_plane_event,
+)
+from src.ops_console.runtime import write_entry_control
+from src.core.exchange_registry import build_exchange, validate_exchange_interface, validate_exchange_snapshot_shape
 from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_csv
 from src.strategy.candidates import (
     CandidateBuildHooks,
@@ -56,7 +74,12 @@ from src.strategy.risk_gate import (
     RiskGateDecision,
     evaluate_entry_risk,
 )
-from src.strategy.close_policy import close_fee_cost_usd, evaluate_close_policy, pair_entry_reference_notional_usd
+from src.strategy.close_policy import (
+    close_pnl_breakdown_usd,
+    evaluate_close_policy,
+    evaluate_normal_close_fee_gate,
+    pair_entry_reference_notional_usd,
+)
 from src.strategy.entry_policy import evaluate_post_first_fill_edge
 from src.strategy.rules import (
     close_first_leg_plan,
@@ -125,6 +148,94 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def entry_locked_symbols(config: "StrategyConfig") -> set[str]:
+    """Symbols the strategy must not enter: manually-locked positions plus
+    orphaned (unhedged, failed-rollback) positions awaiting operator cleanup."""
+    return active_manual_symbols(config.position_ownership_file) | active_orphan_symbols()
+
+
+def reconcile_orphan_markers(exchanges: dict[str, Any], config: "StrategyConfig") -> None:
+    """Auto-clear an orphan marker once the symbol is flat on every exchange
+    (e.g. after the operator manually flattened it via the console).
+
+    The clear decision must use account snapshots newer than the orphan marker.
+    Otherwise a stale flat snapshot can erase the only operator warning for a
+    real unhedged leg.
+    """
+    records_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for record in active_orphans():
+        symbol = normalize_symbol(record.get("symbol") or "")
+        if symbol:
+            records_by_symbol.setdefault(symbol, []).append(record)
+
+    for symbol, orphan_records in records_by_symbol.items():
+        marker_ms = max(
+            int(record.get("updated_at_ms") or record.get("created_at_ms") or 0)
+            for record in orphan_records
+        )
+        still_open = False
+        snapshots_fresh = True
+        for exchange_name, exchange in exchanges.items():
+            try:
+                snapshot = exchange.get_symbol_snapshot(symbol)
+                account_last_sync_ms = int((snapshot or {}).get("account_last_sync_ms") or 0)
+                qty = effective_position_qty(snapshot, exchange, symbol, config)
+            except Exception:
+                still_open = True
+                snapshots_fresh = False
+                break
+            if account_last_sync_ms <= marker_ms:
+                snapshots_fresh = False
+            if abs(qty) > EPS:
+                still_open = True
+                break
+        if not still_open and snapshots_fresh:
+            clear_orphan(symbol)
+
+
+def mark_actual_orphan_legs(
+    *,
+    symbol: str,
+    exchanges: dict[str, Any],
+    config: "StrategyConfig",
+    reason: str,
+    fallback_exchange: str | None = None,
+    fallback_qty: float | None = None,
+) -> list[dict[str, Any]]:
+    """Persist the actual non-flat orphan legs visible in account snapshots.
+
+    A hedge failure can leave exposure on either venue. Recording only the
+    first leg's requested fill can be wrong after a partial rollback, so this
+    helper uses the same effective-position filter as recovery/shutdown.
+    """
+    records: list[dict[str, Any]] = []
+    for exchange_name, exchange in exchanges.items():
+        try:
+            qty = effective_position_qty(exchange.get_symbol_snapshot(symbol), exchange, symbol, config)
+        except Exception:
+            continue
+        if abs(qty) > EPS:
+            records.append(
+                mark_orphan(
+                    symbol=symbol,
+                    exchange=exchange_name,
+                    qty=qty,
+                    reason=reason,
+                )
+            )
+
+    if not records and fallback_exchange and fallback_qty is not None and abs(fallback_qty) > EPS:
+        records.append(
+            mark_orphan(
+                symbol=symbol,
+                exchange=fallback_exchange,
+                qty=fallback_qty,
+                reason=f"{reason}:snapshot_fallback",
+            )
+        )
+    return records
+
+
 def iso_utc_from_ms(timestamp_ms: int) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp_ms / 1000.0))
 
@@ -171,6 +282,10 @@ def record_live_event(config: StrategyConfig, event_type: str, **payload: Any) -
         append_jsonl(config.live_event_log_path, row)
     except Exception as exc:
         print(f"[strategy][warn] failed_to_write_live_event type={event_type} error={exc!r}")
+    try:
+        record_control_plane_event(row)
+    except Exception as exc:
+        print(f"[strategy][warn] failed_to_publish_control_plane_event type={event_type} error={exc!r}")
     try:
         schedule_entry_quality_persist(row)
     except Exception as exc:
@@ -1621,6 +1736,22 @@ async def bootstrap_strategy_symbols_once(
         failure_count=len(failures),
         failures=failures[:20],
     )
+
+    # Validate each exchange exposes the method + snapshot SHAPE the strategy
+    # relies on. Catches a new/partial exchange adapter at startup instead of
+    # crashing mid-trade on a missing snapshot field.
+    sample_symbol = symbols[0] if symbols else None
+    for exchange_name, exchange in exchanges.items():
+        iface = validate_exchange_interface(exchange)
+        if not iface["ok"]:
+            print(f"[strategy][interface][경고] 거래소={exchange_name} 누락메서드={iface['missing_methods']}")
+            record_live_event(config, "exchange_interface_invalid", exchange=exchange_name, **iface)
+        if sample_symbol is not None:
+            shape = validate_exchange_snapshot_shape(exchange, sample_symbol)
+            if not shape["ok"]:
+                print(f"[strategy][snapshot][경고] 거래소={exchange_name} 스냅샷이슈={shape['issues']}")
+                record_live_event(config, "exchange_snapshot_shape_invalid", exchange=exchange_name, **shape)
+
     return failures
 
 
@@ -2562,15 +2693,37 @@ async def flatten_shutdown_symbols(
                 continue
             summary["checked"] += 1
             try:
-                ok, assumed_flat = await emergency_flatten_symbol_state(
-                    exchange,
-                    symbol,
-                    aggressive_bps=config.emergency_flatten_bps,
+                ok, assumed_flat = await asyncio.wait_for(
+                    emergency_flatten_symbol_state(
+                        exchange,
+                        symbol,
+                        aggressive_bps=config.emergency_flatten_bps,
+                    ),
+                    timeout=config.shutdown_per_symbol_timeout_sec,
                 )
                 if assumed_flat:
                     summary["assumed_flat"].append({"exchange": exchange_name, "symbol": symbol})
                 if not ok:
                     summary["failed"].append({"exchange": exchange_name, "symbol": symbol})
+            except asyncio.TimeoutError:
+                # A hung exchange must not block the whole shutdown. Record the
+                # position we could not close as an orphan and move on.
+                summary["failed"].append(
+                    {"exchange": exchange_name, "symbol": symbol, "error": "shutdown_flatten_timeout"}
+                )
+                with contextlib.suppress(Exception):
+                    qty = effective_position_qty(exchange.get_symbol_snapshot(symbol), exchange, symbol, config)
+                    if abs(qty) > EPS:
+                        mark_orphan(
+                            symbol=symbol,
+                            exchange=exchange_name,
+                            qty=qty,
+                            reason="shutdown_flatten_timeout",
+                        )
+                print(
+                    f"[종료][포지션정리][타임아웃] 거래소={exchange_name} 심볼={symbol} "
+                    f"timeout={config.shutdown_per_symbol_timeout_sec}s → orphan 기록 후 다음 진행"
+                )
             except Exception as exc:
                 summary["failed"].append(
                     {"exchange": exchange_name, "symbol": symbol, "error": str(exc)[:300]}
@@ -2615,6 +2768,46 @@ async def collect_remaining_positions(
     return remaining
 
 
+async def collect_remaining_open_orders(
+    *,
+    symbols: list[str],
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+    skip_symbols: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    skip_symbols = {symbol.upper() for symbol in (skip_symbols or set())}
+    remaining: list[dict[str, Any]] = []
+    if not config.enable_live:
+        return remaining
+
+    for exchange_name, exchange in exchanges.items():
+        for symbol in symbols:
+            if symbol.upper() in skip_symbols:
+                continue
+            try:
+                await refresh_symbol_state(
+                    exchange,
+                    symbol,
+                    "strategy_shutdown_final_open_orders_check",
+                    include_account=False,
+                    include_open_orders=True,
+                )
+                snapshot = exchange.get_symbol_snapshot(symbol) or {}
+                open_orders = snapshot.get("open_orders") or []
+                if open_orders:
+                    remaining.append(
+                        {
+                            "exchange": exchange_name,
+                            "symbol": symbol,
+                            "order_count": len(open_orders),
+                            "order_ids": [extract_order_uuid(row) for row in open_orders[:10]],
+                        }
+                    )
+            except Exception as exc:
+                remaining.append({"exchange": exchange_name, "symbol": symbol, "error": str(exc)[:300]})
+    return remaining
+
+
 async def graceful_shutdown_flatten(
     *,
     reason: str,
@@ -2630,7 +2823,11 @@ async def graceful_shutdown_flatten(
 
     manual_locked_symbols = {
         symbol.upper()
-        for symbol in (manual_locked_symbols if manual_locked_symbols is not None else active_manual_symbols(config.position_ownership_file))
+        for symbol in (
+            manual_locked_symbols
+            if manual_locked_symbols is not None
+            else active_manual_symbols(config.position_ownership_file)
+        )
     }
     pair_ids = sorted(open_pairs.keys())
     print(
@@ -2681,8 +2878,20 @@ async def graceful_shutdown_flatten(
         config=config,
         skip_symbols=manual_locked_symbols,
     )
+    cancel_final = await cancel_shutdown_open_orders(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
     for exchange in exchanges.values():
         request_account_refresh(exchange, "shutdown_cleanup_after", priority="urgent")
+    remaining_open_orders = await collect_remaining_open_orders(
+        symbols=symbols,
+        exchanges=exchanges,
+        config=config,
+        skip_symbols=manual_locked_symbols,
+    )
     remaining_positions = await collect_remaining_positions(
         symbols=symbols,
         exchanges=exchanges,
@@ -2690,9 +2899,11 @@ async def graceful_shutdown_flatten(
         skip_symbols=manual_locked_symbols,
     )
 
+    if remaining_open_orders:
+        print(f"[종료][정리경고] 잔여주문={remaining_open_orders}")
     if remaining_positions:
         print(f"[종료][정리경고] 잔여포지션={remaining_positions}")
-    else:
+    elif not remaining_open_orders:
         print("[종료][정리완료] 잔여포지션=없음")
 
     record_live_event(
@@ -2703,7 +2914,9 @@ async def graceful_shutdown_flatten(
         pending_pair_ids=pending_pairs,
         cancel_before=cancel_before,
         cancel_after=cancel_after,
+        cancel_final=cancel_final,
         flatten=flatten_summary,
+        remaining_open_orders=remaining_open_orders,
         remaining_positions=remaining_positions,
         manual_locked_symbols=sorted(manual_locked_symbols),
     )
@@ -3431,7 +3644,34 @@ async def enter_pair_limit_then_hedge(
                     hedged_qty=hedged_qty,
                     remaining_qty=remaining_qty,
                 )
-                await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+                rollback_ok = await emergency_flatten_pair(candidate, exchanges, aggressive_bps=config.emergency_flatten_bps)
+                if not rollback_ok:
+                    # Hedge incomplete AND rollback failed: persist the actual
+                    # remaining account legs, not the original first-fill
+                    # assumption, so operator cleanup sees the right venue/qty.
+                    orphan_records = mark_actual_orphan_legs(
+                        symbol=symbol,
+                        exchanges=exchanges,
+                        config=config,
+                        reason="hedge_incomplete_rollback_failed",
+                        fallback_exchange=first_exchange_name,
+                        fallback_qty=remaining_qty,
+                    )
+                    print(
+                        f"[orphan][marked] symbol={symbol} reason=hedge_incomplete_rollback_failed "
+                        f"records={orphan_records}"
+                    )
+                    record_live_event(
+                        config,
+                        "pair_orphan_marked",
+                        symbol=symbol,
+                        exchange=first_exchange_name,
+                        first_filled_qty=first_filled_qty,
+                        hedged_qty=hedged_qty,
+                        remaining_qty=remaining_qty,
+                        reason="hedge_incomplete_rollback_failed",
+                        orphan_records=orphan_records,
+                    )
                 return None
         else:
             log_residual_ignored(
@@ -4321,23 +4561,12 @@ def estimate_close_pnl_now(
     config: StrategyConfig,
 ) -> float:
     long_bid, short_ask, _ = current_pair_close_edge(pair, exchanges)
-    if long_bid <= 0 or short_ask <= 0:
-        return -1e18
-
-    gross_pnl = pair.qty * (
-        (long_bid - short_ask) - (pair.long_entry_price - pair.short_entry_price)
-    )
-    long_notional = pair.qty * long_bid
-    short_notional = pair.qty * short_ask
-    close_fee_cost = close_fee_cost_usd(
-        long_exchange=pair.long_exchange,
-        short_exchange=pair.short_exchange,
-        long_notional_usd=long_notional,
-        short_notional_usd=short_notional,
-        config=config,
-    )
-    close_slippage = ((long_notional + short_notional) / 2.0) * (config.close_slippage_bps * 2.0) / 10000.0
-    return gross_pnl - close_fee_cost - close_slippage
+    return close_pnl_breakdown_usd(
+        pair,
+        config,
+        long_bid=long_bid,
+        short_ask=short_ask,
+    ).net_close_pnl_usd
 
 
 def maker_then_taker_close_enabled(pair: OpenPairState, config: StrategyConfig) -> bool:
@@ -4870,8 +5099,14 @@ async def manage_open_pairs(
 
         balanced_qty = min(abs(long_qty), abs(short_qty))
         pair.qty = balanced_qty
-        close_pnl_now = estimate_close_pnl_now(pair, exchanges, config)
-        _, _, close_edge_now = current_pair_close_edge(pair, exchanges)
+        long_bid_now, short_ask_now, close_edge_now = current_pair_close_edge(pair, exchanges)
+        close_pnl_breakdown = close_pnl_breakdown_usd(
+            pair,
+            config,
+            long_bid=long_bid_now,
+            short_ask=short_ask_now,
+        )
+        close_pnl_now = close_pnl_breakdown.net_close_pnl_usd
         _, _, open_edge_now = current_pair_open_edge(pair, exchanges)
         hold_pnl = estimate_hold_pnl_next_funding(pair, exchanges, config)
         entry_age_sec = max((now_ms() - pair.entry_time_ms) / 1000.0, 0.0)
@@ -4925,6 +5160,42 @@ async def manage_open_pairs(
                         confirm_sec=config.close_spread_confirm_sec,
                     )
                 continue
+            if pair.close_fee_gate_first_seen_ms <= 0 or previous_close_reason != decision:
+                pair.close_fee_gate_first_seen_ms = current_ms
+                pair.close_fee_gate_defer_count = 0
+            defer_age_sec = max((current_ms - pair.close_fee_gate_first_seen_ms) / 1000.0, 0.0)
+            fee_gate_evaluation = evaluate_normal_close_fee_gate(
+                config=config,
+                decision=decision,
+                hold_pnl_usd=hold_pnl,
+                pnl=close_pnl_breakdown,
+                defer_age_sec=defer_age_sec,
+                defer_count=pair.close_fee_gate_defer_count + 1,
+            )
+            if fee_gate_evaluation.defer:
+                pair.close_fee_gate_defer_count += 1
+                fee_gate_metrics = dict(fee_gate_evaluation.metrics)
+                fee_gate_metrics["defer_count"] = pair.close_fee_gate_defer_count
+                fee_gate_metrics["defer_age_sec"] = defer_age_sec
+                print_verbose(
+                    config,
+                    f"[strategy][close][fee-gate] pair_id={pair_id} symbol={pair.symbol} "
+                    f"reason={decision} net_close_pnl={close_pnl_breakdown.net_close_pnl_usd:.4f} "
+                    f"fee={close_pnl_breakdown.close_fee_cost_usd:.4f} "
+                    f"slippage={close_pnl_breakdown.close_slippage_cost_usd:.4f} "
+                    f"hold_pnl={hold_pnl:.4f} defer_count={pair.close_fee_gate_defer_count}"
+                )
+                record_live_event(
+                    config,
+                    "normal_close_deferred_by_fee",
+                    pair=pair_event_payload(pair),
+                    reason=fee_gate_evaluation.reason,
+                    **fee_gate_metrics,
+                )
+                continue
+            if fee_gate_evaluation.reason != "max_defer_elapsed":
+                pair.close_fee_gate_first_seen_ms = 0
+                pair.close_fee_gate_defer_count = 0
             if current_ms < pair.next_auto_close_retry_ms:
                 continue
             pair.next_auto_close_retry_ms = current_ms + int(config.auto_close_retry_cooldown_sec * 1000)
@@ -4994,6 +5265,72 @@ async def console_confirm_close(pair: OpenPairState, config: StrategyConfig) -> 
     return answer.strip().lower() in {"y", "yes"}
 
 
+async def execute_control_plane_command(
+    control_service: StrategyControlService,
+    command: StrategyControlCommand,
+) -> None:
+    try:
+        if command.command_type == "paper-order":
+            result = await console_paper_order(control_service.runtime_adapter, command.payload)
+        elif command.command_type == "live-limit":
+            result = await console_live_limit_order(
+                control_service.runtime_adapter,
+                command.payload,
+                ops_token=command.ops_token,
+            )
+        elif command.command_type == "live-market":
+            result = await console_live_market_order(
+                control_service.runtime_adapter,
+                command.payload,
+                ops_token=command.ops_token,
+            )
+        elif command.command_type == "cancel-symbol":
+            result = await console_cancel_symbol(
+                control_service.runtime_adapter,
+                command.payload,
+                ops_token=command.ops_token,
+            )
+        elif command.command_type == "flatten-symbol":
+            result = await console_flatten_symbol(
+                control_service.runtime_adapter,
+                command.payload,
+                ops_token=command.ops_token,
+            )
+        elif command.command_type == "rebalance-hedge":
+            result = await console_rebalance_hedge(
+                control_service.runtime_adapter,
+                command.payload,
+                ops_token=command.ops_token,
+            )
+        elif command.command_type == "pause-entry":
+            assert_action_token(command.ops_token)
+            request = command.payload
+            result = {"ok": True, "entry_control": write_entry_control(True, request.reason)}
+        elif command.command_type == "resume-entry":
+            assert_action_token(command.ops_token)
+            request = command.payload
+            result = {"ok": True, "entry_control": write_entry_control(False, request.reason)}
+        else:
+            raise ValueError(f"unsupported control command: {command.command_type}")
+    except Exception as exc:
+        control_service.last_error = str(exc)
+        if not command.response_future.done():
+            command.response_future.set_exception(exc)
+        return
+
+    if not command.response_future.done():
+        command.response_future.set_result(result)
+
+
+async def drain_control_plane_commands(control_service: StrategyControlService) -> None:
+    while True:
+        try:
+            command = control_service.command_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        await execute_control_plane_command(control_service, command)
+
+
 async def handle_command(
     command: str,
     candidates: list[PairCandidate],
@@ -5048,7 +5385,7 @@ async def handle_command(
             entry_control_store,
             balance_reports_by_exchange=collect_balance_reports_by_exchange(exchanges),
             startup_block_reasons=startup_block_reasons,
-            manual_locked_symbols=active_manual_symbols(config.position_ownership_file),
+            manual_locked_symbols=entry_locked_symbols(config),
         )
         if not risk_decision.allowed:
             apply_risk_decision_to_candidate(candidate, risk_decision)
@@ -5177,7 +5514,6 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"approval_mode={config.approval_mode} "
         f"auto_enter_enabled={config.auto_enter_enabled} "
         f"maker_entry_engine_enabled={config.maker_entry_engine_enabled} "
-        f"maker_entry_engine_symbols={config.maker_entry_engine_symbols} "
         f"maker_entry_engine_max_open_orders={config.maker_entry_engine_max_open_orders} "
         f"maker_entry_engine_requote_sec={config.maker_entry_engine_requote_sec} "
         f"maker_entry_engine_replace_edge_bps={config.maker_entry_engine_replace_edge_bps} "
@@ -5244,6 +5580,9 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"entry_fee_bps={config.entry_fee_bps} "
         f"close_fee_bps={config.close_fee_bps} "
         f"close_slippage_bps={config.close_slippage_bps} "
+        f"normal_close_fee_gate_enabled={config.normal_close_fee_gate_enabled} "
+        f"normal_close_fee_gate_min_net_usd={config.normal_close_fee_gate_min_net_usd} "
+        f"normal_close_fee_gate_max_defer_sec={config.normal_close_fee_gate_max_defer_sec} "
         f"risk_buffer_bps={config.risk_buffer_bps} "
         f"stale_data_penalty_bps={config.stale_data_penalty_bps}"
     )
@@ -5277,6 +5616,7 @@ async def strategy_loop() -> None:
     listener_tasks: list[asyncio.Task[Any]] = []
 
     command_queue: asyncio.Queue[str] = asyncio.Queue()
+    control_command_queue: asyncio.Queue[StrategyControlCommand] = asyncio.Queue()
     wake_queue: asyncio.Queue[tuple[str, str, int]] = asyncio.Queue()
 
     open_pairs: dict[str, OpenPairState] = {}
@@ -5306,6 +5646,18 @@ async def strategy_loop() -> None:
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         )
     )
+    control_service = StrategyControlService(
+        config=config,
+        exchanges=exchanges,
+        symbols=symbols,
+        open_pairs=open_pairs,
+        entry_control_store=entry_control_store,
+        assumed_flat_until_ms=assumed_flat_until_ms,
+        symbol_recent_close_ms=symbol_recent_close_ms,
+        wake_queue=wake_queue,
+        command_queue=control_command_queue,
+    )
+    control_server = EmbeddedControlServer(control_service)
 
     last_signature: tuple[Any, ...] | None = None
     last_render_ts = 0.0
@@ -5321,6 +5673,7 @@ async def strategy_loop() -> None:
         )
 
         await start_strategy_exchanges(exchanges)
+        await control_server.start()
         startup_block_reasons = await check_startup_margin_mode_guard(
             exchanges=exchanges,
             symbols=symbols,
@@ -5328,6 +5681,7 @@ async def strategy_loop() -> None:
             enabled=config.startup_margin_mode_guard_enabled,
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
         )
+        control_service.set_startup_block_reasons(startup_block_reasons)
         startup_bootstrap_failures = await bootstrap_strategy_symbols_once(exchanges, symbols, config)
         log_startup_bootstrap_summary(
             exchange_count=len(exchanges),
@@ -5385,8 +5739,12 @@ async def strategy_loop() -> None:
             if shutdown_requested.is_set():
                 break
 
+            await drain_control_plane_commands(control_service)
+            if shutdown_requested.is_set():
+                break
+
             prune_assumed_flat(assumed_flat_until_ms)
-            manual_locked_symbols = active_manual_symbols(config.position_ownership_file)
+            manual_locked_symbols = entry_locked_symbols(config)
 
             candidates = collect_candidates(
                 symbols,
@@ -5454,6 +5812,7 @@ async def strategy_loop() -> None:
                     next_retry_ms_by_key=account_imbalance_next_retry_ms,
                     skip_symbols=recovery_skip_symbols,
                 )
+                reconcile_orphan_markers(exchanges, config)
 
             if not shutdown_requested.is_set() and config.enable_live and config.auto_enter_enabled:
                 active_open_pairs = [
@@ -5618,6 +5977,7 @@ async def strategy_loop() -> None:
             except Exception as exc:
                 print(f"[strategy][listener-stop][error] {exc}")
 
+        await control_server.stop()
         await stop_strategy_exchanges(exchanges)
 
 async def main() -> None:

@@ -14,7 +14,25 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(path: str | Path | None = None, *, override: bool = False, **_: object) -> bool:  # type: ignore[no-redef]
+        if path in (None, ""):
+            return False
+        env_path = Path(path)
+        if not env_path.exists():
+            return False
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (override or key not in os.environ):
+                os.environ[key] = value
+        return True
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -58,6 +76,45 @@ def check(status: str, name: str, detail: str) -> dict[str, str]:
     return {"status": status, "name": name, "detail": detail}
 
 
+def is_ip_ban_line(line: str) -> bool:
+    return "IP banned" in line or bool(re.search(r"(?<![\d.])418(?!\d)", line))
+
+
+def is_exchange_unavailable_line(line: str) -> bool:
+    return (
+        "http_503" in line
+        or "Service temporarily unavailable" in line
+        or bool(re.search(r"(?<!\d)50001(?!\d)", line))
+    )
+
+
+def pressure_line_counts(lines: list[str]) -> dict[str, int]:
+    return {
+        "total_lines": len(lines),
+        "rate_limit_lines": sum(
+            1
+            for line in lines
+            if "-1003" in line
+            or "Way too many requests" in line
+            or "http_429" in line
+            or "status=429" in line
+            or "rate_limit_pressure" in line
+        ),
+        "ip_ban_lines": sum(1 for line in lines if is_ip_ban_line(line)),
+        "http_429_lines": sum(1 for line in lines if "http_429" in line or "status=429" in line or " 429" in line),
+        "exchange_unavailable_lines": sum(1 for line in lines if is_exchange_unavailable_line(line)),
+    }
+
+
+def active_orphan_marker_state() -> tuple[list[dict[str, Any]], str]:
+    try:
+        from src.ops.orphan_guard import active_orphans
+
+        return active_orphans(), ""
+    except Exception as exc:
+        return [], str(exc)
+
+
 def read_json(path: Path | None) -> dict[str, Any]:
     if not path or not path.exists():
         return {}
@@ -97,6 +154,84 @@ def tail_lines(path: Path | None, line_count: int) -> list[str]:
         return proc.stdout.splitlines()
     except Exception:
         return path.read_text(encoding="utf-8", errors="replace").splitlines()[-line_count:]
+
+
+def read_lines(path: Path | None) -> list[str]:
+    if not path or not path.exists():
+        return []
+    return path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+
+def current_run_stdout_lines(
+    path: Path | None,
+    *,
+    tail_count: int,
+    started_at_iso: str,
+) -> tuple[list[str], dict[str, Any]]:
+    all_lines = read_lines(path)
+    if not all_lines:
+        return [], {
+            "scope": "missing",
+            "stdout_log": str(path) if path else "",
+            "total_lines": 0,
+            "returned_lines": 0,
+            "historical_ignored_lines": 0,
+            "trimmed_current_run_lines": 0,
+            "started_at_iso": started_at_iso,
+        }
+
+    marker_idx = -1
+    marker_reason = ""
+    marker_text = ""
+    if started_at_iso:
+        exact_markers = (
+            f"[{started_at_iso}] strategy live runtime start",
+            f"[{started_at_iso}] [런타임][시작]",
+        )
+        for idx, line in enumerate(all_lines):
+            matched_marker = next((marker for marker in exact_markers if marker in line), "")
+            if matched_marker:
+                marker_idx = idx
+                marker_reason = "started_at_iso"
+                marker_text = matched_marker
+                break
+
+    if marker_idx < 0:
+        for idx in range(len(all_lines) - 1, -1, -1):
+            if "strategy live runtime start" in all_lines[idx] or "[런타임][시작]" in all_lines[idx]:
+                marker_idx = idx
+                marker_reason = "latest_runtime_marker"
+                marker_text = all_lines[idx]
+                break
+
+    if marker_idx >= 0:
+        scoped_lines = all_lines[marker_idx:]
+        scope = "current_run" if marker_reason == "started_at_iso" else "latest_runtime_marker"
+        historical_ignored = marker_idx
+    else:
+        scoped_lines = all_lines
+        scope = "tail_fallback"
+        historical_ignored = 0
+
+    current_run_line_count = len(scoped_lines)
+    if tail_count > 0 and len(scoped_lines) > tail_count:
+        returned = scoped_lines[-tail_count:]
+    else:
+        returned = scoped_lines
+
+    return returned, {
+        "scope": scope,
+        "stdout_log": str(path) if path else "",
+        "total_lines": len(all_lines),
+        "current_run_lines": current_run_line_count,
+        "returned_lines": len(returned),
+        "historical_ignored_lines": historical_ignored,
+        "trimmed_current_run_lines": max(current_run_line_count - len(returned), 0),
+        "started_at_iso": started_at_iso,
+        "marker_reason": marker_reason,
+        "marker_text": marker_text,
+        "marker_line": marker_idx + 1 if marker_idx >= 0 else None,
+    }
 
 
 def pid_alive(pid: int) -> bool:
@@ -358,6 +493,7 @@ def collect_strategy_log_report(
     meta = read_json(run_meta_path)
     jsonl_path = resolve_path(meta.get("jsonl_log")) if meta else None
     started_at_ms = int(meta.get("started_at_ms") or 0) if meta else 0
+    started_at_iso = str(meta.get("started_at_iso") or iso_utc(started_at_ms))
     rows = load_jsonl(jsonl_path, since_ms=started_at_ms)
     event_counts = Counter(str(row.get("event_type") or "unknown") for row in rows)
 
@@ -377,34 +513,100 @@ def collect_strategy_log_report(
         count = event_counts.get(event_type, 0)
         checks.append(check("PASS" if count == 0 else "WARN", f"{event_type}_zero", f"count={count}"))
 
-    lines = tail_lines(stdout_log, tail_count)
+    orphan_records, orphan_error = active_orphan_marker_state()
+    if orphan_error:
+        checks.append(check("WARN", "active_orphan_markers_readable", f"error={orphan_error}"))
+    else:
+        checks.append(
+            check(
+                "PASS" if not orphan_records else "FAIL",
+                "active_orphan_markers_empty",
+                f"orphans={orphan_records}",
+            )
+        )
+
+    lines, stdout_scope = current_run_stdout_lines(
+        stdout_log,
+        tail_count=tail_count,
+        started_at_iso=started_at_iso,
+    )
+    all_stdout_lines = read_lines(stdout_log)
+    marker_line = int(stdout_scope.get("marker_line") or 0)
+    historical_lines = all_stdout_lines[: marker_line - 1] if marker_line > 1 else []
+    scope = str(stdout_scope.get("scope") or "unknown")
+    scope_status = "PASS" if scope == "current_run" else "WARN"
+    checks.append(
+        check(
+            scope_status,
+            "strategy_stdout_current_run_scope",
+            " ".join(
+                [
+                    f"scope={scope}",
+                    f"started_at_iso={started_at_iso or None}",
+                    f"marker_line={stdout_scope.get('marker_line')}",
+                    f"current_run_lines={stdout_scope.get('current_run_lines')}",
+                    f"returned_lines={stdout_scope.get('returned_lines')}",
+                    f"historical_ignored_lines={stdout_scope.get('historical_ignored_lines')}",
+                    f"trimmed_current_run_lines={stdout_scope.get('trimmed_current_run_lines')}",
+                ]
+            ),
+        )
+    )
+    current_pressure = pressure_line_counts(lines)
+    historical_pressure = pressure_line_counts(historical_lines)
     danger_count = sum(1 for line in lines if "[strategy][danger]" in line)
-    ip_ban_count = sum(1 for line in lines if "IP banned" in line or "418" in line)
-    rate_limit_count = sum(1 for line in lines if "-1003" in line or "Way too many requests" in line)
-    exchange_unavailable_count = sum(1 for line in lines if "50001" in line or "http_503" in line)
+    ip_ban_count = current_pressure["ip_ban_lines"]
+    rate_limit_count = current_pressure["rate_limit_lines"]
+    exchange_unavailable_count = current_pressure["exchange_unavailable_lines"]
     stopped_strategy_issue_status = "FAIL" if strategy_running else "WARN"
+    stdout_detail = (
+        f"scope={scope} returned_lines={len(lines)} "
+        f"historical_ignored_lines={stdout_scope.get('historical_ignored_lines')} "
+        f"strategy_running={strategy_running}"
+    )
     checks.append(
         check(
             "PASS" if danger_count == 0 else stopped_strategy_issue_status,
             "strategy_danger_log_lines_zero",
-            f"tail_lines={tail_count} count={danger_count} strategy_running={strategy_running}",
+            f"{stdout_detail} count={danger_count}",
         )
     )
     checks.append(
         check(
             "PASS" if ip_ban_count == 0 else stopped_strategy_issue_status,
             "exchange_ip_ban_lines_zero",
-            f"tail_lines={tail_count} count={ip_ban_count} strategy_running={strategy_running}",
+            f"{stdout_detail} count={ip_ban_count}",
         )
     )
-    checks.append(check("PASS" if rate_limit_count == 0 else "WARN", "rate_limit_pressure_lines_zero", f"tail_lines={tail_count} count={rate_limit_count}"))
-    checks.append(check("PASS" if exchange_unavailable_count == 0 else "WARN", "exchange_unavailable_lines_zero", f"tail_lines={tail_count} count={exchange_unavailable_count}"))
+    checks.append(check("PASS" if rate_limit_count == 0 else "WARN", "rate_limit_pressure_lines_zero", f"{stdout_detail} count={rate_limit_count}"))
+    checks.append(check("PASS" if exchange_unavailable_count == 0 else "WARN", "exchange_unavailable_lines_zero", f"{stdout_detail} count={exchange_unavailable_count}"))
+    checks.append(
+        check(
+            "INFO",
+            "strategy_historical_rate_limit_lines",
+            " ".join(
+                [
+                    f"historical_lines={len(historical_lines)}",
+                    f"rate_limit={historical_pressure['rate_limit_lines']}",
+                    f"ip_ban={historical_pressure['ip_ban_lines']}",
+                    f"exchange_unavailable={historical_pressure['exchange_unavailable_lines']}",
+                ]
+            ),
+        )
+    )
 
     return {
         "run_meta": meta,
         "jsonl_path": str(jsonl_path) if jsonl_path else "",
         "run_rows": len(rows),
         "event_counts": dict(event_counts.most_common(20)),
+        "stdout_scope": stdout_scope,
+        "active_orphans": orphan_records,
+        "active_orphan_error": orphan_error,
+        "rate_limit_scope": {
+            "current_run": current_pressure,
+            "historical": historical_pressure,
+        },
         "checks": checks,
     }
 
@@ -412,11 +614,12 @@ def collect_strategy_log_report(
 def collect_collector_log_report(stdout_log: Path, *, tail_count: int) -> dict[str, Any]:
     checks: list[dict[str, str]] = []
     lines = tail_lines(stdout_log, tail_count)
+    collector_pressure = pressure_line_counts(lines)
     okx_reconnect_count = sum(1 for line in lines if "[OKXFuture WS] reconnect" in line)
     binance_reconnect_count = sum(1 for line in lines if "[BinanceFuture WS] reconnect" in line)
     traceback_count = sum(1 for line in lines if "Traceback" in line)
-    rate_limit_count = sum(1 for line in lines if "-1003" in line or "Way too many requests" in line or "429" in line)
-    exchange_unavailable_count = sum(1 for line in lines if "50001" in line or "http_503" in line or "Service temporarily unavailable" in line)
+    rate_limit_count = collector_pressure["rate_limit_lines"]
+    exchange_unavailable_count = collector_pressure["exchange_unavailable_lines"]
     symbol_rows = [line for line in lines if line.startswith("[symbol-price]")]
     latest_symbol_rows = symbol_rows[-2:]
 
@@ -429,6 +632,9 @@ def collect_collector_log_report(stdout_log: Path, *, tail_count: int) -> dict[s
     return {
         "stdout_log": str(stdout_log),
         "latest_symbol_rows": latest_symbol_rows,
+        "rate_limit_scope": {
+            "collector_tail": collector_pressure,
+        },
         "checks": checks,
     }
 
@@ -463,6 +669,50 @@ def render_markdown(payload: dict[str, Any]) -> str:
     for service in payload.get("services", []):
         lines.append(f"- {service['name']}: running={service['running']} pids={service.get('pids') or []}")
     lines.append("")
+    stdout_scope = (payload.get("strategy_logs") or {}).get("stdout_scope") or {}
+    if stdout_scope:
+        lines.append("## Strategy Log Scope")
+        lines.append(
+            "- "
+            f"scope={stdout_scope.get('scope')} "
+            f"started_at_iso={stdout_scope.get('started_at_iso') or ''} "
+            f"marker_line={stdout_scope.get('marker_line')} "
+            f"current_run_lines={stdout_scope.get('current_run_lines')} "
+            f"returned_lines={stdout_scope.get('returned_lines')} "
+            f"historical_ignored_lines={stdout_scope.get('historical_ignored_lines')}"
+        )
+        lines.append("")
+    active_orphans = (payload.get("strategy_logs") or {}).get("active_orphans") or []
+    active_orphan_error = (payload.get("strategy_logs") or {}).get("active_orphan_error") or ""
+    lines.append("## Active Orphan Markers")
+    if active_orphan_error:
+        lines.append(f"- error: {active_orphan_error}")
+    elif active_orphans:
+        for row in active_orphans:
+            lines.append(f"- {row}")
+    else:
+        lines.append("- none")
+    lines.append("")
+    strategy_rate_scope = (payload.get("strategy_logs") or {}).get("rate_limit_scope") or {}
+    collector_rate_scope = (payload.get("collector_logs") or {}).get("rate_limit_scope") or {}
+    if strategy_rate_scope or collector_rate_scope:
+        lines.append("## Rate Limit Scope")
+        for label, row in (
+            ("strategy_current_run", strategy_rate_scope.get("current_run") or {}),
+            ("strategy_historical", strategy_rate_scope.get("historical") or {}),
+            ("collector_tail", collector_rate_scope.get("collector_tail") or {}),
+        ):
+            if not row:
+                continue
+            lines.append(
+                "- "
+                f"{label}: total_lines={row.get('total_lines', 0)} "
+                f"rate_limit={row.get('rate_limit_lines', 0)} "
+                f"ip_ban={row.get('ip_ban_lines', 0)} "
+                f"http_429={row.get('http_429_lines', 0)} "
+                f"exchange_unavailable={row.get('exchange_unavailable_lines', 0)}"
+            )
+        lines.append("")
     lines.append("## Symbol Price")
     for row in (payload.get("db") or {}).get("symbol_price") or []:
         lines.append(
@@ -513,7 +763,6 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         ),
     ]
     strategy_running = bool(services[0].get("running"))
-    ops_console_running = bool(services[2].get("running"))
     strategy_logs = collect_strategy_log_report(
         run_meta,
         stdout_log=strategy_stdout,
@@ -521,7 +770,16 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         strategy_running=strategy_running,
     )
     collector_logs = collect_collector_log_report(symbol_stdout, tail_count=args.tail_lines)
-    ops_console = collect_ops_console_http_report(running=ops_console_running, required=args.require_ops_console)
+    ops_console = collect_ops_console_http_report(running=bool(services[2].get("running")), required=args.require_ops_console)
+    if not services[2].get("running") and ops_console.get("ok"):
+        services[2]["running"] = True
+        services[2]["checks"] = [
+            check(
+                "PASS",
+                "ops_console_process_running",
+                "running=embedded_http_only pid_file_pid=None pgrep_count=0 pids=[]",
+            )
+        ]
     db = collect_db_report(exchanges=exchanges, interval_sec=interval_sec)
     combined = combine_verdict([*services, strategy_logs, collector_logs, ops_console, db])
     return {

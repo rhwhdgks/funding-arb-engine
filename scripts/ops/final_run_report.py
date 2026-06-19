@@ -12,7 +12,25 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(path: str | Path | None = None, *, override: bool = False, **_: object) -> bool:  # type: ignore[no-redef]
+        if path in (None, ""):
+            return False
+        env_path = Path(path)
+        if not env_path.exists():
+            return False
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (override or key not in os.environ):
+                os.environ[key] = value
+        return True
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -852,6 +870,7 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
         "entry_post_first_fill_edge_check",
         "entry_aborted_after_first_fill_bad_edge",
         "entry_quality_analysis",
+        "normal_close_deferred_by_fee",
         "pair_closed_after_recovery",
         "pair_neutralized_after_close_failure",
     ):
@@ -967,6 +986,16 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- submit_latency_ms_max: {float(submit_telemetry.get('submit_latency_ms_max') or 0):.1f}")
     lines.append("")
     lines.append("## DB Verdict")
+    db_scope = db_report.get("scope") or {}
+    if db_scope:
+        lines.append(f"- scope_since_utc: {db_scope.get('since_utc')}")
+        lines.append(f"- account_label: {db_scope.get('account_label')}")
+        lines.append(f"- logic: {db_scope.get('logic')}")
+        lines.append(f"- current_run_verdict: {db_scope.get('current_run_verdict')}")
+        lines.append(
+            "- historical_open_like_orders_informational: "
+            f"{db_scope.get('historical_open_like_orders_informational')}"
+        )
     lines.extend(render_check_lines(db_report.get("checks") or []))
     lines.append("")
     lines.append("## Live Exchange Flat")

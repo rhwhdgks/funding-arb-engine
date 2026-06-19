@@ -1,26 +1,39 @@
 # Funding Arbitrage Execution Engine
 
-Binance Futures와 OKX Futures를 대상으로 한 선물 차익거래 실행 엔진입니다.
-핵심 목표는 단순한 전략 아이디어 구현이 아니라, 실시간 거래 환경에서 **페어 진입, 헷지, 청산, 복구, 운영 검증**이 일관되게 동작하는 시스템을 만드는 것입니다.
+Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 실행 엔진입니다. 핵심은 전략 아이디어 자체보다, 실제 거래 환경에서 필요한 주문 실행, 헷지, 청산, 복구, 운영 제어, 사후 검증을 일관된 하나의 시스템으로 묶는 것입니다.
 
-## What This Project Does
+이 프로젝트는 수익률을 홍보하기 위한 저장소가 아닙니다. 현재 초점은 **전략을 교체해도 안전하게 굴러가는 execution / OMS / ops layer**입니다.
 
-- 거래소별 REST/WebSocket adapter로 orderbook, account, position, order 상태를 수집합니다.
-- 가격 괴리와 funding 조건을 기반으로 long/short pair 후보를 만들고 진입 여부를 판단합니다.
-- 첫 leg 체결 이후 반대 거래소에 hedge를 넣어 net exposure를 중립에 가깝게 맞춥니다.
-- close, recovery, shutdown 경로를 신규 진입 로직과 분리해 한쪽 포지션만 남는 상황을 줄입니다.
-- structured JSONL 로그, optional MariaDB persistence, final PASS/FAIL report로 run 결과를 검증합니다.
-- Ops Console을 통해 수동 주문, 자동 hedge, 포지션 정리, entry pause를 운영할 수 있습니다.
+## Current Status
 
-## Engineering Focus
+- Main path: Binance Futures / OKX Futures
+- Runtime: live and test separated by env file
+- Control plane: strategy-attached embedded Ops Console
+- Persistence: optional MariaDB, DB-less runtime supported
+- Latest operational baseline: 24h live run `PASS warnings=0 failures=0`
+- Strategy profitability: evaluated separately from system stability
 
-이 저장소는 수익률을 홍보하기 위한 프로젝트가 아닙니다. 초점은 자동매매 시스템에서 실제로 문제가 되는 실행 안정성입니다.
+## What It Handles
 
-- **Hedge completeness**: 한쪽 leg만 남았을 때 recovery/neutralize 경로로 중립성 복구
-- **Order safety**: overfill, duplicate order, stale orderbook, open order mismatch 방지
-- **Risk gate**: active pair, open order, margin mode, exposure cap, rate-limit pressure, manual ownership lock 확인
-- **Operational control**: entry pause/resume, safe stop, shutdown flatten, live health check
-- **Auditability**: order/trade/balance/funding/entry quality 기록과 after-run report
+- Exchange REST/WebSocket adapters for orderbook, account, position, order, trade, and funding state
+- Maker first-leg entry with immediate hedge on the opposite exchange
+- Pair close, emergency flatten, account imbalance recovery, and shutdown cleanup
+- Entry gates for active pair, open order, margin mode, exposure cap, rate-limit pressure, and manual ownership
+- Embedded Ops Console for manual order, hedge, flatten, cancel, pause, and resume
+- Structured JSONL events, optional MariaDB persistence, and final PASS/FAIL reports
+- Symbol price collector and FX collector as separate runtime services
+
+## Engineering Guarantees
+
+The operational layer is designed around these invariants:
+
+| Area | Guarantee |
+| --- | --- |
+| Hedge completeness | First-leg fills are hedged or rolled back; residuals go through recovery instead of being ignored blindly |
+| Order safety | Duplicate order, overfill, stale orderbook, orphan position, and open-order mismatch paths are guarded |
+| Shutdown safety | Stop path cancels open orders, closes tracked pairs, flattens leftovers, and records shutdown state |
+| Control isolation | Console actions use the strategy-owned exchange sessions through a command queue |
+| Auditability | Final report checks events, DB consistency, live exchange flat state, API pressure, and collector freshness |
 
 ## Architecture
 
@@ -28,17 +41,20 @@ Binance Futures와 OKX Futures를 대상으로 한 선물 차익거래 실행 �
 flowchart LR
     A[run_strategy_live.sh] --> B[main.py]
     B --> C[strategy.py]
-    C --> D[Entry / Close Policy]
+    C --> D[Entry Policy]
     C --> E[Risk Gate]
-    C --> F[Execution / Hedge / Recovery]
-    F --> G[Binance Adapter]
-    F --> H[OKX Adapter]
-    G --> I[REST + WebSocket State]
-    H --> I
-    C --> J[JSONL Event Log]
-    C --> K[Optional DB Persistence]
-    J --> L[Final Report]
-    K --> L
+    C --> F[Execution / Hedge / Close]
+    C --> G[Recovery / Shutdown]
+    C --> H[Embedded Control Server]
+    F --> I[Binance Adapter]
+    F --> J[OKX Adapter]
+    I --> K[REST + WebSocket State]
+    J --> K
+    C --> L[JSONL Event Log]
+    C --> M[Optional MariaDB]
+    H --> N[Ops Console UI]
+    L --> O[Final Report]
+    M --> O
 ```
 
 ## Main Components
@@ -56,7 +72,7 @@ flowchart LR
 
 ## Quick Start
 
-실행값은 `.env` 또는 `test_server/.env`에 둡니다. 실제 key, token, DB password는 커밋하지 않습니다.
+실제 key, token, DB password는 커밋하지 않습니다. 실행 설정은 실서버는 `.env`, 테스트 서버는 `test_server/.env`를 사용합니다.
 
 ```bash
 .venv/bin/python -m py_compile main.py strategy.py src/strategy/config.py
@@ -91,7 +107,7 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label
 
 ## Ops Console
 
-Ops Console은 수동 주문과 운영 제어를 위한 로컬 콘솔입니다. 기본 권장값은 로컬 전용입니다.
+Ops Console은 전략 프로세스에 내장된 control plane에 붙는 thin client입니다. 콘솔이 별도 exchange polling session을 만들지 않으므로, 브라우저를 열어도 전략과 별개의 API pressure가 생기지 않습니다.
 
 ```env
 OPS_CONSOLE_HOST=127.0.0.1
@@ -99,7 +115,9 @@ OPS_CONSOLE_PORT=8010
 ```
 
 ```bash
-STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
+STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh start
+STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh status
+STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
 ```
 
 접속:
@@ -108,7 +126,35 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
 http://127.0.0.1:8010
 ```
 
-원격 접속이 필요하면 포트포워딩으로 직접 노출하지 않고 VPN/터널과 action token을 같이 사용합니다.
+디버깅 목적의 legacy standalone console은 명시적으로만 사용합니다.
+
+```bash
+OPS_CONSOLE_FORCE_STANDALONE=1 STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
+```
+
+## Reports
+
+Final report는 운영 안정성을 판단하는 기준입니다. 전략 수익성 판단과 분리해서 봅니다.
+
+PASS 기준:
+
+- `pair_entry_overfill_detected=0`
+- `pair_close_leg_failed=0`
+- `pair_close_pending=0`
+- `danger_log_lines=0`
+- `remaining_positions=[]`
+- live Binance/OKX positions `0`
+- live Binance/OKX open orders `0`
+- DB open-like orders `0`
+- order/trade reconcile `PASS`
+- API pressure and IP ban checks `PASS`
+
+최근 검증 기준선:
+
+```text
+final_verdict=PASS warnings=0 failures=0 blocking=0
+observed_duration=24h 0m 3s
+```
 
 ## Documentation
 
@@ -120,16 +166,9 @@ http://127.0.0.1:8010
 - [docs/strategy_quality_roadmap.md](docs/strategy_quality_roadmap.md): 전략 품질 개선 로드맵
 - [test_server/README.md](test_server/README.md): 테스트 서버 실행 가이드
 
-## Status
-
-- Main exchange path: Binance Futures / OKX Futures
-- Runtime mode: live/test separated by env file
-- Persistence: optional MariaDB, DB-less runtime supported
-- Operations: safe stop, entry pause, final report, ops console available
-- Current priority: improve strategy quality while keeping execution and recovery paths stable
-
 ## Safety Notes
 
 - This repository is not investment advice.
 - Do not commit `.env`, API keys, tokens, DB passwords, runtime files, or logs.
 - Live trading should be preceded by test-server runs, shutdown checks, and final report review.
+- Strategy profitability is not assumed from operational PASS reports.

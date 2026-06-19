@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -10,6 +11,31 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(path: str | Path | None = None, *, override: bool = False, **_: object) -> bool:  # type: ignore[no-redef]
+        if path in (None, ""):
+            return False
+        env_path = Path(path)
+        if not env_path.exists():
+            return False
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (override or key not in os.environ):
+                os.environ[key] = value
+        return True
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 
 OPEN_ORDER_STATUSES = (
@@ -28,6 +54,7 @@ FAIL_EVENT_TYPES = (
     "pair_entry_overfill_flatten_failed",
     "pair_close_leg_failed",
     "pair_close_pending",
+    "pair_orphan_marked",
 )
 
 WARN_EVENT_TYPES = (
@@ -56,6 +83,7 @@ INFO_EVENT_TYPES = (
     "entry_post_first_fill_edge_check",
     "entry_aborted_after_first_fill_bad_edge",
     "entry_quality_analysis",
+    "normal_close_deferred_by_fee",
 )
 
 SUBMIT_MARKET_AGE_WARN_MS = 1500
@@ -208,6 +236,17 @@ def summarize_entry_submit_telemetry(run_rows: list[dict]) -> dict:
     }
 
 
+def load_active_orphan_records(env_file: Path) -> tuple[list[dict], str]:
+    try:
+        if env_file.exists():
+            load_dotenv(env_file, override=True)
+        from src.ops.orphan_guard import active_orphans
+
+        return active_orphans(), ""
+    except Exception as exc:
+        return [], str(exc)
+
+
 def evaluate_soak(
     *,
     meta: dict,
@@ -219,6 +258,8 @@ def evaluate_soak(
     open_order_rows: list[tuple],
     db_error: str,
     critical_lines: list[str],
+    orphan_records: list[dict],
+    orphan_error: str,
 ) -> dict:
     checks: list[dict] = []
 
@@ -257,6 +298,16 @@ def evaluate_soak(
             "PASS" if count == 0 else "FAIL",
             f"{event_type}_zero",
             f"count={count}",
+        )
+
+    if orphan_error:
+        add_check(checks, "WARN", "active_orphan_markers_readable", f"error={orphan_error}")
+    else:
+        add_check(
+            checks,
+            "PASS" if not orphan_records else "FAIL",
+            "active_orphan_markers_empty",
+            f"orphans={orphan_records}",
         )
 
     for event_type in WARN_EVENT_TYPES:
@@ -313,7 +364,9 @@ def evaluate_soak(
         pending_pair_ids = latest_shutdown.get("pending_pair_ids") or []
         failed_cancel_before = ((latest_shutdown.get("cancel_before") or {}).get("failed") or [])
         failed_cancel_after = ((latest_shutdown.get("cancel_after") or {}).get("failed") or [])
+        failed_cancel_final = ((latest_shutdown.get("cancel_final") or {}).get("failed") or [])
         flatten_failed = ((latest_shutdown.get("flatten") or {}).get("failed") or [])
+        remaining_open_orders = latest_shutdown.get("remaining_open_orders") or []
         add_check(
             checks,
             "PASS" if not remaining_positions else "FAIL",
@@ -328,9 +381,15 @@ def evaluate_soak(
         )
         add_check(
             checks,
-            "PASS" if not failed_cancel_before and not failed_cancel_after else "FAIL",
+            "PASS" if not failed_cancel_before and not failed_cancel_after and not failed_cancel_final else "FAIL",
             "shutdown_cancel_failures_zero",
-            f"before={failed_cancel_before} after={failed_cancel_after}",
+            f"before={failed_cancel_before} after={failed_cancel_after} final={failed_cancel_final}",
+        )
+        add_check(
+            checks,
+            "PASS" if not remaining_open_orders else "FAIL",
+            "shutdown_remaining_open_orders_empty",
+            f"remaining_open_orders={remaining_open_orders}",
         )
         add_check(
             checks,
@@ -484,6 +543,7 @@ def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
     submit_telemetry = summarize_entry_submit_telemetry(run_rows)
     latest_shutdown = next((row for row in reversed(run_rows) if row.get("event_type") == "shutdown_cleanup_done"), None)
     open_order_rows, db_error = collect_open_order_rows(root, env_file, started_at_ms)
+    orphan_records, orphan_error = load_active_orphan_records(env_file)
     verdict = evaluate_soak(
         meta=meta,
         status_text=status,
@@ -494,6 +554,8 @@ def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
         open_order_rows=open_order_rows,
         db_error=db_error,
         critical_lines=critical_lines,
+        orphan_records=orphan_records,
+        orphan_error=orphan_error,
     )
 
     stopped_rows = [row for row in run_rows if row.get("event_type") == "runtime_stopped"]
@@ -523,6 +585,8 @@ def build_summary_payload(root: Path, meta_path: Path, wait: bool) -> dict:
             for row in open_order_rows
         ],
         "db_error": db_error,
+        "active_orphans": orphan_records,
+        "active_orphan_error": orphan_error,
         "critical_lines": critical_lines,
         "observed_duration_ms": observed_duration_ms,
         "verdict": verdict,
@@ -591,10 +655,20 @@ def render_summary_markdown(payload: dict) -> str:
     lines.append("## Shutdown")
     if latest_shutdown:
         lines.append(f"- remaining_positions: {latest_shutdown.get('remaining_positions')}")
+        lines.append(f"- remaining_open_orders: {latest_shutdown.get('remaining_open_orders')}")
         lines.append(f"- pending_pair_ids: {latest_shutdown.get('pending_pair_ids')}")
         lines.append(f"- closed_pair_ids: {latest_shutdown.get('closed_pair_ids')}")
     else:
         lines.append("- shutdown_cleanup_done event not found yet")
+    lines.append("")
+    lines.append("## Active Orphan Markers")
+    if payload.get("active_orphan_error"):
+        lines.append(f"- error: {payload.get('active_orphan_error')}")
+    elif payload.get("active_orphans"):
+        for row in payload.get("active_orphans") or []:
+            lines.append(f"- {row}")
+    else:
+        lines.append("- none")
     lines.append("")
     lines.append("## DB Open-Like Order Rows")
     if db_error:

@@ -365,6 +365,16 @@ def build_strategy_dashboard_state() -> dict[str, Any]:
             "exchanges": compact_api_pressure(api_pressure),
         },
         "pnl": realized_pnl_summary(meta.get("account_label"), started_at_ms),
+        "orphans": _active_orphans(),
         "artifacts": latest_artifacts(log_dir),
         "meta": meta,
     }
+
+
+def _active_orphans() -> list[dict[str, Any]]:
+    """Unhedged/orphaned positions awaiting cleanup — best effort, never raises."""
+    try:
+        from src.ops.orphan_guard import active_orphans
+        return active_orphans()
+    except Exception:
+        return []

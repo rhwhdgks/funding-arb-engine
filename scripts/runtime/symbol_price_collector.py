@@ -20,7 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.ops.persistence.db import ensure_schema, get_db_connection, current_utc_ms
 from src.ops.persistence.trading_dev_normalizers import build_symbol_price_rows
-from src.ops.persistence.trading_dev_store import upsert_symbol_price_rows
+from src.ops.persistence.trading_dev_store import upsert_funding_rate_rows, upsert_symbol_price_rows
 
 
 def _parse_csv_env(name: str, default: str) -> list[str]:
@@ -250,6 +250,63 @@ async def _build_okx_collector(symbols: list[str] | None, impact_notional_usd: f
     return collector
 
 
+async def _build_hyperliquid_collector(symbols: list[str] | None, impact_notional_usd: float) -> ExchangeCollector:
+    # Hyperliquid orderbook is a public WS feed — no wallet / API key needed.
+    # We avoid importing the wallet-dependent api.py and fetch the perp
+    # universe directly via the public /info endpoint.
+    import aiohttp
+    from src.hyperliquid_f_module.websocket_manager import WebSocketManager
+
+    base_url = os.getenv("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz")
+    available: list[str] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/info",
+                json={"type": "meta"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                meta = await response.json()
+        available = [_normalize_symbol(str(asset.get("name"))) for asset in (meta.get("universe") or []) if asset.get("name")]
+    except Exception as exc:
+        print(f"[symbol-price][hyperliquid][warn] meta fetch 실패 error={exc}")
+
+    available_set = set(available)
+    if symbols is None:
+        targets = available
+    else:
+        targets = [symbol for symbol in symbols if symbol in available_set]
+        missing = [symbol for symbol in symbols if symbol not in available_set]
+        if missing:
+            print(f"[symbol-price][hyperliquid][info] HL 미지원 심볼 {len(missing)}개 제외: {','.join(missing[:12])}")
+
+    impact_state: dict[str, dict[str, Any]] = {}
+    ws_manager = WebSocketManager()
+    collector = ExchangeCollector(
+        exchange_name="hyperliquid",
+        symbols=targets,
+        fetch_api=lambda: _empty_prefill(),  # placeholder, replaced below
+        ws_manager=ws_manager,
+        impact_state=impact_state,
+    )
+
+    # HL has no REST orderbook prefill. When WS coverage is partial (one slow
+    # symbol missing within a bucket), fall back to whatever WS rows we already
+    # have rather than inserting nothing.
+    async def _hl_partial_ws_snapshot() -> dict[str, dict[str, Any]]:
+        return collector.ws_prefill_rows(collector.impact_state)
+
+    collector.fetch_api = _hl_partial_ws_snapshot
+    collector.ws_task = asyncio.create_task(
+        ws_manager.subscribe(targets, collector.handle_ws_payload)
+    )
+    return collector
+
+
+async def _empty_prefill() -> dict[str, Any]:
+    return {}
+
+
 async def build_collectors(exchange_names: list[str], symbols: list[str] | None, impact_notional_usd: float) -> list[ExchangeCollector]:
     collectors: list[ExchangeCollector] = []
     for name in exchange_names:
@@ -257,6 +314,8 @@ async def build_collectors(exchange_names: list[str], symbols: list[str] | None,
             collectors.append(await _build_binance_collector(symbols, impact_notional_usd))
         elif name == "okx":
             collectors.append(await _build_okx_collector(symbols, impact_notional_usd))
+        elif name == "hyperliquid":
+            collectors.append(await _build_hyperliquid_collector(symbols, impact_notional_usd))
         else:
             raise ValueError(f"unsupported symbol_price exchange: {name}")
     return collectors
@@ -306,6 +365,92 @@ async def persist_symbol_price_once(
         conn.close()
 
 
+async def _fetch_funding_binance(symbols: list[str]) -> list[dict[str, Any]]:
+    from src.binance_f_module.api import get_funding_rate
+    out: list[dict[str, Any]] = []
+    results = await asyncio.gather(*[get_funding_rate(s) for s in symbols], return_exceptions=True)
+    for s, r in zip(symbols, results):
+        if isinstance(r, dict) and r.get("funding_rate") is not None:
+            out.append(("binance", _normalize_symbol(s), r["funding_rate"], r.get("next_funding_time"), r.get("raw")))
+    return out
+
+
+async def _fetch_funding_okx(symbols: list[str]) -> list[dict[str, Any]]:
+    from src.okx_f_module.api import get_funding_rate
+    out: list[dict[str, Any]] = []
+    results = await asyncio.gather(*[get_funding_rate(s) for s in symbols], return_exceptions=True)
+    for s, r in zip(symbols, results):
+        if isinstance(r, dict) and r.get("funding_rate") is not None:
+            out.append(("okx", _normalize_symbol(s), r["funding_rate"], r.get("next_funding_time"), r.get("raw")))
+    return out
+
+
+async def _fetch_funding_hyperliquid(symbols: list[str]) -> list[dict[str, Any]]:
+    import aiohttp
+    base_url = os.getenv("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz")
+    want = set(symbols)
+    out: list[dict[str, Any]] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{base_url}/info",
+                json={"type": "metaAndAssetCtxs"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as response:
+                payload = await response.json()
+        universe = (payload[0] or {}).get("universe", [])
+        ctxs = payload[1] or []
+        for asset, ctx in zip(universe, ctxs):
+            sym = _normalize_symbol(str(asset.get("name")))
+            if sym not in want:
+                continue
+            funding = ctx.get("funding")
+            if funding is None:
+                continue
+            out.append(("hyperliquid", sym, float(funding), None, ctx))
+    except Exception as exc:
+        print(f"[symbol-price][hyperliquid][funding][warn] fetch 실패 error={exc}")
+    return out
+
+
+async def persist_funding_once(collectors: list[ExchangeCollector]) -> dict[str, int]:
+    import json as _json
+    now_ms = current_utc_ms()
+    bucket_ms = (now_ms // 60000) * 60000
+    fetchers = {
+        "binance": _fetch_funding_binance,
+        "okx": _fetch_funding_okx,
+        "hyperliquid": _fetch_funding_hyperliquid,
+    }
+    all_rows: list[dict[str, Any]] = []
+    for collector in collectors:
+        fn = fetchers.get(collector.exchange_name)
+        if fn is None or not collector.symbols:
+            continue
+        for ex, sym, rate, next_ms, raw in await fn(collector.symbols):
+            all_rows.append({
+                "exchange_name": ex,
+                "symbol": sym,
+                "bucket_start_ms": bucket_ms,
+                "desktop_time_ms": now_ms,
+                "server_time_ms": None,
+                "funding_rate": rate,
+                "next_funding_time_ms": next_ms,
+                "raw_json": _json.dumps(raw, default=str)[:60000] if raw is not None else None,
+            })
+    if not all_rows:
+        return {}
+    conn = await asyncio.to_thread(get_db_connection)
+    try:
+        await asyncio.to_thread(upsert_funding_rate_rows, conn, all_rows)
+    finally:
+        conn.close()
+    counts: dict[str, int] = {}
+    for r in all_rows:
+        counts[r["exchange_name"]] = counts.get(r["exchange_name"], 0) + 1
+    return counts
+
+
 async def run_collector(*, once: bool = False) -> None:
     exchange_names = [name.strip().lower() for name in _parse_csv_env("SYMBOL_PRICE_EXCHANGES", "binance,okx")]
     symbols = _requested_symbols()
@@ -321,12 +466,23 @@ async def run_collector(*, once: bool = False) -> None:
         schema_conn.close()
 
     collectors = await build_collectors(exchange_names, symbols, impact_notional_usd)
+    funding_interval_sec = max(int(float(os.getenv("SYMBOL_PRICE_FUNDING_INTERVAL_SEC", "300") or 300)), 60)
+    last_funding_ms = 0
 
     try:
         await asyncio.sleep(3.0)
         while True:
             summary = await persist_symbol_price_once(collectors, ws_stale_sec=ws_stale_sec, ws_first=ws_first)
             now_ms = current_utc_ms()
+
+            if now_ms - last_funding_ms >= funding_interval_sec * 1000:
+                last_funding_ms = now_ms
+                try:
+                    fcounts = await persist_funding_once(collectors)
+                    if fcounts:
+                        print("[symbol-price][funding] " + " ".join(f"{k}={v}" for k, v in fcounts.items()) + f" bucket_ms={now_ms}")
+                except Exception as exc:
+                    print(f"[symbol-price][funding][warn] persist 실패 error={exc}")
             for exchange_name, item in summary.items():
                 print(
                     "[symbol-price]"

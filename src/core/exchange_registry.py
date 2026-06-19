@@ -59,3 +59,54 @@ def validate_exchange_interface(exchange_or_class: Any) -> dict[str, Any]:
         "missing_methods": missing,
         "expected_methods": list(EXPECTED_PUBLIC_METHODS),
     }
+
+
+# Top-level keys the strategy dereferences on get_symbol_snapshot().
+REQUIRED_SYMBOL_SNAPSHOT_KEYS = (
+    "orderbook",
+    "position",
+    "funding",
+    "health",
+    "account_last_sync_ms",
+    "open_orders",
+)
+# Nested keys that must be dicts (strategy reads sub-fields off them).
+REQUIRED_DICT_SNAPSHOT_KEYS = ("orderbook", "position", "funding", "health")
+
+
+def validate_exchange_snapshot_shape(exchange: Any, sample_symbol: str) -> dict[str, Any]:
+    """Verify a live exchange instance returns the snapshot SHAPE the strategy
+    relies on. Method-presence (validate_exchange_interface) only proves the
+    methods exist; this proves they return usable structures, so a new exchange
+    fails loudly at bootstrap rather than at runtime mid-trade."""
+    issues: list[str] = []
+
+    try:
+        snapshot = exchange.get_symbol_snapshot(sample_symbol)
+    except Exception as exc:
+        return {"ok": False, "issues": [f"get_symbol_snapshot raised: {exc!r}"]}
+
+    if not isinstance(snapshot, dict):
+        return {"ok": False, "issues": ["get_symbol_snapshot did not return a dict"]}
+
+    for key in REQUIRED_SYMBOL_SNAPSHOT_KEYS:
+        if key not in snapshot:
+            issues.append(f"symbol_snapshot missing key: {key}")
+    for key in REQUIRED_DICT_SNAPSHOT_KEYS:
+        if key in snapshot and not isinstance(snapshot[key], dict):
+            issues.append(f"symbol_snapshot[{key}] is not a dict")
+
+    health = snapshot.get("health")
+    if isinstance(health, dict):
+        for key in ("market_ready", "account_ready"):
+            if key not in health and key not in snapshot:
+                issues.append(f"health missing key: {key}")
+
+    try:
+        account = exchange.get_account_snapshot()
+        if not isinstance(account, dict):
+            issues.append("get_account_snapshot did not return a dict")
+    except Exception as exc:
+        issues.append(f"get_account_snapshot raised: {exc!r}")
+
+    return {"ok": not issues, "issues": issues, "sample_symbol": sample_symbol}

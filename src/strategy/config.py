@@ -202,6 +202,16 @@ def load_strategy_config() -> StrategyConfig:
         stop_loss_bps=stop_loss_bps,
         position_stale_ignore_sec=float(os.getenv("STRATEGY_POSITION_STALE_IGNORE_SEC", "20.0") or 20.0),
         close_slippage_bps=float(os.getenv("STRATEGY_CLOSE_SLIPPAGE_BPS", "0.0") or 0.0),
+        normal_close_fee_gate_enabled=parse_bool(
+            os.getenv("STRATEGY_NORMAL_CLOSE_FEE_GATE_ENABLED"),
+            False,
+        ),
+        normal_close_fee_gate_min_net_usd=float(
+            os.getenv("STRATEGY_NORMAL_CLOSE_FEE_GATE_MIN_NET_USD", "0.0") or 0.0
+        ),
+        normal_close_fee_gate_max_defer_sec=float(
+            os.getenv("STRATEGY_NORMAL_CLOSE_FEE_GATE_MAX_DEFER_SEC", "600.0") or 600.0
+        ),
         risk_buffer_bps=float(os.getenv("STRATEGY_RISK_BUFFER_BPS", "1.0") or 1.0),
         margin_guard_enabled=parse_bool(os.getenv("STRATEGY_MARGIN_GUARD_ENABLED"), True),
         margin_guard_safety_factor=float(os.getenv("STRATEGY_MARGIN_GUARD_SAFETY_FACTOR", "1.02") or 1.02),
@@ -227,7 +237,6 @@ def load_strategy_config() -> StrategyConfig:
         auto_close_enabled=parse_bool(os.getenv("STRATEGY_AUTO_CLOSE_ENABLED"), False),
         bootstrap_on_entry=parse_bool(os.getenv("STRATEGY_BOOTSTRAP_ON_ENTRY"), True),
         maker_entry_engine_enabled=parse_bool(os.getenv("STRATEGY_MAKER_ENGINE_ENABLED"), False),
-        maker_entry_engine_symbols=[symbol.upper() for symbol in parse_csv(os.getenv("STRATEGY_MAKER_ENGINE_SYMBOLS"))],
         maker_entry_engine_max_open_orders=parse_nonnegative_int_env("STRATEGY_MAKER_ENGINE_MAX_OPEN_ORDERS", 1),
         maker_entry_engine_requote_sec=float(os.getenv("STRATEGY_MAKER_ENGINE_REQUOTE_SEC", "1.0") or 1.0),
         maker_entry_engine_replace_edge_bps=float(
@@ -267,6 +276,7 @@ def load_strategy_config() -> StrategyConfig:
         graceful_shutdown_enabled=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_ENABLED"), True),
         graceful_shutdown_cancel_orders=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_CANCEL_ORDERS"), True),
         graceful_shutdown_flatten_positions=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_FLATTEN_POSITIONS"), True),
+        shutdown_per_symbol_timeout_sec=float(os.getenv("STRATEGY_SHUTDOWN_PER_SYMBOL_TIMEOUT_SEC", "10.0") or 10.0),
         entry_control_file=Path(
             os.getenv("STRATEGY_ENTRY_CONTROL_FILE", str(PROJECT_ROOT / "runtime" / "entry_control.json"))
         ),

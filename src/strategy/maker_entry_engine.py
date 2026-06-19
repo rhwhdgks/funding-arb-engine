@@ -89,12 +89,7 @@ class MakerEntryEngine:
     def managed_symbols(self, config: StrategyConfig, symbols: list[str]) -> set[str]:
         if not config.maker_entry_engine_enabled:
             return set()
-        configured = {symbol.upper() for symbol in config.maker_entry_engine_symbols if symbol}
-        if "ALL" in configured:
-            return {symbol.upper() for symbol in symbols}
-        if configured:
-            return configured
-        return {symbol.upper() for symbol in symbols[:1]}
+        return {symbol.upper() for symbol in symbols}
 
     def is_managed_symbol(self, symbol: str, config: StrategyConfig, symbols: list[str]) -> bool:
         return symbol.upper() in self.managed_symbols(config, symbols)

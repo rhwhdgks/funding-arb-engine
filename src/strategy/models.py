@@ -74,6 +74,9 @@ class StrategyConfig:
     stop_loss_bps: float | None = -8.0
     position_stale_ignore_sec: float = 20.0
     close_slippage_bps: float = 0.0
+    normal_close_fee_gate_enabled: bool = False
+    normal_close_fee_gate_min_net_usd: float = 0.0
+    normal_close_fee_gate_max_defer_sec: float = 600.0
     risk_buffer_bps: float = 1.0
     margin_guard_enabled: bool = True
     margin_guard_safety_factor: float = 1.02
@@ -96,7 +99,6 @@ class StrategyConfig:
     auto_close_enabled: bool = False
     bootstrap_on_entry: bool = True
     maker_entry_engine_enabled: bool = False
-    maker_entry_engine_symbols: list[str] = field(default_factory=list)
     maker_entry_engine_max_open_orders: int = 1
     maker_entry_engine_requote_sec: float = 1.0
     maker_entry_engine_replace_edge_bps: float = 5.0
@@ -122,6 +124,7 @@ class StrategyConfig:
     graceful_shutdown_enabled: bool = True
     graceful_shutdown_cancel_orders: bool = True
     graceful_shutdown_flatten_positions: bool = True
+    shutdown_per_symbol_timeout_sec: float = 10.0
     entry_control_file: Path = field(default_factory=lambda: PROJECT_ROOT / "runtime" / "entry_control.json")
     entry_control_fail_closed: bool = True
     position_ownership_file: Path = field(default_factory=lambda: PROJECT_ROOT / "runtime" / "position_ownership.json")
@@ -194,6 +197,8 @@ class OpenPairState:
     last_close_reason: str = ""
     close_signal_first_seen_ms: int = 0
     close_signal_confirm_count: int = 0
+    close_fee_gate_first_seen_ms: int = 0
+    close_fee_gate_defer_count: int = 0
     last_direction_mismatch_log_ms: int = 0
     next_recovery_retry_ms: int = 0
     next_auto_close_retry_ms: int = 0

@@ -25,6 +25,21 @@ class ClosePolicyEvaluation:
         return self.decision in AUTO_CLOSE_DECISIONS
 
 
+@dataclass(frozen=True)
+class ClosePnlBreakdown:
+    gross_close_pnl_usd: float
+    close_fee_cost_usd: float
+    close_slippage_cost_usd: float
+    net_close_pnl_usd: float
+
+
+@dataclass(frozen=True)
+class NormalCloseFeeGateEvaluation:
+    defer: bool
+    reason: str
+    metrics: dict[str, float | str | int | bool]
+
+
 def pair_entry_reference_notional_usd(pair: OpenPairState) -> float:
     reference_price = (float(pair.long_entry_price or 0.0) + float(pair.short_entry_price or 0.0)) / 2.0
     return max(float(pair.qty or 0.0) * reference_price, 0.0)
@@ -59,6 +74,43 @@ def close_fee_cost_usd(
     return (
         first_notional * float(first_fee_bps or 0.0) / 10000.0
         + hedge_notional * float(hedge_fee_bps or 0.0) / 10000.0
+    )
+
+
+def close_pnl_breakdown_usd(
+    pair: OpenPairState,
+    config: StrategyConfig,
+    *,
+    long_bid: float,
+    short_ask: float,
+) -> ClosePnlBreakdown:
+    """Break close PnL into gross PnL, close fees/slippage, and net PnL."""
+    if long_bid <= 0 or short_ask <= 0:
+        return ClosePnlBreakdown(
+            gross_close_pnl_usd=-1e18,
+            close_fee_cost_usd=0.0,
+            close_slippage_cost_usd=0.0,
+            net_close_pnl_usd=-1e18,
+        )
+
+    gross_pnl = pair.qty * (
+        (long_bid - short_ask) - (pair.long_entry_price - pair.short_entry_price)
+    )
+    long_notional = pair.qty * long_bid
+    short_notional = pair.qty * short_ask
+    close_fee_cost = close_fee_cost_usd(
+        long_exchange=pair.long_exchange,
+        short_exchange=pair.short_exchange,
+        long_notional_usd=long_notional,
+        short_notional_usd=short_notional,
+        config=config,
+    )
+    close_slippage = ((long_notional + short_notional) / 2.0) * (config.close_slippage_bps * 2.0) / 10000.0
+    return ClosePnlBreakdown(
+        gross_close_pnl_usd=gross_pnl,
+        close_fee_cost_usd=close_fee_cost,
+        close_slippage_cost_usd=close_slippage,
+        net_close_pnl_usd=gross_pnl - close_fee_cost - close_slippage,
     )
 
 
@@ -112,6 +164,43 @@ def decide_pair_close_reason(
     if entry_age_sec >= config.max_hold_sec:
         return "max_hold"
     return "hold_spread_support"
+
+
+def evaluate_normal_close_fee_gate(
+    *,
+    config: StrategyConfig,
+    decision: str,
+    hold_pnl_usd: float,
+    pnl: ClosePnlBreakdown,
+    defer_age_sec: float,
+    defer_count: int,
+) -> NormalCloseFeeGateEvaluation:
+    """Decide whether to defer only normal, non-risk close attempts."""
+    metrics: dict[str, float | str | int | bool] = {
+        "original_close_reason": decision,
+        "gross_close_pnl_usd": pnl.gross_close_pnl_usd,
+        "close_fee_cost_usd": pnl.close_fee_cost_usd,
+        "close_slippage_cost_usd": pnl.close_slippage_cost_usd,
+        "net_close_pnl_usd": pnl.net_close_pnl_usd,
+        "hold_pnl_usd": hold_pnl_usd,
+        "defer_count": int(defer_count),
+        "defer_age_sec": max(float(defer_age_sec or 0.0), 0.0),
+        "max_defer_sec": max(float(config.normal_close_fee_gate_max_defer_sec or 0.0), 0.0),
+        "min_net_usd": float(config.normal_close_fee_gate_min_net_usd or 0.0),
+        "enabled": bool(config.normal_close_fee_gate_enabled),
+    }
+    if not config.normal_close_fee_gate_enabled:
+        return NormalCloseFeeGateEvaluation(False, "fee_gate_disabled", metrics)
+    if decision != "spread_nonpositive":
+        return NormalCloseFeeGateEvaluation(False, "reason_not_fee_gate_eligible", metrics)
+    if hold_pnl_usd <= 0:
+        return NormalCloseFeeGateEvaluation(False, "hold_pnl_not_positive", metrics)
+    if pnl.net_close_pnl_usd >= float(config.normal_close_fee_gate_min_net_usd or 0.0):
+        return NormalCloseFeeGateEvaluation(False, "close_net_above_threshold", metrics)
+    max_defer_sec = max(float(config.normal_close_fee_gate_max_defer_sec or 0.0), 0.0)
+    if max_defer_sec <= 0 or defer_age_sec >= max_defer_sec:
+        return NormalCloseFeeGateEvaluation(False, "max_defer_elapsed", metrics)
+    return NormalCloseFeeGateEvaluation(True, "normal_close_deferred_by_fee", metrics)
 
 
 def evaluate_close_policy(

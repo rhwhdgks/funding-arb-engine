@@ -25,6 +25,7 @@ LOG_DIR="${OPS_CONSOLE_LOG_DIR:-$PROJECT_ROOT/logs}"
 PID_FILE="${OPS_CONSOLE_PID_FILE:-$LOG_DIR/ops_console.pid}"
 STDOUT_LOG="${OPS_CONSOLE_STDOUT_LOG:-$LOG_DIR/ops_console.out}"
 PYTHON_BIN="${OPS_CONSOLE_PYTHON_BIN:-$PROJECT_ROOT/.venv/bin/python}"
+FORCE_STANDALONE="${OPS_CONSOLE_FORCE_STANDALONE:-$(env_file_value OPS_CONSOLE_FORCE_STANDALONE || true)}"
 
 mkdir -p "$LOG_DIR"
 
@@ -36,11 +37,62 @@ is_running() {
   kill -0 "$pid" 2>/dev/null
 }
 
+client_host="$HOST"
+if [[ "$client_host" == "0.0.0.0" || "$client_host" == "::" || -z "$client_host" ]]; then
+  client_host="127.0.0.1"
+fi
+HEALTH_URL="${OPS_CONSOLE_HEALTH_URL:-http://$client_host:$PORT/healthz}"
+
+boolish() {
+  local value
+  value="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ "$value" == "1" || "$value" == "true" || "$value" == "yes" || "$value" == "on" || "$value" == "y" ]]
+}
+
+health_check() {
+  local python_bin="$PYTHON_BIN"
+  if [[ ! -x "$python_bin" ]]; then
+    python_bin="$(command -v python3)"
+  fi
+  OPS_CONSOLE_HEALTH_URL="$HEALTH_URL" "$python_bin" - <<'PY'
+import json
+import os
+from urllib.request import Request, urlopen
+
+url = os.environ["OPS_CONSOLE_HEALTH_URL"]
+try:
+    with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=2.0) as response:
+        body = response.read(4096).decode("utf-8", errors="replace")
+        payload = json.loads(body)
+        ok = 200 <= response.status < 300 and bool(payload.get("ok", True))
+        print(json.dumps({
+            "ok": ok,
+            "status": response.status,
+            "payload": payload,
+            "url": url,
+        }, ensure_ascii=False))
+        raise SystemExit(0 if ok else 1)
+except Exception as exc:
+    print(json.dumps({"ok": False, "error": repr(exc), "url": url}, ensure_ascii=False))
+    raise SystemExit(1)
+PY
+}
+
 case "$CMD" in
   start)
     if is_running; then
       echo "[run_ops_console] already running pid=$(cat "$PID_FILE")"
       exit 0
+    fi
+    if health_json="$(health_check 2>/dev/null)" && ! boolish "$FORCE_STANDALONE"; then
+      echo "[run_ops_console] embedded console already available url=$HEALTH_URL"
+      echo "[run_ops_console] payload=$health_json"
+      exit 0
+    fi
+    if ! boolish "$FORCE_STANDALONE"; then
+      echo "[run_ops_console] strategy-attached console not reachable at $HEALTH_URL" >&2
+      echo "[run_ops_console] start the strategy runtime first, or set OPS_CONSOLE_FORCE_STANDALONE=1 to launch the legacy standalone backend" >&2
+      exit 1
     fi
     if [[ ! -x "$PYTHON_BIN" ]]; then
       echo "[run_ops_console] python not found or not executable: $PYTHON_BIN" >&2
@@ -62,6 +114,11 @@ case "$CMD" in
     ;;
   stop)
     if ! is_running; then
+      if health_json="$(health_check 2>/dev/null)"; then
+        echo "[run_ops_console] embedded console is attached to the strategy process; stop the strategy runtime instead"
+        echo "[run_ops_console] payload=$health_json"
+        exit 0
+      fi
       echo "[run_ops_console] not running"
       rm -f "$PID_FILE"
       exit 0
@@ -87,47 +144,31 @@ case "$CMD" in
     ;;
   status)
     if is_running; then
-      echo "[run_ops_console] running pid=$(cat "$PID_FILE") url=http://$HOST:$PORT"
+      echo "[run_ops_console] running standalone pid=$(cat "$PID_FILE") url=http://$HOST:$PORT"
+    elif health_json="$(health_check 2>/dev/null)"; then
+      echo "[run_ops_console] running embedded url=$HEALTH_URL"
+      echo "[run_ops_console] payload=$health_json"
     else
       echo "[run_ops_console] not running"
       exit 1
     fi
     ;;
   health)
-    if ! is_running; then
-      echo "[run_ops_console] not running"
+    if health_json="$(health_check)"; then
+      echo "[run_ops_console] health ok payload=$health_json"
+    else
+      echo "[run_ops_console] health failed payload=$health_json" >&2
       exit 1
     fi
-    client_host="$HOST"
-    if [[ "$client_host" == "0.0.0.0" || "$client_host" == "::" || -z "$client_host" ]]; then
-      client_host="127.0.0.1"
-    fi
-    health_url="${OPS_CONSOLE_HEALTH_URL:-http://$client_host:$PORT/healthz}"
-    if [[ ! -x "$PYTHON_BIN" ]]; then
-      PYTHON_BIN="$(command -v python3)"
-    fi
-    OPS_CONSOLE_HEALTH_URL="$health_url" "$PYTHON_BIN" - <<'PY'
-import json
-import os
-import sys
-from urllib.request import Request, urlopen
-
-url = os.environ["OPS_CONSOLE_HEALTH_URL"]
-try:
-    with urlopen(Request(url, headers={"Accept": "application/json"}), timeout=2.0) as response:
-        body = response.read(4096).decode("utf-8", errors="replace")
-        payload = json.loads(body)
-        ok = 200 <= response.status < 300 and bool(payload.get("ok", True))
-        print(f"[run_ops_console] health url={url} status={response.status} ok={ok} payload={payload}")
-        raise SystemExit(0 if ok else 1)
-except Exception as exc:
-    print(f"[run_ops_console] health failed url={url} error={exc!r}", file=sys.stderr)
-    raise SystemExit(1)
-PY
     ;;
   logs)
-    touch "$STDOUT_LOG"
-    tail -f "$STDOUT_LOG"
+    if is_running; then
+      touch "$STDOUT_LOG"
+      tail -f "$STDOUT_LOG"
+    else
+      echo "[run_ops_console] no standalone backend log; inspect the strategy stdout/jsonl logs for embedded console activity" >&2
+      exit 1
+    fi
     ;;
   *)
     echo "usage: scripts/runtime/run_ops_console.sh [start|stop|restart|status|health|logs]" >&2

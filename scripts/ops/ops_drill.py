@@ -216,9 +216,15 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         ["scripts/runtime/run_symbol_price_collector.sh", "status"],
         expected_running=args.expect_collector_running,
     )
+    expect_ops_console_running = args.expect_ops_console_running
+    if expect_ops_console_running is None and args.expect_strategy_running is False:
+        expect_ops_console_running = False
+    elif expect_ops_console_running is None and args.expect_strategy_running is True:
+        expect_ops_console_running = True
+
     ops_console_status, ops_console_check = service_status(
         ["scripts/runtime/run_ops_console.sh", "status"],
-        expected_running=args.expect_ops_console_running,
+        expected_running=expect_ops_console_running,
     )
     artifacts["strategy_status"] = strategy_status
     artifacts["collector_status"] = collector_status
@@ -367,7 +373,7 @@ def main() -> int:
     parser.add_argument("--expect-strategy-running", action="store_const", const=True, default=None, dest="expect_strategy_running")
     parser.add_argument("--expect-strategy-stopped", action="store_const", const=False, dest="expect_strategy_running")
     parser.add_argument("--expect-collector-running", action="store_true", default=True)
-    parser.add_argument("--expect-ops-console-running", action="store_const", const=True, default=True, dest="expect_ops_console_running")
+    parser.add_argument("--expect-ops-console-running", action="store_const", const=True, default=None, dest="expect_ops_console_running")
     parser.add_argument("--expect-ops-console-stopped", action="store_const", const=False, dest="expect_ops_console_running")
     parser.add_argument("--skip-console-conflict-drill", action="store_true")
     args = parser.parse_args()

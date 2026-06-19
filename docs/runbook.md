@@ -9,6 +9,15 @@
 - 체결이 없는 run은 정상일 수 있습니다. 시장 조건이 맞지 않으면 pair가 열리지 않는 것이 맞습니다.
 - final report는 실행 안정성을 판단하는 도구입니다. 수익성 평가는 별도 분석으로 봅니다.
 - `.env` 계열 파일과 runtime/log 산출물은 공개 저장소에 올리지 않습니다.
+- 전략 프로세스가 exchange session의 유일한 owner입니다. ops console은 기본적으로 전략 내장 control plane에 붙습니다.
+
+## Control Plane 기준
+
+- 기본 운영 경로는 `embedded console`입니다.
+- `run_ops_console.sh`는 기본적으로 새 거래소 세션을 만들지 않습니다.
+- 수동 주문, cancel, flatten, rebalance, pause/resume은 전략 내부 command queue로 위임됩니다.
+- embedded 모드에서는 console 조회와 액션이 전략과 같은 in-memory state를 사용합니다.
+- standalone console은 디버깅이나 호환성 확인용 예외 경로입니다. 필요 시에만 `OPS_CONSOLE_FORCE_STANDALONE=1`을 명시합니다.
 
 ## 실행 전 확인
 
@@ -122,7 +131,7 @@ pause 상태에서 기대하는 동작:
 
 ## Ops Console 수동 주문
 
-ops console은 수동 주문용 resident runtime입니다.
+ops console은 기본적으로 `전략에 붙는 control plane`입니다. 운영 순서는 `전략 시작 -> console health 확인 -> 브라우저 접속`입니다.
 
 로컬 PC에서만 볼 때는 `.env`에 아래 값을 둡니다.
 
@@ -132,7 +141,8 @@ OPS_CONSOLE_PORT=8010
 ```
 
 ```bash
-STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
+STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh start
+STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh status
 STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
 ```
 
@@ -145,7 +155,20 @@ http://127.0.0.1:8010
 테스트 서버:
 
 ```bash
-STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_ops_console.sh start
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh start
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_ops_console.sh health
+```
+
+embedded 모드에서 `run_ops_console.sh start`를 호출하면:
+
+- 전략이 이미 실행 중이면 `embedded console already available`만 출력하고 끝납니다.
+- 전략이 꺼져 있으면 `strategy-attached console not reachable`로 실패합니다.
+- 이 동작이 정상입니다. 별도 backend를 또 띄우지 않는 것이 목적입니다.
+
+standalone backend가 꼭 필요할 때만 아래처럼 명시합니다.
+
+```bash
+OPS_CONSOLE_FORCE_STANDALONE=1 STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
 ```
 
 폰이나 다른 장비에서 접속해야 하는 경우:
@@ -175,6 +198,7 @@ STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_ops_console.sh start
 
 - 실서버 `.env`에서 `ENABLE_WEB_TRADING=1`이면 console 버튼으로 실제 주문이 나갈 수 있습니다.
 - 로컬 전용 운영은 `OPS_CONSOLE_HOST=127.0.0.1`을 기본으로 둡니다.
+- embedded 모드에서는 console 별도 로그 파일이 없습니다. console 동작 확인은 `run_strategy_live.sh logs` 또는 `jsonl`로 봅니다.
 - console 신규 live order는 전략이 같은 symbol active pair를 들고 있으면 차단됩니다.
 - `cancel-symbol`, `flatten-symbol`은 정리 액션이므로 active pair conflict check를 타지 않습니다.
 - ownership 파일 경로는 기본적으로 `STRATEGY_ENTRY_CONTROL_FILE`과 같은 폴더의 `position_ownership.json`입니다. 필요하면 `POSITION_OWNERSHIP_FILE`로 명시합니다.
@@ -243,6 +267,7 @@ PASS로 보는 주요 신호:
 - `remaining_positions=[]`
 - `pending_pair_ids=[]`
 - DB open-like orders가 0입니다.
+- order/trade DB reconcile이 `PASS`입니다.
 - Binance/OKX live positions가 0입니다.
 - Binance/OKX live open orders가 0입니다.
 - symbol price collector freshness가 정상입니다.
@@ -267,7 +292,8 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
 - `FAIL`은 즉시 원인 확인 대상입니다.
 - `WARN`은 운영자가 판단해서 유지할 수 있는 상태입니다.
 - strategy가 꺼져 있고 symbol price collector만 도는 상태는 `strategy_process_running=WARN`으로 나올 수 있습니다.
-- ops console이 떠 있으면 `ops_console_process_running=PASS`, `/healthz`가 응답하면 `ops_console_healthz_ok=PASS`입니다.
+- embedded 또는 standalone 어느 쪽이든 `/healthz`가 응답하면 `ops_console_healthz_ok=PASS`입니다.
+- embedded 모드에서는 standalone pid가 없어도 health가 살아 있으면 `ops_console_process_running=PASS`로 봅니다.
 - `okx_symbol_price_impact_complete`가 `USDC` 1개 결측으로만 뜨는 경우는 모니터 품질 경고이며, 주문/헷지 failure는 아닙니다.
 - `pair_close_pending`, `pair_close_leg_failed`, `pair_entry_overfill_detected`, `strategy_danger_log_lines`가 `FAIL`이면 신규 진입보다 정리 상태를 먼저 확인합니다.
 
@@ -277,7 +303,7 @@ Health 항목별 판단:
 | --- | --- | --- | --- |
 | `strategy_process_running` | 전략 실행 중 | monitor-only 또는 의도적으로 꺼둠 | 해당 없음 |
 | `symbol_price_collector_process_running` | collector 실행 중 | collector optional 설정일 때 미실행 | collector required인데 미실행 |
-| `ops_console_process_running` | ops console 실행 중 | console optional 설정일 때 미실행 | console required인데 미실행 |
+| `ops_console_process_running` | embedded health 또는 standalone pid 기준으로 console 사용 가능 | console optional 설정일 때 미실행 | console required인데 미실행 |
 | `ops_console_healthz_ok` | `/healthz` 응답 정상 | console 미실행 또는 optional 상태 | console required 또는 실행 중인데 응답 실패 |
 | `*_symbol_price_fresh` | 최신 bucket이 freshness 기준 이내 | DB 적재 지연 또는 collector 정지 의심 | 해당 없음 |
 | `*_symbol_price_impact_complete` | 모든 심볼 impact 가격 있음 | 일부 심볼 impact 가격 결측 | 해당 없음 |
@@ -287,6 +313,15 @@ Health 항목별 판단:
 | `strategy_danger_log_lines_zero` | 위험 로그 없음 | 전략이 꺼진 과거 로그에만 존재 | 실행 중 위험 로그 존재 |
 | `exchange_ip_ban_lines_zero` | ban 흔적 없음 | 전략이 꺼진 과거 로그에만 존재 | 실행 중 ban 흔적 존재 |
 | `rate_limit_pressure_lines_zero` | rate-limit 압박 없음 | circuit breaker/pause 발생 | IP ban 또는 거래 불능으로 이어짐 |
+
+## DB Reconcile 해석
+
+final report의 DB Verdict는 현재 run 기준 `order_history`와 `trade_history`가 운영 판단에 충분히 맞는지 확인합니다.
+
+- `run_open_like_orders_zero=PASS`가 핵심입니다. 최신 run에 `NEW/LIVE/PARTIALLY_FILLED/OPEN` 잔존이 없어야 합니다.
+- `filled_orders_have_trade_rows=PASS`는 체결 주문이 trade row와 연결된 상태입니다.
+- Binance처럼 order row가 client id, trade row가 exchange order id로 들어오는 경우가 있습니다. 이때 exact id link가 실패해도 같은 exchange/symbol/side, 근접 timestamp, 동일 체결 수량이면 `Inferred Order/Trade Links`로 정합성을 인정합니다.
+- inferred link는 원본 DB를 고치는 것이 아니라 reconcile report의 판정 보강입니다. 실제 미해결 row는 `Unresolved Unlinked Trades`에 남아야 합니다.
 
 ## 운영 Drill
 

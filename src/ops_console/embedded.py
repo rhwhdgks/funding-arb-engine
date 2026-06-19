@@ -1,0 +1,499 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import os
+import time
+from collections import Counter, deque
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import uvicorn
+
+from src.core.api_pressure import current_api_pressure_summary
+from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
+from src.ops_console.action_gate import set_active_strategy_symbols_provider
+from src.ops_console.runtime import (
+    PROJECT_ROOT,
+    action_token_required,
+    console_symbols_source,
+    exchange_action_error,
+    parse_bool,
+    parse_positive_float,
+)
+from src.ops_console.state import build_exchange_state, normalize_symbol, now_ms
+from src.ops_console.strategy_dashboard import (
+    DANGER_EVENT_TYPES,
+    KEY_EVENT_TYPES,
+    _active_orphans,
+    compact_api_pressure,
+    compact_candidate,
+    compact_event,
+    latest_artifacts,
+    realized_pnl_summary,
+)
+
+if TYPE_CHECKING:
+    from src.strategy.control import EntryControlStore
+    from src.strategy.models import OpenPairState, StrategyConfig
+
+
+_ACTIVE_SERVICE: "StrategyControlService | None" = None
+
+
+def active_service() -> "StrategyControlService | None":
+    return _ACTIVE_SERVICE
+
+
+def set_active_service(service: "StrategyControlService | None") -> None:
+    global _ACTIVE_SERVICE
+    _ACTIVE_SERVICE = service
+
+
+def record_control_plane_event(row: dict[str, Any]) -> None:
+    service = active_service()
+    if service is not None:
+        service.record_event(row)
+
+
+def _utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time()))
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+@dataclass
+class StrategyControlCommand:
+    command_type: str
+    payload: Any
+    response_future: asyncio.Future[Any]
+    ops_token: str | None = None
+    enqueued_at_ms: int = field(default_factory=now_ms)
+
+
+class StrategyControlProjection:
+    def __init__(self, *, started_at_ms: int, recent_limit: int = 50) -> None:
+        self.started_at_ms = started_at_ms
+        self.event_counts: Counter[str] = Counter()
+        self.latest_by_type: dict[str, dict[str, Any]] = {}
+        self.recent_events: deque[dict[str, Any]] = deque(maxlen=recent_limit)
+        self.last_event_ms: int = 0
+        self.last_error: str = ""
+        self.pnl_cache: dict[str, Any] = {
+            "ok": False,
+            "account_label": resolve_account_label(),
+            "today_realized_usd": 0.0,
+            "today_fee_usd": 0.0,
+            "today_trades": 0,
+            "run_realized_usd": 0.0,
+            "run_fee_usd": 0.0,
+            "run_trades": 0,
+            "by_symbol": [],
+        }
+        self.pnl_updated_at_ms: int = 0
+        self.api_pressure_cache: dict[str, Any] = {}
+        self.api_pressure_updated_at_ms: int = 0
+
+    @property
+    def rows_loaded(self) -> int:
+        return sum(self.event_counts.values())
+
+    def record_event(self, row: dict[str, Any]) -> None:
+        event_type = str(row.get("event_type") or "unknown")
+        self.event_counts[event_type] += 1
+        self.latest_by_type[event_type] = dict(row)
+        self.recent_events.append(compact_event(row))
+        self.last_event_ms = _safe_int(row.get("ts_ms"), now_ms())
+
+    def update_pnl_cache(self, payload: dict[str, Any]) -> None:
+        self.pnl_cache = dict(payload)
+        self.pnl_updated_at_ms = now_ms()
+
+    def update_api_pressure(self, payload: dict[str, Any] | None) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        self.api_pressure_cache = dict(payload)
+        self.api_pressure_updated_at_ms = now_ms()
+
+
+class _EmbeddedExchangeSession:
+    def __init__(self, exchange: Any) -> None:
+        self.exchange = exchange
+
+    async def ensure_started(self) -> None:
+        return None
+
+
+class StrategyConsoleRuntimeAdapter:
+    def __init__(self, service: "StrategyControlService") -> None:
+        self.service = service
+        self.exchange_names = list(service.exchange_names)
+        self.symbols = list(service.symbols)
+
+    async def snapshot(self) -> dict[str, Any]:
+        return await self.service.build_console_state()
+
+    def session(self, exchange_name: str) -> _EmbeddedExchangeSession:
+        normalized = str(exchange_name or "").strip().lower()
+        exchange = self.service.exchanges.get(normalized)
+        if exchange is None:
+            raise ValueError(f"exchange not configured: {exchange_name}")
+        return _EmbeddedExchangeSession(exchange)
+
+    async def execute_action(
+        self,
+        exchange_name: str,
+        symbol: str,
+        action_name: str,
+        action: Any,
+        *,
+        wait_sec: float = 0.0,
+    ) -> dict[str, Any]:
+        normalized_exchange = str(exchange_name or "").strip().lower()
+        exchange = self.service.exchanges.get(normalized_exchange)
+        if exchange is None:
+            raise ValueError(f"exchange not configured: {exchange_name}")
+
+        normalized_symbol = normalize_symbol(symbol)
+        timeout_sec = float(os.getenv("OPS_CONSOLE_ACTION_TIMEOUT_SEC", "10.0"))
+        before = self.service.build_single_exchange_state(normalized_exchange)
+        result = await asyncio.wait_for(action(exchange), timeout=timeout_sec)
+        error = exchange_action_error(result)
+        if error:
+            raise ValueError(
+                f"{action_name} failed on {normalized_exchange}:{normalized_symbol}: {error}"
+            )
+        if wait_sec > 0:
+            await asyncio.sleep(wait_sec)
+        after = self.service.build_single_exchange_state(normalized_exchange)
+        return {
+            "ok": True,
+            "action": action_name,
+            "exchange": normalized_exchange,
+            "symbol": normalized_symbol,
+            "action_result": result,
+            "before": before,
+            "after": after,
+        }
+
+
+class StrategyControlService:
+    def __init__(
+        self,
+        *,
+        config: "StrategyConfig",
+        exchanges: dict[str, Any],
+        symbols: list[str],
+        open_pairs: dict[str, "OpenPairState"],
+        entry_control_store: "EntryControlStore",
+        assumed_flat_until_ms: dict[tuple[str, str], int],
+        symbol_recent_close_ms: dict[str, int],
+        wake_queue: asyncio.Queue[tuple[str, str, int]],
+        command_queue: asyncio.Queue[StrategyControlCommand],
+    ) -> None:
+        self.config = config
+        self.exchanges = exchanges
+        self.exchange_names = list(exchanges.keys())
+        self.symbols = [normalize_symbol(symbol) for symbol in symbols]
+        self.open_pairs = open_pairs
+        self.entry_control_store = entry_control_store
+        self.assumed_flat_until_ms = assumed_flat_until_ms
+        self.symbol_recent_close_ms = symbol_recent_close_ms
+        self.wake_queue = wake_queue
+        self.command_queue = command_queue
+        self.stale_ms = int(os.getenv("OPS_CONSOLE_STALE_MS", "1500"))
+        self.account_label = resolve_account_label()
+        self.logic = resolve_logic_name()
+        self.started_at_ms = now_ms()
+        self.started_at_iso = _utc_now_iso()
+        self.startup_block_reasons: tuple[str, ...] = ()
+        self.last_error: str = ""
+        self.state_last_built_ms: int = 0
+        self.projection = StrategyControlProjection(started_at_ms=self.started_at_ms)
+        self.runtime_adapter = StrategyConsoleRuntimeAdapter(self)
+        self._refresh_task: asyncio.Task[Any] | None = None
+        self._stopping = False
+
+    async def start(self) -> None:
+        set_active_service(self)
+        set_active_strategy_symbols_provider(self.active_strategy_symbols)
+        self._refresh_task = asyncio.create_task(
+            self._background_refresh_loop(),
+            name="strategy-control-refresh",
+        )
+
+    async def stop(self) -> None:
+        self._stopping = True
+        if active_service() is self:
+            set_active_service(None)
+        set_active_strategy_symbols_provider(None)
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._refresh_task
+            self._refresh_task = None
+
+    async def _background_refresh_loop(self) -> None:
+        interval_sec = max(float(os.getenv("OPS_CONSOLE_BACKGROUND_REFRESH_SEC", "5.0")), 1.0)
+        while True:
+            try:
+                pnl = await asyncio.to_thread(realized_pnl_summary, self.account_label, self.started_at_ms)
+                self.projection.update_pnl_cache(pnl)
+                self.projection.update_api_pressure(current_api_pressure_summary())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.last_error = str(exc)
+            await asyncio.sleep(interval_sec)
+
+    def set_startup_block_reasons(self, reasons: tuple[str, ...]) -> None:
+        self.startup_block_reasons = tuple(reasons or ())
+
+    def active_strategy_symbols(self) -> dict[str, str]:
+        active: dict[str, str] = {}
+        for pair_id, pair in self.open_pairs.items():
+            if getattr(pair, "status", "") in {"closed", "failed"}:
+                continue
+            active[str(pair_id)] = normalize_symbol(getattr(pair, "symbol", ""))
+        return active
+
+    def record_event(self, row: dict[str, Any]) -> None:
+        self.projection.record_event(row)
+
+    def build_single_exchange_state(self, exchange_name: str) -> dict[str, Any]:
+        exchange = self.exchanges[exchange_name]
+        return build_exchange_state(exchange_name, exchange, self.symbols, stale_ms=self.stale_ms)
+
+    async def build_console_state(self) -> dict[str, Any]:
+        generated_at_ms = now_ms()
+        exchange_states: dict[str, Any] = {}
+        ages: list[int] = []
+        errors: list[str] = []
+        for exchange_name in self.exchange_names:
+            try:
+                state = self.build_single_exchange_state(exchange_name)
+                exchange_states[exchange_name] = state
+                for symbol_state in (state.get("symbols") or {}).values():
+                    orderbook = symbol_state.get("orderbook") or {}
+                    age_ms = orderbook.get("age_ms")
+                    if age_ms is not None:
+                        ages.append(_safe_int(age_ms))
+            except Exception as exc:
+                errors.append(f"{exchange_name}:{exc}")
+                exchange_states[exchange_name] = {
+                    "exchange": exchange_name,
+                    "error": str(exc),
+                    "symbols": {},
+                }
+        self.state_last_built_ms = generated_at_ms
+        if errors:
+            self.last_error = "; ".join(errors)[:400]
+        source_status = "stopping" if self._stopping else ("degraded" if errors else "live")
+        return {
+            "timestamp_ms": generated_at_ms,
+            "timestamp_utc": _utc_now_iso(),
+            "generated_at_ms": generated_at_ms,
+            "data_age_ms": max(ages) if ages else 0,
+            "source_status": source_status,
+            "last_error": self.last_error or None,
+            "mode": os.getenv("STRATEGY_MODE", "LIVE"),
+            "symbols": self.symbols,
+            "exchanges": exchange_states,
+            "runtime": {
+                "exchange_names": self.exchange_names,
+                "symbols": self.symbols,
+                "symbols_source": console_symbols_source(),
+                "stale_ms": self.stale_ms,
+                "strategy_leverage": parse_positive_float(os.getenv("STRATEGY_LEVERAGE"), 1.0),
+                "entry_control": self.entry_control_dict(),
+                "web_trading_enabled": parse_bool(os.getenv("ENABLE_WEB_TRADING"), False),
+                "token_required": action_token_required(),
+                "account_label": self.account_label,
+                "logic": self.logic,
+            },
+        }
+
+    def entry_control_dict(self) -> dict[str, Any]:
+        state = self.entry_control_store.read_state()
+        return {
+            "entry_paused": state.entry_paused,
+            "reason": state.reason,
+            "updated_at_ms": state.updated_at_ms,
+            "updated_by": state.updated_by,
+            "source_path": state.source_path,
+            "error": state.error,
+        }
+
+    def build_strategy_state(self) -> dict[str, Any]:
+        now = now_ms()
+        latest_candidate = self.projection.latest_by_type.get("candidate_scan_summary") or {}
+        latest_shutdown = self.projection.latest_by_type.get("shutdown_cleanup_done") or {}
+        api_pressure = self.projection.api_pressure_cache or {}
+        danger_counts = {
+            event_name: self.projection.event_counts.get(event_name, 0)
+            for event_name in sorted(DANGER_EVENT_TYPES)
+        }
+        age_candidates = [
+            age
+            for age in (
+                now - self.projection.last_event_ms if self.projection.last_event_ms > 0 else None,
+                now - self.projection.pnl_updated_at_ms if self.projection.pnl_updated_at_ms > 0 else None,
+                now - self.projection.api_pressure_updated_at_ms if self.projection.api_pressure_updated_at_ms > 0 else None,
+            )
+            if age is not None
+        ]
+        source_status = "stopping" if self._stopping else ("degraded" if self.last_error else "live")
+        log_dir = Path(os.getenv("STRATEGY_LIVE_LOG_DIR") or PROJECT_ROOT / "logs")
+        pid_file = Path(os.getenv("STRATEGY_LIVE_PID_FILE") or (log_dir / "strategy_live.pid"))
+        meta_file = Path(os.getenv("STRATEGY_LIVE_RUN_META_FILE") or (log_dir / "strategy_live.run.json"))
+        stdout_log = Path(os.getenv("STRATEGY_LIVE_STDOUT_LOG") or (log_dir / "strategy_live.out"))
+        jsonl_log = self.config.live_event_log_path
+        return {
+            "timestamp_ms": now,
+            "generated_at_ms": now,
+            "data_age_ms": max(age_candidates) if age_candidates else 0,
+            "source_status": source_status,
+            "last_error": self.last_error or None,
+            "paths": {
+                "log_dir": str(log_dir),
+                "pid_file": str(pid_file),
+                "meta_file": str(meta_file),
+                "jsonl_log": str(jsonl_log),
+                "stdout_log": str(stdout_log),
+            },
+            "runtime": {
+                "path": str(pid_file),
+                "pid": os.getpid(),
+                "running": True,
+                "started_at_ms": self.started_at_ms,
+                "started_at_iso": self.started_at_iso,
+                "duration": f"{max((now - self.started_at_ms) / 1000.0, 0.0):.1f}s",
+                "execution_profile": os.getenv("STRATEGY_EXECUTION_PROFILE") or "strategy_attached_console",
+                "env_file": os.getenv("STRATEGY_ENV_FILE"),
+                "symbols": self.symbols,
+                "exchanges": self.exchange_names,
+                "account_label": self.account_label,
+                "logic": self.logic,
+                "runtime_stopped": False,
+                "entry_control": self.entry_control_dict(),
+            },
+            "health": {
+                "danger_total": sum(danger_counts.values()),
+                "danger_counts": danger_counts,
+                "shutdown_remaining_positions": latest_shutdown.get("remaining_positions"),
+                "shutdown_pending_pair_ids": latest_shutdown.get("pending_pair_ids"),
+            },
+            "events": {
+                "rows_loaded": self.projection.rows_loaded,
+                "counts": {event: self.projection.event_counts.get(event, 0) for event in KEY_EVENT_TYPES},
+                "top_counts": dict(self.projection.event_counts.most_common(20)),
+                "recent": list(self.projection.recent_events)[-25:],
+            },
+            "candidate": {
+                "latest_ts_utc": latest_candidate.get("ts_utc"),
+                "total_candidates": latest_candidate.get("total_candidates"),
+                "enterable_candidates": latest_candidate.get("enterable_candidates"),
+                "blocked_candidates": latest_candidate.get("blocked_candidates"),
+                "top_candidate": compact_candidate(latest_candidate.get("top_candidate")),
+                "top_enterable_candidate": compact_candidate(latest_candidate.get("top_enterable_candidate")),
+                "top_blocked_candidate": compact_candidate(latest_candidate.get("top_blocked_candidate")),
+                "top_block_reason": latest_candidate.get("top_block_reason"),
+                "reason_counts": latest_candidate.get("reason_counts") or {},
+            },
+            "api_pressure": {
+                "latest_ts_utc": api_pressure.get("ts_utc"),
+                "window_sec": api_pressure.get("window_sec"),
+                "exchanges": compact_api_pressure(api_pressure),
+            },
+            "pnl": dict(self.projection.pnl_cache),
+            "orphans": _active_orphans(),
+            "artifacts": latest_artifacts(log_dir),
+            "meta": {
+                "embedded": True,
+                "startup_block_reasons": list(self.startup_block_reasons),
+                "open_pair_ids": sorted(self.open_pairs.keys()),
+                "assumed_flat_keys": [
+                    {"exchange": exchange, "symbol": symbol, "until_ms": until_ms}
+                    for (exchange, symbol), until_ms in sorted(self.assumed_flat_until_ms.items())
+                ],
+                "recent_close_symbols": dict(self.symbol_recent_close_ms),
+            },
+        }
+
+    async def submit_command(
+        self,
+        command_type: str,
+        payload: Any,
+        *,
+        ops_token: str | None,
+        timeout_sec: float | None = None,
+    ) -> dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        command = StrategyControlCommand(
+            command_type=command_type,
+            payload=payload,
+            response_future=future,
+            ops_token=ops_token,
+        )
+        self.command_queue.put_nowait(command)
+        with contextlib.suppress(asyncio.QueueFull):
+            self.wake_queue.put_nowait(("control", command_type, now_ms()))
+        wait_timeout = timeout_sec or float(os.getenv("OPS_CONSOLE_COMMAND_TIMEOUT_SEC", "30.0"))
+        return await asyncio.wait_for(future, timeout=wait_timeout)
+
+
+class EmbeddedControlServer:
+    def __init__(self, service: StrategyControlService) -> None:
+        self.service = service
+        self.host = os.getenv("OPS_CONSOLE_HOST", "127.0.0.1")
+        self.port = int(float(os.getenv("OPS_CONSOLE_PORT", "8010")))
+        self._server: uvicorn.Server | None = None
+        self._task: asyncio.Task[Any] | None = None
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        await self.service.start()
+        try:
+            from src.ops_console.app import app
+
+            config = uvicorn.Config(
+                app,
+                host=self.host,
+                port=self.port,
+                log_level="warning",
+                access_log=False,
+            )
+            self._server = uvicorn.Server(config)
+            self._task = asyncio.create_task(self._server.serve(), name="strategy-embedded-control-server")
+            await asyncio.sleep(0.2)
+            if self._task.done():
+                exc = self._task.exception()
+                if exc is not None:
+                    raise exc
+        except Exception:
+            await self.service.stop()
+            self._task = None
+            self._server = None
+            raise
+
+    async def stop(self) -> None:
+        try:
+            if self._server is not None:
+                self._server.should_exit = True
+            if self._task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._task
+        finally:
+            self._task = None
+            self._server = None
+            await self.service.stop()

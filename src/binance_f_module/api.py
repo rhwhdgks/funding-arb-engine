@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import random
 import re
 import time
 import hmac
@@ -264,6 +266,38 @@ def _binance_error_code(data: Any) -> int | None:
         return None
 
 
+_TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+
+
+def _transient_retry_max() -> int:
+    try:
+        return max(0, int(os.getenv("BINANCE_TRANSIENT_RETRY_MAX", "3")))
+    except Exception:
+        return 3
+
+
+def _transient_backoff_base_sec() -> float:
+    try:
+        return max(0.0, float(os.getenv("BINANCE_TRANSIENT_BACKOFF_BASE_SEC", "0.25")))
+    except Exception:
+        return 0.25
+
+
+def _transient_backoff_jitter() -> float:
+    try:
+        return max(0.0, float(os.getenv("BINANCE_TRANSIENT_BACKOFF_JITTER", "0.2")))
+    except Exception:
+        return 0.2
+
+
+def _classify_binance_transient(status: int) -> str | None:
+    # Server-side transient (5xx). Rate-limit (418/429/-1003) is handled by the
+    # circuit breaker, NOT retried here.
+    if status in _TRANSIENT_HTTP_STATUSES:
+        return f"http_{status}"
+    return None
+
+
 def _classify_rate_limit_response(status: int, data: Any) -> tuple[str, int] | None:
     code = _binance_error_code(data)
     if status not in {418, 429} and code != -1003:
@@ -456,35 +490,86 @@ async def _request(
             url = f"{url}?{query_string}"
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
-    async with aiohttp.ClientSession(timeout=timeout_obj) as session:
-        async with session.request(method.upper(), url, headers=headers) as response:
-            try:
-                data = await response.json(content_type=None)
-            except Exception:
-                data = await response.text()
-            response_headers = dict(response.headers)
-            rate_limits = _build_rate_limits(response_headers)
-            _update_rest_rate_limit_state(
-                path=path,
-                status=response.status,
-                data=data,
-                headers=response_headers,
-            )
+    # Only idempotent reads (GET) are retried — re-sending a POST order on a
+    # transient failure risks a duplicate fill, so non-idempotent verbs return
+    # the error to the caller unchanged.
+    is_idempotent = method.upper() in {"GET", "HEAD"}
+    retry_max = _transient_retry_max() if is_idempotent else 0
+    backoff_base = _transient_backoff_base_sec()
+    backoff_jitter = _transient_backoff_jitter()
+
+    for attempt in range(retry_max + 1):
+        is_last = attempt >= retry_max
+        attempt_started_ms = _now_ms()
+        transient_reason: str | None = None
+        try:
+            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+                async with session.request(method.upper(), url, headers=headers) as response:
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception:
+                        data = await response.text()
+                    response_headers = dict(response.headers)
+                    status = response.status
+            transient_reason = _classify_binance_transient(status)
+        except (asyncio.TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError) as exc:
+            reason = f"exc:{type(exc).__name__}"
             record_api_call(
                 exchange="binance",
                 method=method,
                 path=path,
-                status=response.status,
-                data=data,
-                headers=response_headers,
-                rate_limits=rate_limits,
-                latency_ms=max(_now_ms() - request_started_ms, 0),
+                status=0,
+                data={"code": reason, "msg": str(exc)[:300]},
+                headers={},
+                latency_ms=max(_now_ms() - attempt_started_ms, 0),
+                transient_reason=reason,
+                retry_attempt=not is_last,
+                retry_exhausted=is_last,
             )
-            rate_limit_pause = _classify_rate_limit_response(response.status, data)
-            if rate_limit_pause is not None:
-                reason, until_ms = rate_limit_pause
-                _set_rest_pause(until_ms, reason, path)
-            return response.status, data, response_headers
+            if is_last:
+                print(
+                    f"[binance][_request][retry_exhausted] path={path} reason={reason} "
+                    f"attempts={attempt + 1}"
+                )
+                raise
+            backoff = backoff_base * (2 ** attempt)
+            if backoff_jitter > 0:
+                backoff *= 1.0 + random.uniform(-backoff_jitter, backoff_jitter)
+            print(f"[binance][_request][retry] path={path} reason={reason} attempt={attempt + 1}/{retry_max + 1} backoff={max(backoff, 0.0):.2f}s")
+            await asyncio.sleep(max(backoff, 0.0))
+            continue
+
+        rate_limits = _build_rate_limits(response_headers)
+        _update_rest_rate_limit_state(path=path, status=status, data=data, headers=response_headers)
+        record_api_call(
+            exchange="binance",
+            method=method,
+            path=path,
+            status=status,
+            data=data,
+            headers=response_headers,
+            rate_limits=rate_limits,
+            latency_ms=max(_now_ms() - attempt_started_ms, 0),
+            transient_reason=transient_reason,
+            retry_attempt=transient_reason is not None and not is_last,
+            retry_exhausted=transient_reason is not None and is_last,
+        )
+
+        # Rate-limit (418/429/-1003) → circuit breaker pause, returned to caller.
+        rate_limit_pause = _classify_rate_limit_response(status, data)
+        if rate_limit_pause is not None:
+            reason, until_ms = rate_limit_pause
+            _set_rest_pause(until_ms, reason, path)
+            return status, data, response_headers
+
+        if transient_reason is None or is_last:
+            return status, data, response_headers
+
+        backoff = backoff_base * (2 ** attempt)
+        if backoff_jitter > 0:
+            backoff *= 1.0 + random.uniform(-backoff_jitter, backoff_jitter)
+        print(f"[binance][_request][retry] path={path} reason={transient_reason} attempt={attempt + 1}/{retry_max + 1} backoff={max(backoff, 0.0):.2f}s")
+        await asyncio.sleep(max(backoff, 0.0))
 
 
 # ---------- time sync ----------

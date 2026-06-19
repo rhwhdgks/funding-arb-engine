@@ -218,6 +218,15 @@ def flush_api_pressure(*, force: bool = False) -> dict[str, Any] | None:
     return summary
 
 
+def current_api_pressure_summary() -> dict[str, Any] | None:
+    if not _enabled():
+        return None
+    now_ms = _now_ms()
+    with _LOCK:
+        _ensure_bucket(now_ms)
+        return _build_summary(now_ms)
+
+
 def record_api_call(
     *,
     exchange: str,
@@ -289,4 +298,3 @@ def record_api_call(
 
     if should_flush:
         flush_api_pressure(force=True)
-

@@ -320,6 +320,8 @@
     const $ = (id) => document.getElementById(id);
     let state = null;
     let strategyState = null;
+    let refreshInFlight = false;
+    let refreshStrategyInFlight = false;
 
     function fmt(v, d = 4) {
       const n = Number(v);
@@ -592,12 +594,14 @@
       $("staleB").textContent = sb?.stale ? "STALE" : "FRESH";
       $("staleB").className = `chip ${sb?.stale ? "bad" : "good"}`;
 
+      const orphans = strategyState?.orphans || [];
       $("statusChips").innerHTML = [
         chip(`mode=${state.mode || "-"}`),
         chip(`symbols=${(state.symbols || []).length}`),
         chip(`source=${state.runtime?.symbols_source || "-"}`),
         chip(state.runtime?.entry_control?.entry_paused ? "entry paused" : "entry active", state.runtime?.entry_control?.entry_paused ? "warn" : "good"),
-        chip(state.runtime?.web_trading_enabled ? "web trading on" : "web trading off", state.runtime?.web_trading_enabled ? "warn" : "")
+        chip(state.runtime?.web_trading_enabled ? "web trading on" : "web trading off", state.runtime?.web_trading_enabled ? "warn" : ""),
+        orphans.length ? chip(`⚠ 헷지깨진 포지션 ${orphans.length}: ${orphans.map(o => o.symbol).join(",")}`, "bad") : ""
       ].join("");
 
       const entryControl = state.runtime?.entry_control || {};
@@ -720,6 +724,7 @@
         metric("오늘 체결수", pnl.ok ? (pnl.today_trades ?? 0) : "-"),
         metric("진입 가능", `${enterable}/${totalCand}`, enterable > 0 ? "good" : ""),
         metric("danger", danger, danger ? "bad" : "good"),
+        metric("헷지깨진 포지션", (strategyState.orphans || []).length, (strategyState.orphans || []).length ? "bad" : "good"),
       ].join("");
 
       // --- 런 성과: 심볼별 실현손익 ---
@@ -795,16 +800,39 @@
       $("strategyArtifacts").innerHTML = `<table><thead><tr><th>type</th><th>file</th><th>updated</th></tr></thead><tbody>${artifactRows || `<tr><td colspan="3" class="muted">no artifacts</td></tr>`}</tbody></table>`;
     }
 
+    async function fetchJson(path) {
+      const res = await fetch(path, { cache: "no-store" });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || `http_${res.status}`);
+      }
+      return data;
+    }
+
     async function refresh() {
-      const res = await fetch("/api/state");
-      state = await res.json();
-      render();
+      if (refreshInFlight) return;
+      refreshInFlight = true;
+      try {
+        state = await fetchJson("/api/state");
+        render();
+      } catch (error) {
+        console.error("[ops-console][refresh][error]", error);
+      } finally {
+        refreshInFlight = false;
+      }
     }
 
     async function refreshStrategy() {
-      const res = await fetch("/api/strategy/state");
-      strategyState = await res.json();
-      renderStrategy();
+      if (refreshStrategyInFlight) return;
+      refreshStrategyInFlight = true;
+      try {
+        strategyState = await fetchJson("/api/strategy/state");
+        renderStrategy();
+      } catch (error) {
+        console.error("[ops-console][refreshStrategy][error]", error);
+      } finally {
+        refreshStrategyInFlight = false;
+      }
     }
 
     function explainError(status, detail) {
@@ -867,7 +895,7 @@
 
     async function post(path, body) {
       const headers = {"Content-Type": "application/json"};
-      const res = await fetch(path, {method: "POST", headers, body: JSON.stringify(body)});
+      const res = await fetch(path, {method: "POST", headers, body: JSON.stringify(body), cache: "no-store"});
       const data = await res.json();
       const ok = Boolean(data.ok);
       const action = data.action || data.mode || path.split("/").slice(-1)[0];

@@ -10,7 +10,25 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except Exception:
+    def load_dotenv(path: str | Path | None = None, *, override: bool = False, **_: object) -> bool:  # type: ignore[no-redef]
+        if path in (None, ""):
+            return False
+        env_path = Path(path)
+        if not env_path.exists():
+            return False
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (override or key not in os.environ):
+                os.environ[key] = value
+        return True
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -27,6 +45,10 @@ OPEN_ORDER_STATUSES = (
     "SUBMITTED",
     "UPDATED",
 )
+
+INFERRED_LINK_WINDOW_MS = 10_000
+QTY_MATCH_REL_TOL = 1e-6
+QTY_MATCH_ABS_TOL = 1e-9
 
 
 def now_utc_ms() -> int:
@@ -98,6 +120,128 @@ def placeholders(values: tuple[str, ...]) -> str:
 
 def check(status: str, name: str, detail: str) -> dict[str, str]:
     return {"status": status, "name": name, "detail": detail}
+
+
+def _float_value(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(float(value or 0))
+    except Exception:
+        return 0
+
+
+def _norm_text(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _qty_matches(expected: float, actual: float) -> bool:
+    tolerance = max(QTY_MATCH_ABS_TOL, abs(expected) * QTY_MATCH_REL_TOL)
+    return abs(expected - actual) <= tolerance
+
+
+def _infer_order_trade_links(
+    missing_orders: list[dict[str, Any]],
+    unlinked_trades: list[dict[str, Any]],
+    *,
+    window_ms: int = INFERRED_LINK_WINDOW_MS,
+) -> tuple[set[str], set[str], list[dict[str, Any]]]:
+    """Infer links when an exchange returns client ids in order rows but
+    exchange order ids in trade rows. The inference is intentionally narrow:
+    same exchange/symbol/side, timestamp inside the order lifecycle window,
+    and exact executed quantity after summing candidate fills.
+    """
+    used_trade_uuids: set[str] = set()
+    resolved_order_uuids: set[str] = set()
+    inferred_links: list[dict[str, Any]] = []
+
+    sorted_orders = sorted(missing_orders, key=lambda row: _int_value(row.get("order_start")))
+    sorted_trades = sorted(unlinked_trades, key=lambda row: _int_value(row.get("desktop_time_ms")))
+
+    for order in sorted_orders:
+        order_uuid = str(order.get("uuid") or "")
+        if not order_uuid:
+            continue
+        expected_qty = abs(_float_value(order.get("executed_qty")))
+        if expected_qty <= 0:
+            continue
+        order_start = _int_value(order.get("order_start"))
+        order_end = _int_value(order.get("order_end")) or order_start
+        lower = order_start - window_ms
+        upper = order_end + window_ms
+        candidates = [
+            trade
+            for trade in sorted_trades
+            if str(trade.get("uuid") or "") not in used_trade_uuids
+            and _norm_text(trade.get("exchange_name")) == _norm_text(order.get("exchange_name"))
+            and str(trade.get("symbol") or "").upper() == str(order.get("symbol") or "").upper()
+            and _norm_text(trade.get("side")) == _norm_text(order.get("side"))
+            and lower <= _int_value(trade.get("desktop_time_ms")) <= upper
+        ]
+        if not candidates:
+            continue
+
+        running_qty = 0.0
+        matched: list[dict[str, Any]] = []
+        for trade in candidates:
+            running_qty += abs(_float_value(trade.get("qty")))
+            matched.append(trade)
+            if _qty_matches(expected_qty, running_qty):
+                resolved_order_uuids.add(order_uuid)
+                matched_trade_uuids = [str(row.get("uuid") or "") for row in matched if row.get("uuid")]
+                used_trade_uuids.update(matched_trade_uuids)
+                weighted_notional = sum(abs(_float_value(row.get("qty"))) * _float_value(row.get("price")) for row in matched)
+                inferred_links.append(
+                    {
+                        "order_uuid": order_uuid,
+                        "exchange_name": order.get("exchange_name"),
+                        "symbol": order.get("symbol"),
+                        "side": order.get("side"),
+                        "order_id": order.get("order_id"),
+                        "client_order_id": order.get("client_order_id"),
+                        "trade_uuids": ",".join(matched_trade_uuids),
+                        "trade_order_ids": ",".join(str(row.get("order_id") or "") for row in matched if row.get("order_id")),
+                        "executed_qty": f"{expected_qty:.12f}",
+                        "trade_qty_sum": f"{running_qty:.12f}",
+                        "avg_trade_price": f"{(weighted_notional / running_qty):.12f}" if running_qty > 0 else "",
+                    }
+                )
+                break
+            if running_qty > expected_qty + max(QTY_MATCH_ABS_TOL, expected_qty * QTY_MATCH_REL_TOL):
+                break
+
+    return resolved_order_uuids, used_trade_uuids, inferred_links
+
+
+def _aggregate_missing_orders(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("exchange_name") or ""), str(row.get("symbol") or ""))
+        bucket = grouped.setdefault(
+            key,
+            {
+                "exchange_name": key[0],
+                "symbol": key[1],
+                "row_count": 0,
+                "exec_notional_sum": 0.0,
+                "executed_qty_sum": 0.0,
+            },
+        )
+        executed_qty = abs(_float_value(row.get("executed_qty")))
+        price = _float_value(row.get("avg_price")) or _float_value(row.get("price"))
+        bucket["row_count"] += 1
+        bucket["exec_notional_sum"] += abs(price * executed_qty)
+        bucket["executed_qty_sum"] += executed_qty
+    result = list(grouped.values())
+    for row in result:
+        row["exec_notional_sum"] = f"{float(row['exec_notional_sum']):.8f}"
+        row["executed_qty_sum"] = f"{float(row['executed_qty_sum']):.8f}"
+    return sorted(result, key=lambda row: (-float(row["exec_notional_sum"]), row["exchange_name"], row["symbol"]))
 
 
 def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, Any]:
@@ -233,15 +377,23 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         """,
         (account_label, logic, since_ms),
     )
-    filled_orders_missing_trade_rows = query_dicts(
+    filled_orders_missing_trade_details = query_dicts(
         conn,
         """
         SELECT
+            o.uuid,
             o.exchange_name,
             o.symbol,
-            COUNT(*) AS row_count,
-            ROUND(SUM(ABS(COALESCE(o.avg_price, o.price, 0) * o.executed_qty)), 8) AS exec_notional_sum,
-            ROUND(SUM(ABS(o.executed_qty)), 8) AS executed_qty_sum
+            o.side,
+            o.status,
+            o.qty,
+            o.executed_qty,
+            o.price,
+            o.avg_price,
+            o.order_id,
+            o.client_order_id,
+            o.order_start,
+            o.order_end
         FROM order_history o
         WHERE o.account_label = ?
           AND o.logic = ?
@@ -261,13 +413,10 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
                     OR (t.client_order_id IS NOT NULL AND t.client_order_id <> '' AND o.client_order_id IS NOT NULL AND o.client_order_id <> '' AND t.client_order_id = o.client_order_id)
                 )
           )
-        GROUP BY o.exchange_name, o.symbol
-        ORDER BY exec_notional_sum DESC, o.exchange_name, o.symbol
-        LIMIT 40
+        ORDER BY o.order_start, o.exchange_name, o.symbol
         """,
         (account_label, logic, since_ms, since_ms),
     )
-    filled_orders_missing_trade_count = sum(int(row["row_count"] or 0) for row in filled_orders_missing_trade_rows)
 
     trades_missing_order_ref = query_scalar(
         conn,
@@ -311,10 +460,21 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         """,
         (account_label, logic, since_ms),
     )
-    trades_unlinked_to_order = query_scalar(
+    trades_unlinked_to_order_rows = query_dicts(
         conn,
         """
-        SELECT COUNT(DISTINCT t.uuid)
+        SELECT
+            t.uuid,
+            t.exchange_name,
+            t.symbol,
+            t.side,
+            t.qty,
+            t.price,
+            t.order_uuid,
+            t.order_id,
+            t.client_order_id,
+            t.trade_id,
+            t.desktop_time_ms
         FROM trade_history t
         LEFT JOIN order_history ou
           ON t.order_uuid IS NOT NULL
@@ -342,9 +502,23 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
           AND ou.uuid IS NULL
           AND oo.uuid IS NULL
           AND oc.uuid IS NULL
+        ORDER BY t.desktop_time_ms, t.exchange_name, t.symbol
         """,
         (account_label, logic, since_ms),
     )
+    inferred_order_uuids, inferred_trade_uuids, inferred_links = _infer_order_trade_links(
+        filled_orders_missing_trade_details,
+        trades_unlinked_to_order_rows,
+    )
+    unresolved_missing_order_details = [
+        row for row in filled_orders_missing_trade_details if str(row.get("uuid") or "") not in inferred_order_uuids
+    ]
+    unresolved_unlinked_trade_rows = [
+        row for row in trades_unlinked_to_order_rows if str(row.get("uuid") or "") not in inferred_trade_uuids
+    ]
+    filled_orders_missing_trade_rows = _aggregate_missing_orders(unresolved_missing_order_details)
+    filled_orders_missing_trade_count = len(unresolved_missing_order_details)
+    trades_unlinked_to_order = len(unresolved_unlinked_trade_rows)
 
     symbol_exchange_notional: dict[str, dict[str, float]] = defaultdict(dict)
     for row in trade_counts:
@@ -377,7 +551,7 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             f"rows={trade_rows}" if trade_rows > 0 else "rows=0 empty_run_ok",
         ),
         check("PASS" if run_open_like_count == 0 else "FAIL", "run_open_like_orders_zero", f"rows={run_open_like_count}"),
-        check("PASS" if all_open_like_count == 0 else "WARN", "all_open_like_orders_zero", f"rows={all_open_like_count}"),
+        check("INFO", "historical_open_like_orders", f"rows={all_open_like_count} current_run_verdict_uses_run_open_like_only"),
         check(
             "PASS" if orders_missing_external_id == 0 else "WARN",
             "orders_have_external_id_or_client_id",
@@ -440,6 +614,14 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         "run_meta": run_meta,
         "account_label": account_label,
         "logic": logic,
+        "scope": {
+            "since_ms": since_ms,
+            "since_utc": iso_utc(since_ms),
+            "account_label": account_label,
+            "logic": logic,
+            "current_run_verdict": True,
+            "historical_open_like_orders_informational": True,
+        },
         "verdict": verdict,
         "fail_count": fail_count,
         "warn_count": warn_count,
@@ -453,6 +635,7 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
             "filled_orders_missing_trade_rows": filled_orders_missing_trade_count,
             "trades_missing_order_ref": trades_missing_order_ref,
             "trades_unlinked_to_order": trades_unlinked_to_order,
+            "inferred_order_trade_links": len(inferred_links),
         },
         "order_status_counts": order_status_counts,
         "trade_counts": trade_counts,
@@ -462,6 +645,9 @@ def build_report(conn, *, since_ms: int, run_meta: dict[str, Any]) -> dict[str, 
         "duplicate_client_order_ids": duplicate_client_order_ids,
         "executed_qty_over_qty": executed_qty_over_qty,
         "filled_orders_missing_trade_rows": filled_orders_missing_trade_rows,
+        "filled_orders_missing_trade_details": unresolved_missing_order_details,
+        "trades_unlinked_to_order_rows": unresolved_unlinked_trade_rows,
+        "inferred_order_trade_links": inferred_links,
         "duplicate_trade_ids": duplicate_trade_ids,
         "notional_balance_warnings": notional_balance_warnings,
     }
@@ -495,6 +681,12 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append(f"- since_utc: {report['since_utc']}")
     if report.get("run_meta", {}).get("started_at_iso"):
         lines.append(f"- run_started_at_utc: {report['run_meta'].get('started_at_iso')}")
+    scope = report.get("scope") or {}
+    if scope:
+        lines.append(f"- account_label: {scope.get('account_label')}")
+        lines.append(f"- logic: {scope.get('logic')}")
+        lines.append(f"- current_run_verdict: {scope.get('current_run_verdict')}")
+        lines.append(f"- historical_open_like_orders_informational: {scope.get('historical_open_like_orders_informational')}")
     lines.append("")
     lines.append("## Checks")
     for item in report["checks"]:
@@ -513,7 +705,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("## Run Open-Like Orders")
     lines.extend(markdown_table(report["run_open_like_orders"], ["exchange_name", "symbol", "status", "row_count"]))
     lines.append("")
-    lines.append("## All Open-Like Orders")
+    lines.append("## Historical Open-Like Orders")
+    lines.append("- informational only; final verdict uses Run Open-Like Orders")
     lines.extend(markdown_table(report["all_open_like_orders"], ["exchange_name", "symbol", "status", "row_count"]))
     lines.append("")
     lines.append("## Duplicate Order IDs")
@@ -527,6 +720,18 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append("## Filled Orders Missing Trade Rows")
     lines.extend(markdown_table(report["filled_orders_missing_trade_rows"], ["exchange_name", "symbol", "row_count", "exec_notional_sum", "executed_qty_sum"]))
+    lines.append("")
+    lines.append("## Inferred Order/Trade Links")
+    lines.append("- exact identifier links are preferred; inferred links require same exchange/symbol/side, close timestamps, and matching fill quantity")
+    lines.extend(
+        markdown_table(
+            report["inferred_order_trade_links"],
+            ["exchange_name", "symbol", "side", "order_uuid", "trade_order_ids", "executed_qty", "trade_qty_sum", "avg_trade_price"],
+        )
+    )
+    lines.append("")
+    lines.append("## Unresolved Unlinked Trades")
+    lines.extend(markdown_table(report["trades_unlinked_to_order_rows"], ["uuid", "exchange_name", "symbol", "side", "qty", "price", "order_id", "desktop_time_ms"]))
     lines.append("")
     lines.append("## Duplicate Trade IDs")
     lines.extend(markdown_table(report["duplicate_trade_ids"], ["exchange_name", "symbol", "trade_id", "row_count"]))
