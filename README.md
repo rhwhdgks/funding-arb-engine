@@ -164,6 +164,9 @@ observed_duration=24h 0m 3s
 - [docs/development_requirements_checklist.md](docs/development_requirements_checklist.md): 요구사항 반영 상태
 - [docs/question4_comparison.md](docs/question4_comparison.md): reference 구현과의 비교
 - [docs/strategy_quality_roadmap.md](docs/strategy_quality_roadmap.md): 전략 품질 개선 로드맵
+- [docs/strategy_experiment_loop.md](docs/strategy_experiment_loop.md): 전략만 교체해 실험하는 표준 루프
+- [docs/strategy_evaluation_criteria.md](docs/strategy_evaluation_criteria.md): expected/actual edge와 체결 품질 평가 기준
+- [docs/strategy_live_operations_runbook.md](docs/strategy_live_operations_runbook.md): 새 전략을 실거래로 옮기는 운영 절차
 - [test_server/README.md](test_server/README.md): 테스트 서버 실행 가이드
 
 ## Safety Notes
