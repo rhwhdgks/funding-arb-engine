@@ -5270,7 +5270,9 @@ async def execute_control_plane_command(
     command: StrategyControlCommand,
 ) -> None:
     try:
-        if command.command_type == "paper-order":
+        if command.command_type == "health-check":
+            result = control_service.build_health_check()
+        elif command.command_type == "paper-order":
             result = await console_paper_order(control_service.runtime_adapter, command.payload)
         elif command.command_type == "live-limit":
             result = await console_live_limit_order(

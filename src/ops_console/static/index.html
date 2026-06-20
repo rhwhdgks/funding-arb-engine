@@ -104,6 +104,7 @@
     button.danger { background: var(--bad); color: #1f0805; }
     button.market { background: var(--warn); color: #2a1c05; }
     button.hedge { background: #5bbfb0; color: #06201c; }
+    button.inline { width: auto; padding: 0.42rem 0.65rem; border-radius: 0.55rem; font-size: 0.78rem; }
     button:disabled { opacity: 0.48; cursor: not-allowed; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
     .chips { display: flex; gap: 0.45rem; flex-wrap: wrap; justify-content: flex-end; }
@@ -310,8 +311,11 @@
         <div id="strategyRecent"></div>
       </section>
       <section class="card">
-        <h2>리포트 산출물</h2>
-        <div id="strategyArtifacts"></div>
+        <h2>
+          <span>운영 헬스 체크</span>
+          <button id="strategyHealthBtn" class="secondary inline">Health check</button>
+        </h2>
+        <div id="strategyHealth">아직 실행 전</div>
       </section>
     </section>
   </main>
@@ -320,8 +324,10 @@
     const $ = (id) => document.getElementById(id);
     let state = null;
     let strategyState = null;
+    let strategyHealthState = null;
     let refreshInFlight = false;
     let refreshStrategyInFlight = false;
+    let strategyHealthInFlight = false;
 
     function fmt(v, d = 4) {
       const n = Number(v);
@@ -701,6 +707,47 @@
       return { cls: "good", label: "정상" };
     }
 
+    function healthClass(status) {
+      const normalized = String(status || "").toUpperCase();
+      if (normalized === "PASS" || normalized === "INFO") return "good";
+      if (normalized === "WARN") return "warn";
+      if (normalized === "FAIL" || normalized === "UNAVAILABLE") return "bad";
+      return "";
+    }
+
+    function renderStrategyHealth() {
+      const btn = $("strategyHealthBtn");
+      if (btn) {
+        btn.disabled = strategyHealthInFlight;
+        btn.textContent = strategyHealthInFlight ? "checking..." : "Health check";
+      }
+      if (!strategyHealthState) {
+        const health = strategyState?.health || {};
+        const runtime = strategyState?.runtime || {};
+        const danger = Number(health.danger_total || 0);
+        const orphans = (strategyState?.orphans || []).length;
+        $("strategyHealth").innerHTML = `
+          <div class="muted">버튼을 누르면 전략 프로세스 내부 command queue에서 현재 상태를 판정합니다.</div>
+          <table><tbody>
+            <tr><td>runtime</td><td class="${runtime.running ? "good" : "bad"}">${runtime.running ? "RUNNING" : "STOPPED"}</td></tr>
+            <tr><td>danger</td><td class="${danger ? "bad" : "good"}">${danger}</td></tr>
+            <tr><td>orphan</td><td class="${orphans ? "bad" : "good"}">${orphans}</td></tr>
+          </tbody></table>`;
+        return;
+      }
+      const verdict = String(strategyHealthState.verdict || "-").toUpperCase();
+      const checks = strategyHealthState.checks || [];
+      const rows = checks.map(row => {
+        const cls = healthClass(row.status);
+        return `<tr><td class="${cls}">${row.status || "-"}</td><td>${row.name || "-"}</td><td>${row.detail || "-"}</td></tr>`;
+      }).join("");
+      const summary = strategyHealthState.summary || {};
+      $("strategyHealth").innerHTML = `
+        <div class="${healthClass(verdict)}" style="font-weight:800">verdict=${verdict} · failures=${strategyHealthState.failures || 0} · warnings=${strategyHealthState.warnings || 0}</div>
+        <div class="muted">${shortTime(strategyHealthState.generated_at_utc)} · source=${strategyHealthState.source_status || "-"} · data_age=${strategyHealthState.data_age_ms ?? "-"}ms · open_pairs=${summary.open_pairs ?? "-"}</div>
+        <table><thead><tr><th>status</th><th>check</th><th>detail</th></tr></thead><tbody>${rows || `<tr><td colspan="3" class="muted">checks 없음</td></tr>`}</tbody></table>`;
+    }
+
     function renderStrategy() {
       if (!strategyState) return;
       const runtime = strategyState.runtime || {};
@@ -795,9 +842,7 @@
       }).join("");
       $("strategyRecent").innerHTML = `<table><thead><tr><th>time</th><th>event</th><th>detail</th></tr></thead><tbody>${recentRows || `<tr><td colspan="3" class="muted">거래/사고 이벤트 없음 (스캔만 진행 중)</td></tr>`}</tbody></table>`;
 
-      // --- artifacts ---
-      const artifactRows = Object.entries(strategyState.artifacts || {}).map(([name, row]) => `<tr><td>${name}</td><td class="mono">${String(row.path).split("/").pop()}</td><td>${new Date(row.mtime_ms).toLocaleString()}</td></tr>`).join("");
-      $("strategyArtifacts").innerHTML = `<table><thead><tr><th>type</th><th>file</th><th>updated</th></tr></thead><tbody>${artifactRows || `<tr><td colspan="3" class="muted">no artifacts</td></tr>`}</tbody></table>`;
+      renderStrategyHealth();
     }
 
     async function fetchJson(path) {
@@ -832,6 +877,45 @@
         console.error("[ops-console][refreshStrategy][error]", error);
       } finally {
         refreshStrategyInFlight = false;
+      }
+    }
+
+    async function runStrategyHealthCheck() {
+      if (strategyHealthInFlight) return;
+      strategyHealthInFlight = true;
+      renderStrategyHealth();
+      try {
+        const res = await fetch("/api/strategy/health-check", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: "{}",
+          cache: "no-store"
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || data.verdict || `http_${res.status}`);
+        }
+        strategyHealthState = data;
+      } catch (error) {
+        strategyHealthState = {
+          ok: false,
+          verdict: "UNAVAILABLE",
+          generated_at_utc: new Date().toISOString(),
+          data_age_ms: null,
+          source_status: "error",
+          failures: 1,
+          warnings: 0,
+          summary: {},
+          checks: [{
+            status: "FAIL",
+            name: "health_check_request",
+            detail: String(error.message || error)
+          }]
+        };
+        console.error("[ops-console][healthCheck][error]", error);
+      } finally {
+        strategyHealthInFlight = false;
+        renderStrategyHealth();
       }
     }
 
@@ -1023,6 +1107,7 @@
     $("resumeBtn").onclick = () => post("/api/runtime/resume-entry", {reason: "ops_console_manual_resume"});
     $("exchangeTab").onclick = () => setTab("exchange");
     $("strategyTab").onclick = () => setTab("strategy");
+    $("strategyHealthBtn").onclick = () => runStrategyHealthCheck();
     function applyQtyFraction(frac) {
       const {exchangeState, symbolState} = selectedOrderState();
       const report = exchangeState?.balance_report || {};

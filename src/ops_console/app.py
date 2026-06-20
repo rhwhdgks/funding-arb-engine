@@ -117,6 +117,30 @@ async def api_strategy_state() -> dict[str, Any]:
     return JSONResponse(build_strategy_dashboard_state(), headers=_no_cache_headers())
 
 
+@app.post("/api/strategy/health-check")
+async def api_strategy_health_check() -> dict[str, Any]:
+    service = active_service()
+    if service is None:
+        return JSONResponse(
+            {
+                "ok": False,
+                "verdict": "UNAVAILABLE",
+                "detail": "strategy_attached_console_required",
+                "source_status": "standalone_legacy",
+            },
+            status_code=409,
+            headers=_no_cache_headers(),
+        )
+    try:
+        return JSONResponse(
+            await service.submit_command("health-check", {}, ops_token=None, timeout_sec=10.0),
+            headers=_no_cache_headers(),
+        )
+    except Exception as exc:
+        _raise_http_error(exc)
+        raise
+
+
 @app.post("/api/order/paper")
 async def api_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
     try:

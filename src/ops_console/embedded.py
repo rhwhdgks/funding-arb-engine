@@ -70,6 +70,15 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
 @dataclass
 class StrategyControlCommand:
     command_type: str
@@ -425,6 +434,141 @@ class StrategyControlService:
                     for (exchange, symbol), until_ms in sorted(self.assumed_flat_until_ms.items())
                 ],
                 "recent_close_symbols": dict(self.symbol_recent_close_ms),
+            },
+        }
+
+    def build_health_check(self) -> dict[str, Any]:
+        state = self.build_strategy_state()
+        generated_at_ms = now_ms()
+        events = state.get("events") or {}
+        counts = events.get("counts") or {}
+        top_counts = events.get("top_counts") or {}
+        health = state.get("health") or {}
+        runtime = state.get("runtime") or {}
+        api_pressure = state.get("api_pressure") or {}
+        checks: list[dict[str, Any]] = []
+
+        def event_count(name: str) -> int:
+            return _safe_int(counts.get(name, top_counts.get(name, 0)))
+
+        def add_check(status: str, name: str, detail: str, metrics: dict[str, Any] | None = None) -> None:
+            checks.append(
+                {
+                    "status": status,
+                    "name": name,
+                    "detail": detail,
+                    "metrics": metrics or {},
+                }
+            )
+
+        hard_event_counts = {
+            event_name: event_count(event_name)
+            for event_name in sorted(DANGER_EVENT_TYPES | {"pair_orphan_marked"})
+        }
+        hard_total = sum(hard_event_counts.values())
+        add_check(
+            "PASS" if hard_total == 0 else "FAIL",
+            "hard_failure_events_zero",
+            f"count={hard_total}",
+            hard_event_counts,
+        )
+
+        orphan_count = len(state.get("orphans") or [])
+        add_check(
+            "PASS" if orphan_count == 0 else "FAIL",
+            "active_orphans_empty",
+            f"count={orphan_count}",
+        )
+
+        source_status = str(state.get("source_status") or "")
+        add_check(
+            "PASS" if source_status in {"live", "stopping"} else "WARN",
+            "strategy_projection_live",
+            f"source_status={source_status or '-'}",
+        )
+
+        max_data_age_ms = _safe_int(os.getenv("OPS_CONSOLE_HEALTH_MAX_DATA_AGE_MS"), 15000)
+        data_age_ms = _safe_int(state.get("data_age_ms"))
+        add_check(
+            "PASS" if data_age_ms <= max_data_age_ms else "WARN",
+            "strategy_projection_fresh",
+            f"data_age_ms={data_age_ms} max={max_data_age_ms}",
+        )
+
+        entry_control = runtime.get("entry_control") or {}
+        entry_error = str(entry_control.get("error") or "")
+        add_check(
+            "PASS" if not entry_error else "WARN",
+            "entry_control_readable",
+            entry_error or f"entry_paused={bool(entry_control.get('entry_paused'))}",
+        )
+
+        startup_block_reasons = (state.get("meta") or {}).get("startup_block_reasons") or []
+        add_check(
+            "PASS" if not startup_block_reasons else "FAIL",
+            "startup_block_reasons_empty",
+            f"count={len(startup_block_reasons)}",
+            {"reasons": startup_block_reasons},
+        )
+
+        api_failures = 0
+        api_warnings = 0
+        api_metrics: dict[str, Any] = {}
+        for exchange_name, row in (api_pressure.get("exchanges") or {}).items():
+            max_usage = max(
+                _safe_float(row.get("max_request_weight_usage_1m")),
+                _safe_float(row.get("max_order_count_usage_1m")),
+                _safe_float(row.get("max_order_count_usage_10s")),
+            )
+            violations = _safe_int(row.get("rate_limit_violations"))
+            bans = _safe_int(row.get("ip_ban_events"))
+            retry_exhausted = _safe_int(row.get("retry_exhausted"))
+            if violations > 0 or bans > 0:
+                api_failures += 1
+            elif max_usage >= 0.85 or retry_exhausted > 0:
+                api_warnings += 1
+            api_metrics[str(exchange_name)] = {
+                "max_usage": max_usage,
+                "rate_limit_violations": violations,
+                "ip_ban_events": bans,
+                "retry_exhausted": retry_exhausted,
+            }
+        api_status = "FAIL" if api_failures else ("WARN" if api_warnings else "PASS")
+        add_check(
+            api_status,
+            "api_pressure_within_limits",
+            f"failures={api_failures} warnings={api_warnings}",
+            api_metrics,
+        )
+
+        open_pair_ids = (state.get("meta") or {}).get("open_pair_ids") or []
+        add_check(
+            "INFO",
+            "open_pairs_current",
+            f"count={len(open_pair_ids)}",
+            {"pair_ids": open_pair_ids},
+        )
+
+        failures = [row for row in checks if row.get("status") == "FAIL"]
+        warnings = [row for row in checks if row.get("status") == "WARN"]
+        verdict = "FAIL" if failures else ("WARN" if warnings else "PASS")
+        return {
+            "ok": True,
+            "verdict": verdict,
+            "generated_at_ms": generated_at_ms,
+            "generated_at_utc": _utc_now_iso(),
+            "data_age_ms": data_age_ms,
+            "source_status": source_status,
+            "failures": len(failures),
+            "warnings": len(warnings),
+            "checks": checks,
+            "summary": {
+                "running": bool(runtime.get("running")),
+                "duration": runtime.get("duration"),
+                "symbols": runtime.get("symbols") or [],
+                "open_pairs": len(open_pair_ids),
+                "danger_total": _safe_int(health.get("danger_total")),
+                "orphans": orphan_count,
             },
         }
 
