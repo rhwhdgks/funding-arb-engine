@@ -4,10 +4,11 @@ import asyncio
 import contextlib
 import os
 import time
+import uuid
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import uvicorn
 
@@ -79,6 +80,58 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _payload_dict(payload: Any) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    if isinstance(payload, dict):
+        return dict(payload)
+    model_dump = getattr(payload, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return dict(model_dump())
+        except Exception:
+            return {}
+    legacy_dict = getattr(payload, "dict", None)
+    if callable(legacy_dict):
+        try:
+            return dict(legacy_dict())
+        except Exception:
+            return {}
+    return {}
+
+
+def command_payload_summary(payload: Any) -> dict[str, Any]:
+    raw = _payload_dict(payload)
+    allowed_keys = {
+        "exchange",
+        "symbol",
+        "side",
+        "order_type",
+        "quantity",
+        "price",
+        "reduce_only",
+        "hedge_mode",
+        "hedge_exchange",
+        "ownership_mode",
+        "confirm",
+        "wait_sec",
+        "reason",
+    }
+    summary: dict[str, Any] = {}
+    for key in sorted(allowed_keys):
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if value is None:
+            continue
+        summary[key] = value
+    return summary
+
+
+def new_control_command_id() -> str:
+    return f"cmd-{now_ms()}-{uuid.uuid4().hex[:8]}"
+
+
 @dataclass
 class StrategyControlCommand:
     command_type: str
@@ -86,6 +139,7 @@ class StrategyControlCommand:
     response_future: asyncio.Future[Any]
     ops_token: str | None = None
     enqueued_at_ms: int = field(default_factory=now_ms)
+    command_id: str = field(default_factory=new_control_command_id)
 
 
 class StrategyControlProjection:
@@ -207,6 +261,7 @@ class StrategyControlService:
         symbol_recent_close_ms: dict[str, int],
         wake_queue: asyncio.Queue[tuple[str, str, int]],
         command_queue: asyncio.Queue[StrategyControlCommand],
+        event_sink: Callable[..., None] | None = None,
     ) -> None:
         self.config = config
         self.exchanges = exchanges
@@ -218,6 +273,7 @@ class StrategyControlService:
         self.symbol_recent_close_ms = symbol_recent_close_ms
         self.wake_queue = wake_queue
         self.command_queue = command_queue
+        self.event_sink = event_sink
         self.stale_ms = int(os.getenv("OPS_CONSOLE_STALE_MS", "1500"))
         self.account_label = resolve_account_label()
         self.logic = resolve_logic_name()
@@ -226,6 +282,7 @@ class StrategyControlService:
         self.startup_block_reasons: tuple[str, ...] = ()
         self.last_error: str = ""
         self.state_last_built_ms: int = 0
+        self.extra_active_symbols_provider = None
         self.projection = StrategyControlProjection(started_at_ms=self.started_at_ms)
         self.runtime_adapter = StrategyConsoleRuntimeAdapter(self)
         self._refresh_task: asyncio.Task[Any] | None = None
@@ -272,10 +329,47 @@ class StrategyControlService:
             if getattr(pair, "status", "") in {"closed", "failed"}:
                 continue
             active[str(pair_id)] = normalize_symbol(getattr(pair, "symbol", ""))
+        provider = self.extra_active_symbols_provider
+        if callable(provider):
+            try:
+                for symbol in provider() or set():
+                    normalized = normalize_symbol(str(symbol))
+                    if normalized:
+                        active[f"maker:{normalized}"] = normalized
+            except Exception as exc:
+                self.last_error = f"active maker symbol provider failed: {exc!r}"
         return active
 
     def record_event(self, row: dict[str, Any]) -> None:
         self.projection.record_event(row)
+
+    def audit_event(self, event_type: str, **payload: Any) -> None:
+        if self.event_sink is not None:
+            self.event_sink(event_type, **payload)
+            return
+        row = {
+            "ts_ms": now_ms(),
+            "ts_utc": _utc_now_iso(),
+            "event_type": event_type,
+            **payload,
+        }
+        self.record_event(row)
+
+    def audit_command_event(
+        self,
+        event_type: str,
+        command: StrategyControlCommand,
+        **payload: Any,
+    ) -> None:
+        self.audit_event(
+            event_type,
+            command_id=command.command_id,
+            command_type=command.command_type,
+            enqueued_at_ms=command.enqueued_at_ms,
+            payload_summary=command_payload_summary(command.payload),
+            ops_token_present=bool(command.ops_token),
+            **payload,
+        )
 
     def build_single_exchange_state(self, exchange_name: str) -> dict[str, Any]:
         exchange = self.exchanges[exchange_name]
@@ -592,7 +686,27 @@ class StrategyControlService:
         with contextlib.suppress(asyncio.QueueFull):
             self.wake_queue.put_nowait(("control", command_type, now_ms()))
         wait_timeout = timeout_sec or float(os.getenv("OPS_CONSOLE_COMMAND_TIMEOUT_SEC", "30.0"))
-        return await asyncio.wait_for(future, timeout=wait_timeout)
+        self.audit_command_event(
+            "ops_console_command_enqueued",
+            command,
+            queue_size=self.command_queue.qsize(),
+            wait_timeout_sec=wait_timeout,
+        )
+        try:
+            result = await asyncio.wait_for(future, timeout=wait_timeout)
+            if isinstance(result, dict):
+                enriched = dict(result)
+                enriched.setdefault("command_id", command.command_id)
+                return enriched
+            return {"ok": True, "command_id": command.command_id, "result": result}
+        except asyncio.TimeoutError:
+            self.audit_command_event(
+                "ops_console_command_wait_timeout",
+                command,
+                wait_timeout_sec=wait_timeout,
+                age_ms=now_ms() - command.enqueued_at_ms,
+            )
+            raise
 
 
 class EmbeddedControlServer:

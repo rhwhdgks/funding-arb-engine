@@ -30,6 +30,11 @@ KEY_EVENT_TYPES = (
     "pair_neutralized_after_close_failure",
     "entry_quality_analysis",
     "api_pressure_summary",
+    "ops_console_command_enqueued",
+    "ops_console_command_started",
+    "ops_console_command_completed",
+    "ops_console_command_failed",
+    "ops_console_command_wait_timeout",
     "shutdown_cleanup_started",
     "shutdown_cleanup_done",
 )

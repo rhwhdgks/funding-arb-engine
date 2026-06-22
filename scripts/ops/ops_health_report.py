@@ -328,7 +328,13 @@ def collect_ops_console_http_report(*, running: bool, required: bool) -> dict[st
                 payload = parsed if isinstance(parsed, dict) else {"raw": parsed}
             except Exception:
                 payload = {"raw": body[:300]}
-            ok = 200 <= status_code < 300 and bool(payload.get("ok", True))
+            source_status = str(payload.get("source_status") or "")
+            ok = (
+                200 <= status_code < 300
+                and bool(payload.get("ok", True))
+                and bool(payload.get("embedded"))
+                and source_status == "strategy_attached"
+            )
     except (OSError, URLError, TimeoutError) as exc:
         error = str(exc)
     except Exception as exc:
@@ -339,7 +345,8 @@ def collect_ops_console_http_report(*, running: bool, required: bool) -> dict[st
         check(
             status,
             "ops_console_healthz_ok",
-            f"url={url} status_code={status_code} running={running} error={error or ''}",
+            f"url={url} status_code={status_code} running={running} "
+            f"source_status={payload.get('source_status') or ''} error={error or ''}",
         )
     )
     return {
@@ -770,14 +777,24 @@ def build_payload(args: argparse.Namespace) -> dict[str, Any]:
         strategy_running=strategy_running,
     )
     collector_logs = collect_collector_log_report(symbol_stdout, tail_count=args.tail_lines)
-    ops_console = collect_ops_console_http_report(running=bool(services[2].get("running")), required=args.require_ops_console)
-    if not services[2].get("running") and ops_console.get("ok"):
+    legacy_console_detected = bool(services[2].get("running"))
+    ops_console = collect_ops_console_http_report(running=legacy_console_detected, required=args.require_ops_console)
+    if ops_console.get("ok"):
         services[2]["running"] = True
         services[2]["checks"] = [
             check(
                 "PASS",
                 "ops_console_process_running",
                 "running=embedded_http_only pid_file_pid=None pgrep_count=0 pids=[]",
+            )
+        ]
+    elif legacy_console_detected:
+        services[2]["running"] = False
+        services[2]["checks"] = [
+            check(
+                "FAIL" if args.require_ops_console else "WARN",
+                "ops_console_process_running",
+                "legacy_standalone_detected=true standalone_disabled=true",
             )
         ]
     db = collect_db_report(exchanges=exchanges, interval_sec=interval_sec)

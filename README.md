@@ -107,7 +107,7 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label
 
 ## Ops Console
 
-Ops Console은 전략 프로세스에 내장된 control plane에 붙는 thin client입니다. 콘솔이 별도 exchange polling session을 만들지 않으므로, 브라우저를 열어도 전략과 별개의 API pressure가 생기지 않습니다.
+Ops Console은 전략 프로세스에 내장된 control plane입니다. 전략이 켜질 때 같이 뜨며, 콘솔이 별도 exchange polling session을 만들지 않으므로 브라우저를 열어도 전략과 별개의 API pressure가 생기지 않습니다.
 
 ```env
 OPS_CONSOLE_HOST=127.0.0.1
@@ -126,11 +126,7 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
 http://127.0.0.1:8010
 ```
 
-디버깅 목적의 legacy standalone console은 명시적으로만 사용합니다.
-
-```bash
-OPS_CONSOLE_FORCE_STANDALONE=1 STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh start
-```
+전략이 꺼져 있으면 콘솔도 사용할 수 없습니다. `run_ops_console.sh start/status/health`는 전략 내장 콘솔이 살아 있는지만 확인하며, standalone backend는 시작하지 않습니다.
 
 ## Reports
 

@@ -83,13 +83,12 @@ normal close fee gate는 정상 자동청산에서만 수수료/슬리피지 대
 
 | 변수 | 역할 |
 | --- | --- |
-| `OPS_CONSOLE_HOST` | embedded control server 또는 standalone console의 bind host. 로컬 전용은 `127.0.0.1`, 외부 장비 접속은 `0.0.0.0` |
-| `OPS_CONSOLE_PORT` | embedded control server 또는 standalone console의 포트. 기본 `8010` |
+| `OPS_CONSOLE_HOST` | strategy-attached embedded control server의 bind host. 로컬 전용은 `127.0.0.1`, 외부 장비 접속은 `0.0.0.0` |
+| `OPS_CONSOLE_PORT` | strategy-attached embedded control server의 포트. 기본 `8010` |
 | `ENABLE_WEB_TRADING` | console 실주문 버튼 활성화 여부 |
 | `OPS_CONSOLE_ACTION_TOKEN_REQUIRED` | 실행 요청에 `X-OPS-TOKEN`을 요구할지 여부 |
 | `OPS_CONSOLE_ACTION_TOKEN` | 주문/청산/entry pause 실행 요청용 토큰 |
 | `OPS_CONSOLE_STALE_MS` | console 주문 전 market data stale 판단 기준 |
-| `OPS_CONSOLE_FORCE_STANDALONE` | `1`이면 전략 내장형 대신 legacy standalone console backend 강제 실행. 기본 운영에서는 비워둠 |
 
 기본 운영은 `OPS_CONSOLE_HOST=127.0.0.1`입니다. 같은 PC 브라우저에서만 console을 볼 수 있고, 별도 token 없이도 로컬 운영이 가능합니다. 폰이나 다른 장비에서 접속하려면 VPN/터널과 action token을 같이 둡니다.
 
@@ -97,7 +96,7 @@ normal close fee gate는 정상 자동청산에서만 수수료/슬리피지 대
 
 - 전략이 실행 중이면 `OPS_CONSOLE_*` 값은 전략 프로세스가 직접 사용합니다.
 - `run_ops_console.sh status/health`는 embedded console도 정상 상태로 인식합니다.
-- standalone console은 거래소 세션을 따로 여는 legacy 디버깅 경로이므로, 장기 운영에서는 기본값으로 두지 않습니다.
+- 전략이 꺼져 있으면 console도 사용할 수 없습니다. standalone console은 거래소 세션 분리 리스크 때문에 사용하지 않습니다.
 
 ## 운영 메모
 

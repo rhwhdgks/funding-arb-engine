@@ -5265,10 +5265,188 @@ async def console_confirm_close(pair: OpenPairState, config: StrategyConfig) -> 
     return answer.strip().lower() in {"y", "yes"}
 
 
+def _control_command_symbol(command: StrategyControlCommand) -> str:
+    payload = getattr(command, "payload", None)
+    return str(getattr(payload, "symbol", "") or "").strip().upper()
+
+
+def _control_command_result_summary(result: Any) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return {"result_type": type(result).__name__}
+
+    summary: dict[str, Any] = {}
+    for key in (
+        "ok",
+        "action",
+        "mode",
+        "exchange",
+        "symbol",
+        "side",
+        "noop",
+        "reason",
+        "hedge_exchange",
+        "hedge_side",
+        "hedge_quantity",
+        "filled_qty",
+        "remaining_qty",
+        "net_exposure_before",
+    ):
+        if key in result and result.get(key) is not None:
+            summary[key] = result.get(key)
+
+    hedge = result.get("hedge")
+    if isinstance(hedge, dict):
+        summary["hedge"] = {
+            key: hedge.get(key)
+            for key in (
+                "ok",
+                "skipped",
+                "reason",
+                "exchange",
+                "symbol",
+                "side",
+                "quantity",
+                "filled_qty",
+                "remaining_qty",
+            )
+            if key in hedge and hedge.get(key) is not None
+        }
+
+    results = result.get("results")
+    if isinstance(results, list):
+        summary["result_count"] = len(results)
+        summary["result_ok_count"] = sum(1 for row in results if isinstance(row, dict) and row.get("ok"))
+        summary["result_exchanges"] = [
+            row.get("exchange")
+            for row in results
+            if isinstance(row, dict) and row.get("exchange")
+        ][:8]
+
+    entry_control = result.get("entry_control")
+    if isinstance(entry_control, dict):
+        summary["entry_paused"] = bool(entry_control.get("entry_paused"))
+        summary["entry_reason"] = entry_control.get("reason")
+
+    ownership = result.get("ownership")
+    if isinstance(ownership, dict):
+        summary["ownership_status"] = ownership.get("status") or ownership.get("state")
+        summary["ownership_symbol"] = ownership.get("symbol")
+
+    return summary
+
+
+def _control_command_error_summary(exc: Exception) -> dict[str, Any]:
+    return {
+        "error_type": type(exc).__name__,
+        "error_message": str(exc)[:800],
+    }
+
+
+async def reconcile_manual_pair_after_control_command(
+    control_service: StrategyControlService,
+    command: StrategyControlCommand,
+    result: dict[str, Any],
+) -> None:
+    if command.command_type not in {"flatten-symbol", "rebalance-hedge"}:
+        return
+    if not isinstance(result, dict) or not result.get("ok"):
+        return
+
+    symbol = _control_command_symbol(command)
+    if not symbol:
+        return
+
+    open_pairs = control_service.open_pairs
+    exchanges = control_service.exchanges
+    config = control_service.config
+    matching_pairs = [
+        (pair_id, pair)
+        for pair_id, pair in list(open_pairs.items())
+        if str(getattr(pair, "symbol", "")).upper() == symbol
+        and getattr(pair, "status", "") not in {"closed", "failed"}
+    ]
+    for pair_id, pair in matching_pairs:
+        try:
+            long_qty = extract_position_qty(exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol))
+            short_qty = extract_position_qty(exchanges[pair.short_exchange].get_symbol_snapshot(pair.symbol))
+        except Exception as exc:
+            record_live_event(
+                config,
+                "pair_manual_intervention_reconcile_error",
+                pair=pair_event_payload(pair),
+                command_type=command.command_type,
+                error=repr(exc),
+            )
+            continue
+
+        record_live_event(
+            config,
+            "pair_manual_intervention_observed",
+            pair=pair_event_payload(pair),
+            command_type=command.command_type,
+            long_qty_after=long_qty,
+            short_qty_after=short_qty,
+            net_qty_after=long_qty + short_qty,
+        )
+        if abs(long_qty) > EPS or abs(short_qty) > EPS:
+            continue
+
+        pair.status = "closed"
+        register_pair_assumed_flat(pair, control_service.assumed_flat_until_ms, config)
+        mark_symbol_recently_closed(control_service.symbol_recent_close_ms, pair.symbol)
+        del open_pairs[pair_id]
+        log_pair_closed_detected(pair_id=pair_id)
+        record_live_event(
+            config,
+            "pair_closed_after_manual_console",
+            pair=pair_event_payload(pair),
+            command_type=command.command_type,
+            long_qty_after=long_qty,
+            short_qty_after=short_qty,
+        )
+
+
 async def execute_control_plane_command(
     control_service: StrategyControlService,
     command: StrategyControlCommand,
 ) -> None:
+    if command.response_future.done():
+        control_service.last_error = (
+            f"skipped completed control command type={command.command_type}"
+        )
+        control_service.audit_command_event(
+            "ops_console_command_skipped",
+            command,
+            reason="response_future_done_before_start",
+            age_ms=now_ms() - int(getattr(command, "enqueued_at_ms", 0) or 0),
+        )
+        return
+
+    max_age_sec = float(os.getenv("OPS_CONSOLE_COMMAND_MAX_QUEUE_AGE_SEC", "30.0") or 30.0)
+    if max_age_sec > 0:
+        age_ms = now_ms() - int(getattr(command, "enqueued_at_ms", 0) or 0)
+        if age_ms > int(max_age_sec * 1000):
+            control_service.last_error = (
+                f"expired control command skipped type={command.command_type} age_ms={age_ms}"
+            )
+            control_service.audit_command_event(
+                "ops_console_command_expired",
+                command,
+                age_ms=age_ms,
+                max_age_sec=max_age_sec,
+            )
+            if not command.response_future.done():
+                command.response_future.set_exception(
+                    TimeoutError(control_service.last_error)
+                )
+            return
+
+    started_ms = now_ms()
+    control_service.audit_command_event(
+        "ops_console_command_started",
+        command,
+        queue_age_ms=started_ms - int(getattr(command, "enqueued_at_ms", started_ms) or started_ms),
+    )
     try:
         if command.command_type == "health-check":
             result = control_service.build_health_check()
@@ -5314,12 +5492,27 @@ async def execute_control_plane_command(
             result = {"ok": True, "entry_control": write_entry_control(False, request.reason)}
         else:
             raise ValueError(f"unsupported control command: {command.command_type}")
+        await reconcile_manual_pair_after_control_command(control_service, command, result)
     except Exception as exc:
         control_service.last_error = str(exc)
+        control_service.audit_command_event(
+            "ops_console_command_failed",
+            command,
+            duration_ms=now_ms() - started_ms,
+            response_future_done=command.response_future.done(),
+            **_control_command_error_summary(exc),
+        )
         if not command.response_future.done():
             command.response_future.set_exception(exc)
         return
 
+    control_service.audit_command_event(
+        "ops_console_command_completed",
+        command,
+        duration_ms=now_ms() - started_ms,
+        response_future_done=command.response_future.done(),
+        result_summary=_control_command_result_summary(result),
+    )
     if not command.response_future.done():
         command.response_future.set_result(result)
 
@@ -5658,7 +5851,9 @@ async def strategy_loop() -> None:
         symbol_recent_close_ms=symbol_recent_close_ms,
         wake_queue=wake_queue,
         command_queue=control_command_queue,
+        event_sink=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
+    control_service.extra_active_symbols_provider = maker_entry_engine.active_symbols
     control_server = EmbeddedControlServer(control_service)
 
     last_signature: tuple[Any, ...] | None = None

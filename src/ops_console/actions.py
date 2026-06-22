@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import os
+import time
 from typing import Any
 
 from src.ops.position_ownership import close_manual_position, upsert_manual_position
@@ -15,6 +18,8 @@ from src.ops_console.schemas import (
 )
 from src.ops_console.state import normalize_order_side, normalize_symbol
 from src.strategy.hedge_adapter import execute_strategy_style_hedge
+
+EPS = 1e-9
 
 
 def resolve_hedge_exchange(runtime: ConsoleRuntime, primary_exchange: str, requested_exchange: str | None) -> str:
@@ -44,6 +49,136 @@ def primary_fill_delta(primary_result: dict[str, Any], symbol: str) -> float:
     before_qty = position_qty_from_exchange_state(primary_result.get("before") or {}, symbol)
     after_qty = position_qty_from_exchange_state(primary_result.get("after") or {}, symbol)
     return after_qty - before_qty
+
+
+def open_order_conflicts(snapshot: dict[str, Any], symbol: str) -> list[dict[str, Any]]:
+    normalized_symbol = normalize_symbol(symbol)
+    conflicts: list[dict[str, Any]] = []
+    for exchange_name, exchange_state in (snapshot.get("exchanges") or {}).items():
+        symbol_state = ((exchange_state or {}).get("symbols") or {}).get(normalized_symbol) or {}
+        for row in symbol_state.get("open_orders") or []:
+            if not isinstance(row, dict):
+                continue
+            conflicts.append(
+                {
+                    "exchange": exchange_name,
+                    "symbol": normalized_symbol,
+                    "order_id": row.get("orderId") or row.get("ordId") or row.get("id"),
+                    "client_order_id": row.get("clientOrderId") or row.get("clOrdId") or row.get("client_id"),
+                    "side": row.get("side"),
+                    "status": row.get("status") or row.get("state"),
+                    "price": row.get("price") or row.get("px"),
+                    "qty": row.get("origQty") or row.get("sz") or row.get("amount") or row.get("qty"),
+                }
+            )
+    return conflicts
+
+
+def assert_no_open_order_conflicts(snapshot: dict[str, Any], symbol: str) -> None:
+    conflicts = open_order_conflicts(snapshot, symbol)
+    if conflicts:
+        raise ValueError(
+            "console live order blocked because open orders already exist "
+            f"for {normalize_symbol(symbol)}; cancel-symbol first. conflicts={conflicts[:5]}"
+        )
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        parsed = float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _auto_hedge_wait_sec(request_wait_sec: float) -> float:
+    configured = _env_float("OPS_CONSOLE_AUTO_HEDGE_FILL_WAIT_SEC", 2.5)
+    return min(max(configured, float(request_wait_sec or 0.0)), 10.0)
+
+
+async def refresh_console_symbol_state(runtime: ConsoleRuntime, exchange_name: str, symbol: str, reason: str) -> None:
+    """Ask the strategy-owned exchange object to refresh account state now.
+
+    In embedded mode this does not create another exchange session; it only wakes
+    the existing exchange/account refresh path so console auto-hedge can observe
+    post-order position delta before deciding whether to hedge or cancel.
+    """
+
+    try:
+        session = runtime.session(exchange_name)
+        exchange = session.exchange
+    except Exception:
+        return
+
+    scheduler = getattr(exchange, "account_refresh_scheduler", None)
+    refresh_now = getattr(scheduler, "refresh_now", None)
+    if callable(refresh_now):
+        try:
+            refreshed = await refresh_now(reason, priority="urgent")
+            if refreshed:
+                return
+        except Exception as exc:
+            print(
+                f"[ops_console][auto_hedge][refresh_warn] "
+                f"exchange={exchange_name} symbol={symbol} reason={reason} error={exc!r}"
+            )
+
+    requester = getattr(exchange, "request_account_refresh", None)
+    if callable(requester):
+        try:
+            requester(reason, priority="urgent", symbol=symbol)
+        except Exception as exc:
+            print(
+                f"[ops_console][auto_hedge][refresh_request_warn] "
+                f"exchange={exchange_name} symbol={symbol} reason={reason} error={exc!r}"
+            )
+
+
+async def wait_for_primary_fill_delta(
+    runtime: ConsoleRuntime,
+    *,
+    exchange_name: str,
+    symbol: str,
+    before_qty: float,
+    wait_sec: float,
+    poll_sec: float,
+    reason: str,
+    return_on_first_delta: bool = True,
+) -> tuple[float, dict[str, Any]]:
+    deadline = time.monotonic() + max(wait_sec, 0.0)
+    attempts = 0
+    last_qty = before_qty
+    last_snapshot_ts_ms = None
+    last_delta = 0.0
+    while time.monotonic() <= deadline:
+        attempts += 1
+        await refresh_console_symbol_state(runtime, exchange_name, symbol, reason)
+        snapshot = await runtime.snapshot()
+        last_snapshot_ts_ms = snapshot.get("timestamp_ms")
+        last_qty = position_qty_for_symbol(snapshot, exchange_name, symbol)
+        delta = last_qty - before_qty
+        if abs(delta) > EPS:
+            last_delta = delta
+        if abs(delta) > EPS and return_on_first_delta:
+            return delta, {
+                "attempts": attempts,
+                "before_qty": before_qty,
+                "observed_qty": last_qty,
+                "position_delta": delta,
+                "snapshot_ts_ms": last_snapshot_ts_ms,
+                "wait_sec": wait_sec,
+                "reason": reason,
+            }
+        await asyncio.sleep(max(poll_sec, 0.05))
+    return last_delta, {
+        "attempts": attempts,
+        "before_qty": before_qty,
+        "observed_qty": last_qty,
+        "position_delta": last_delta,
+        "snapshot_ts_ms": last_snapshot_ts_ms,
+        "wait_sec": wait_sec,
+        "reason": reason,
+    }
 
 
 def hedge_execution_payload(result: Any) -> dict[str, Any]:
@@ -134,7 +269,59 @@ async def maybe_auto_hedge(
 
     symbol = normalize_symbol(request.symbol)
     fill_delta = primary_fill_delta(primary_result, symbol)
-    if abs(fill_delta) <= 0:
+    settle_payload: dict[str, Any] | None = None
+    cancel_payload: dict[str, Any] | None = None
+
+    if abs(fill_delta) <= EPS:
+        before_qty = position_qty_from_exchange_state(primary_result.get("before") or {}, symbol)
+        fill_delta, settle_payload = await wait_for_primary_fill_delta(
+            runtime,
+            exchange_name=request.exchange,
+            symbol=symbol,
+            before_qty=before_qty,
+            wait_sec=_auto_hedge_wait_sec(request.wait_sec),
+            poll_sec=_env_float("OPS_CONSOLE_AUTO_HEDGE_POLL_SEC", 0.2),
+            reason="ops_console_auto_hedge_primary_settle",
+        )
+
+    if isinstance(request, LiveLimitOrderRequest):
+        cancel_reason = "cancel_residual_limit_before_hedge" if abs(fill_delta) > EPS else "cancel_unfilled_limit"
+        print(
+            f"[ops_console][auto_hedge][{cancel_reason}] "
+            f"exchange={request.exchange} symbol={symbol} side={request.side} qty={request.quantity} "
+            f"price={request.price} fill_delta={fill_delta} settle={settle_payload}"
+        )
+        try:
+            cancel_payload = await runtime.execute_action(
+                request.exchange,
+                symbol,
+                "live_limit_auto_hedge_cancel_primary_residual",
+                lambda exchange: exchange.cancel_all_orders_for_symbol(symbol),
+                wait_sec=min(max(float(request.wait_sec or 0.0), 0.3), 2.0),
+            )
+        except Exception as exc:
+            cancel_payload = {"ok": False, "error": repr(exc)}
+        before_qty = position_qty_from_exchange_state(primary_result.get("before") or {}, symbol)
+        fill_delta, after_cancel_settle = await wait_for_primary_fill_delta(
+            runtime,
+            exchange_name=request.exchange,
+            symbol=symbol,
+            before_qty=before_qty,
+            wait_sec=min(_auto_hedge_wait_sec(request.wait_sec), 2.0),
+            poll_sec=_env_float("OPS_CONSOLE_AUTO_HEDGE_POLL_SEC", 0.2),
+            reason="ops_console_auto_hedge_after_cancel_settle",
+            return_on_first_delta=False,
+        )
+        settle_payload = {"before_cancel": settle_payload, "after_cancel": after_cancel_settle}
+
+        if cancel_payload and not cancel_payload.get("ok"):
+            raise ValueError(
+                "auto hedge limit residual cancel failed; refusing to hedge while "
+                f"primary order may still be live exchange={request.exchange} symbol={symbol} "
+                f"fill_delta={fill_delta} cancel={cancel_payload}"
+            )
+
+    if abs(fill_delta) <= EPS:
         return {
             "ok": True,
             "hedge_mode": request.hedge_mode,
@@ -143,7 +330,13 @@ async def maybe_auto_hedge(
                 "ok": True,
                 "action": "live_auto_hedge_market_order",
                 "skipped": True,
-                "reason": "primary_fill_delta_zero",
+                "reason": (
+                    "primary_limit_not_filled_cancelled"
+                    if isinstance(request, LiveLimitOrderRequest)
+                    else "primary_fill_delta_zero_after_settle"
+                ),
+                "settle": settle_payload,
+                "cancel": cancel_payload,
             },
             "rollback": None,
         }
@@ -257,6 +450,7 @@ async def live_limit_order(runtime: ConsoleRuntime, request: LiveLimitOrderReque
         raise ValueError("reduce_only limit order is not supported by the console MVP; use flatten-symbol")
     snapshot = await runtime.snapshot()
     assert_live_action_allowed(snapshot, exchange=request.exchange, symbol=request.symbol, ops_token=ops_token)
+    assert_no_open_order_conflicts(snapshot, request.symbol)
     side = normalize_order_side(request.side)
     symbol = normalize_symbol(request.symbol)
     ownership = None
@@ -291,11 +485,21 @@ async def live_limit_order(runtime: ConsoleRuntime, request: LiveLimitOrderReque
         snapshot=await runtime.snapshot(),
     )
     if request.ownership_mode == "manual_only":
+        hedge = hedged.get("hedge") if isinstance(hedged, dict) else {}
+        no_fill_cancelled = bool(
+            isinstance(hedge, dict)
+            and hedge.get("skipped")
+            and hedge.get("reason") == "primary_limit_not_filled_cancelled"
+        )
         ownership = await record_manual_ownership_from_runtime(
             runtime,
             symbol=symbol,
-            note=f"live_limit_order hedge_mode={request.hedge_mode}",
-            force_open=True,
+            note=(
+                "live_limit_order_not_filled_cancelled"
+                if no_fill_cancelled
+                else f"live_limit_order hedge_mode={request.hedge_mode}"
+            ),
+            force_open=not no_fill_cancelled,
         )
     return {"ok": True, "action": "live_limit_order", "ownership": ownership, **hedged}
 
@@ -303,6 +507,7 @@ async def live_limit_order(runtime: ConsoleRuntime, request: LiveLimitOrderReque
 async def live_market_order(runtime: ConsoleRuntime, request: LiveMarketOrderRequest, *, ops_token: str | None) -> dict[str, Any]:
     snapshot = await runtime.snapshot()
     assert_live_action_allowed(snapshot, exchange=request.exchange, symbol=request.symbol, ops_token=ops_token)
+    assert_no_open_order_conflicts(snapshot, request.symbol)
     side = normalize_order_side(request.side)
     symbol = normalize_symbol(request.symbol)
     ownership = None
