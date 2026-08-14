@@ -23,6 +23,8 @@ BASE_URL = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
 
 _TIME_OFFSET_MS = 0
 _TICKER_LIST_CACHE: tuple[int, tuple[list[str], dict[str, dict[str, Any]]]] | None = None
+_FUNDING_INTERVAL_CACHE: tuple[int, dict[str, int]] | None = None
+_FUNDING_INTERVAL_CACHE_LOCK = asyncio.Lock()
 _REST_PAUSE_UNTIL_MS = 0
 _REST_PAUSE_REASON = ""
 _REST_PAUSE_LAST_LOG_MS = 0
@@ -459,7 +461,9 @@ async def _request(
 ) -> tuple[int, Any, dict[str, str]]:
     params = dict(params or {})
 
-    paused = _local_rest_pause_response(path)
+    # The local breaker protects read budget. Never turn a locally observed
+    # read pause into a synthetic rejection of close/hedge/cancel writes.
+    paused = _local_rest_pause_response(path) if method.upper() in {"GET", "HEAD"} else None
     if paused is not None:
         status, data, paused_headers = paused
         record_api_call(
@@ -806,16 +810,59 @@ async def get_funding_rate(symbol: str) -> dict[str, Any] | None:
     status, data, _ = await _request("GET", "/fapi/v1/premiumIndex", params={"symbol": normalized})
     if status != 200:
         return None
+    funding_interval_hours, funding_interval_source = await get_funding_interval_hours(normalized)
     return {
         "exchange": "binanceFuture",
         "symbol": symbol_to_code(normalized),
         "funding_rate": _safe_float(data.get("lastFundingRate"), None),
         "next_funding_time": _safe_int(data.get("nextFundingTime"), None),
+        "funding_interval_hours": funding_interval_hours,
+        "funding_interval_source": funding_interval_source,
         "mark_price": _safe_float(data.get("markPrice"), None),
         "index_price": _safe_float(data.get("indexPrice"), None),
         "timestamp": _now_ms(),
         "raw": data,
     }
+
+
+async def get_funding_interval_hours(symbol: str) -> tuple[int, str]:
+    """Return the venue settlement interval without adding per-symbol polling."""
+    global _FUNDING_INTERVAL_CACHE
+
+    normalized = normalize_symbol(symbol)
+    now_ms = _now_ms()
+    ttl_ms = int(float(os.getenv("BINANCE_FUNDING_INFO_CACHE_SEC", "3600") or 3600) * 1000)
+    cached = _FUNDING_INTERVAL_CACHE
+    if cached is not None and (ttl_ms <= 0 or now_ms - cached[0] < ttl_ms):
+        return cached[1].get(normalized, 8), (
+            "binance_funding_info" if normalized in cached[1] else "binance_default_8h"
+        )
+
+    async with _FUNDING_INTERVAL_CACHE_LOCK:
+        cached = _FUNDING_INTERVAL_CACHE
+        if cached is not None and (ttl_ms <= 0 or now_ms - cached[0] < ttl_ms):
+            return cached[1].get(normalized, 8), (
+                "binance_funding_info" if normalized in cached[1] else "binance_default_8h"
+            )
+
+        intervals: dict[str, int] = {}
+        status, data, _ = await _request("GET", "/fapi/v1/fundingInfo")
+        if status == 200 and isinstance(data, list):
+            for row in data:
+                contract = str(row.get("symbol") or "").upper()
+                interval = _safe_int(row.get("fundingIntervalHours"), None)
+                if contract and interval is not None and 0 < int(interval) <= 24:
+                    intervals[contract] = int(interval)
+            _FUNDING_INTERVAL_CACHE = (now_ms, intervals)
+        elif cached is not None:
+            return cached[1].get(normalized, 8), (
+                "binance_funding_info_stale" if normalized in cached[1] else "binance_default_8h"
+            )
+        else:
+            return 8, "binance_default_8h_unverified"
+        return intervals.get(normalized, 8), (
+            "binance_funding_info" if normalized in intervals else "binance_default_8h"
+        )
 
 
 async def get_funding_rate_history(
@@ -845,6 +892,33 @@ async def get_funding_rate_history(
             "raw": row,
         }
         for row in data
+    ]
+
+
+async def get_funding_payments(
+    start_time: int | None = None,
+    end_time: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]] | None:
+    params: dict[str, Any] = {"incomeType": "FUNDING_FEE", "limit": min(max(limit, 1), 1000)}
+    if start_time is not None:
+        params["startTime"] = int(start_time)
+    if end_time is not None:
+        params["endTime"] = int(end_time)
+    status, data, _ = await _request("GET", "/fapi/v1/income", params=params, signed=True)
+    if status != 200 or not isinstance(data, list):
+        return None
+    return [
+        {
+            "movement_id": str(row.get("tranId") or row.get("tradeId") or ""),
+            "symbol": symbol_to_code(str(row.get("symbol") or "")),
+            "asset_code": str(row.get("asset") or "USDT").upper(),
+            "amount": _safe_float(row.get("income"), 0.0),
+            "event_time_ms": _safe_int(row.get("time"), 0),
+            "raw": row,
+        }
+        for row in data
+        if str(row.get("incomeType") or "FUNDING_FEE").upper() == "FUNDING_FEE"
     ]
 
 

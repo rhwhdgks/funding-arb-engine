@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.ops_console.embedded import active_service
+from src.ops_console.action_gate import enable_live_action_window, live_action_window_status
 from src.ops_console.schemas import (
     CancelSymbolRequest,
     EntryPauseRequest,
@@ -40,6 +41,27 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 app = FastAPI(title="Ops Console", version="0.1.0")
 
 
+@app.middleware("http")
+async def validate_write_origin(request: Request, call_next):
+    if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+        origin = str(request.headers.get("origin") or "").rstrip("/")
+        if origin:
+            port = int(float(os.getenv("OPS_CONSOLE_PORT", "8010")))
+            configured = {
+                item.strip().rstrip("/")
+                for item in os.getenv("OPS_CONSOLE_ALLOWED_ORIGINS", "").split(",")
+                if item.strip()
+            }
+            allowed = configured or {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+            if origin not in allowed:
+                return JSONResponse(
+                    {"detail": "origin not allowed"},
+                    status_code=403,
+                    headers=_no_cache_headers(),
+                )
+    return await call_next(request)
+
+
 @app.on_event("startup")
 async def startup_runtime() -> None:
     # Standalone exchange sessions are intentionally disabled. The console is
@@ -56,6 +78,10 @@ def _ops_token(header_token: str | None) -> str | None:
     return header_token
 
 
+def _operator(header_operator: str | None) -> str:
+    return str(header_operator or "local_operator").strip()[:64]
+
+
 def _no_cache_headers() -> dict[str, str]:
     return {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -68,6 +94,9 @@ def _unavailable_payload() -> dict[str, Any]:
     return {
         "ok": False,
         "embedded": False,
+        "source": "strategy_attached_console",
+        "exchange_owner": "strategy",
+        "standalone_enabled": False,
         "source_status": "strategy_unavailable",
         "detail": "strategy_attached_console_required",
         "env_file": str(ENV_PATH),
@@ -108,6 +137,9 @@ async def healthz() -> dict[str, Any]:
         "ok": True,
         "env_file": str(ENV_PATH),
         "embedded": True,
+        "source": "embedded_strategy",
+        "exchange_owner": "strategy",
+        "standalone_enabled": False,
         "source_status": "strategy_attached",
     }
     return JSONResponse(payload, headers=_no_cache_headers())
@@ -156,14 +188,47 @@ async def api_paper_order(request: PaperOrderRequest) -> dict[str, Any]:
         raise
 
 
+@app.get("/api/runtime/action-window")
+async def api_action_window() -> dict[str, Any]:
+    _require_service()
+    return JSONResponse(
+        {"ok": True, **live_action_window_status()},
+        headers=_no_cache_headers(),
+    )
+
+
+@app.post("/api/runtime/enable-actions")
+async def api_enable_actions(
+    payload: dict[str, Any] = Body(default={}),
+    x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
+) -> dict[str, Any]:
+    try:
+        service = _require_service()
+        operator = _operator(x_ops_operator)
+        status = enable_live_action_window(
+            _ops_token(x_ops_token),
+            operator=operator,
+            duration_sec=payload.get("duration_sec"),
+        )
+        service.audit_event("ops_console_live_action_window_enabled", operator=operator, **status)
+        return JSONResponse({"ok": True, **status}, headers=_no_cache_headers())
+    except Exception as exc:
+        _raise_http_error(exc)
+        raise
+
+
 @app.post("/api/order/live-limit")
 async def api_live_limit_order(
     request: LiveLimitOrderRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("live-limit", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "live-limit", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -173,10 +238,13 @@ async def api_live_limit_order(
 async def api_live_market_order(
     request: LiveMarketOrderRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("live-market", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "live-market", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -186,10 +254,13 @@ async def api_live_market_order(
 async def api_cancel_symbol(
     request: CancelSymbolRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("cancel-symbol", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "cancel-symbol", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -199,10 +270,13 @@ async def api_cancel_symbol(
 async def api_flatten_symbol(
     request: FlattenSymbolRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("flatten-symbol", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "flatten-symbol", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -212,10 +286,13 @@ async def api_flatten_symbol(
 async def api_rebalance_hedge(
     request: RebalanceHedgeRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("rebalance-hedge", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "rebalance-hedge", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -225,10 +302,13 @@ async def api_rebalance_hedge(
 async def api_pause_entry(
     request: EntryPauseRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("pause-entry", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "pause-entry", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise
@@ -238,10 +318,13 @@ async def api_pause_entry(
 async def api_resume_entry(
     request: EntryResumeRequest,
     x_ops_token: str | None = Header(default=None),
+    x_ops_operator: str | None = Header(default=None),
 ) -> dict[str, Any]:
     try:
         service = _require_service()
-        return await service.submit_command("resume-entry", request, ops_token=_ops_token(x_ops_token))
+        return await service.submit_command(
+            "resume-entry", request, ops_token=_ops_token(x_ops_token), operator=_operator(x_ops_operator)
+        )
     except Exception as exc:
         _raise_http_error(exc)
         raise

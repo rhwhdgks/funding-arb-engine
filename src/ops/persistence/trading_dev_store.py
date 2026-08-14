@@ -339,13 +339,16 @@ def upsert_funding_rate_rows(conn, rows: list[dict[str, Any]]) -> int:
     sql = """
     INSERT INTO funding_rate (
         exchange_name, symbol, bucket_start_ms, desktop_time_ms, server_time_ms,
-        funding_rate, next_funding_time_ms, raw_json
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        funding_rate, next_funding_time_ms, funding_interval_hours,
+        funding_interval_source, raw_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
         desktop_time_ms = VALUES(desktop_time_ms),
         server_time_ms = VALUES(server_time_ms),
         funding_rate = VALUES(funding_rate),
         next_funding_time_ms = VALUES(next_funding_time_ms),
+        funding_interval_hours = VALUES(funding_interval_hours),
+        funding_interval_source = VALUES(funding_interval_source),
         raw_json = VALUES(raw_json)
     """
 
@@ -358,6 +361,8 @@ def upsert_funding_rate_rows(conn, rows: list[dict[str, Any]]) -> int:
             row.get("server_time_ms"),
             row["funding_rate"],
             row.get("next_funding_time_ms"),
+            row.get("funding_interval_hours"),
+            row.get("funding_interval_source"),
             row.get("raw_json"),
         )
         for row in rows
@@ -379,15 +384,22 @@ def upsert_symbol_price_rows(conn, rows: list[dict[str, Any]]) -> int:
     sql = """
     INSERT INTO symbol_price (
         exchange_name, symbol, bucket_start_ms, desktop_time_ms, server_time_ms,
-        best_bid, best_ask, bid, ask
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        best_bid, best_ask, bid, ask,
+        funding_rate, next_funding_time_ms, funding_interval_hours,
+        funding_interval_source, funding_updated_at_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON DUPLICATE KEY UPDATE
         desktop_time_ms = VALUES(desktop_time_ms),
         server_time_ms = VALUES(server_time_ms),
         best_bid = VALUES(best_bid),
         best_ask = VALUES(best_ask),
         bid = VALUES(bid),
-        ask = VALUES(ask)
+        ask = VALUES(ask),
+        funding_rate = COALESCE(VALUES(funding_rate), funding_rate),
+        next_funding_time_ms = COALESCE(VALUES(next_funding_time_ms), next_funding_time_ms),
+        funding_interval_hours = COALESCE(VALUES(funding_interval_hours), funding_interval_hours),
+        funding_interval_source = COALESCE(VALUES(funding_interval_source), funding_interval_source),
+        funding_updated_at_ms = COALESCE(VALUES(funding_updated_at_ms), funding_updated_at_ms)
     """
 
     values = [
@@ -401,6 +413,11 @@ def upsert_symbol_price_rows(conn, rows: list[dict[str, Any]]) -> int:
             row["best_ask"],
             row.get("bid"),
             row.get("ask"),
+            row.get("funding_rate"),
+            row.get("next_funding_time_ms"),
+            row.get("funding_interval_hours"),
+            row.get("funding_interval_source"),
+            row.get("funding_updated_at_ms"),
         )
         for row in rows
     ]
@@ -412,3 +429,63 @@ def upsert_symbol_price_rows(conn, rows: list[dict[str, Any]]) -> int:
     finally:
         cur.close()
     return len(values)
+
+
+def fetch_latest_symbol_price_funding_rows(
+    conn,
+    *,
+    exchange_name: str,
+    symbols: list[str],
+    max_age_ms: int | None = None,
+    now_ms: int | None = None,
+) -> dict[str, dict[str, Any]]:
+    normalized_symbols = [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+    if not normalized_symbols:
+        return {}
+
+    now_ms = int(now_ms or 0)
+    min_updated_ms = None
+    if max_age_ms is not None and max_age_ms > 0 and now_ms > 0:
+        min_updated_ms = max(0, now_ms - int(max_age_ms))
+
+    cur = conn.cursor()
+    try:
+        out: dict[str, dict[str, Any]] = {}
+        for symbol in normalized_symbols:
+            clauses = [
+                "exchange_name = ?",
+                "symbol = ?",
+                "funding_rate IS NOT NULL",
+                "funding_updated_at_ms IS NOT NULL",
+            ]
+            params: list[Any] = [exchange_name, symbol]
+            if min_updated_ms is not None:
+                clauses.append("funding_updated_at_ms >= ?")
+                params.append(min_updated_ms)
+            sql = f"""
+                SELECT exchange_name, symbol, funding_rate, next_funding_time_ms,
+                       funding_interval_hours, funding_interval_source, funding_updated_at_ms,
+                       best_bid, best_ask
+                FROM symbol_price
+                WHERE {' AND '.join(clauses)}
+                ORDER BY funding_updated_at_ms DESC, bucket_start_ms DESC, id DESC
+                LIMIT 1
+            """
+            cur.execute(sql, tuple(params))
+            row = cur.fetchone()
+            if not row:
+                continue
+            out[symbol] = {
+                "exchange_name": row[0],
+                "symbol": row[1],
+                "funding_rate": row[2],
+                "next_funding_time_ms": row[3],
+                "funding_interval_hours": row[4],
+                "funding_interval_source": row[5],
+                "funding_updated_at_ms": row[6],
+                "best_bid": row[7],
+                "best_ask": row[8],
+            }
+        return out
+    finally:
+        cur.close()

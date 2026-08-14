@@ -1,0 +1,22 @@
+[Unit]
+Description=Funding Arbitrage Execution Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/opt/funding-arb
+EnvironmentFile=/opt/funding-arb/.env
+ExecStart=/opt/funding-arb/.venv/bin/python -u /opt/funding-arb/main.py
+KillSignal=SIGTERM
+TimeoutStopSec=240
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

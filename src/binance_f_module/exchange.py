@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any, Optional
 from src.core.account_refresh import AccountRefreshScheduler
 from src.ops.persistence.balance_report import build_balance_report
+from src.ops.persistence.db import db_persistence_enabled, get_db_connection
 from src.ops.persistence.event_hooks import (
     build_cancel_all_request_payload,
     build_cancel_request_payload,
@@ -23,6 +24,7 @@ from src.ops.persistence.event_hooks import (
     schedule_order_submit,
     schedule_polled_order_status,
 )
+from src.ops.persistence.trading_dev_store import fetch_latest_symbol_price_funding_rows
 
 from .api import (
     get_accounts,
@@ -34,6 +36,7 @@ from .api import (
     get_rest_rate_limit_state as api_get_rest_rate_limit_state,
     get_funding_rate,
     get_funding_rate_history,
+    get_funding_payments as api_get_funding_payments,
     get_ohlcv_1m,
     get_margin_mode as api_get_margin_mode,
     set_leverage,
@@ -136,7 +139,19 @@ class Exchange:
         self.open_orders_symbol_scoped = _env_bool("BINANCE_OPEN_ORDERS_SYMBOL_SCOPED", True)
         self.open_orders_symbol_scoped_max_symbols = int(float(os.getenv("BINANCE_OPEN_ORDERS_SYMBOL_SCOPED_MAX_SYMBOLS", "30")))
         self.open_orders_symbol_sleep_sec = float(os.getenv("BINANCE_OPEN_ORDERS_SYMBOL_SLEEP_SEC", "0.02"))
+        self.open_orders_full_reconcile_sec = max(
+            float(os.getenv("BINANCE_OPEN_ORDERS_FULL_RECONCILE_SEC", "120") or 120.0),
+            self.open_orders_interval,
+        )
+        self.open_orders_last_full_reconcile_ms = 0
         self.funding_interval = funding_interval
+        raw_funding_source = os.getenv("STRATEGY_FUNDING_SOURCE", "runtime").strip().lower()
+        self.funding_source = "symbol_price" if raw_funding_source in {"symbol_price", "collector", "db"} else "runtime"
+        self.funding_max_age_ms = int(float(os.getenv("STRATEGY_FUNDING_MAX_AGE_SEC", "900") or 900.0) * 1000)
+        self.collector_funding_interval = max(
+            float(os.getenv("STRATEGY_COLLECTOR_FUNDING_REFRESH_SEC", "60") or 60.0),
+            float(self.funding_interval),
+        )
         self.health_interval = health_interval
         self.order_cooldown_sec = order_cooldown_sec
         self.cancel_cooldown_sec = cancel_cooldown_sec
@@ -218,6 +233,81 @@ class Exchange:
             self.funding_snapshot_last_sync_ms = now_ms
             return True
         return False
+
+    def _uses_symbol_price_funding(self) -> bool:
+        return self.funding_source == "symbol_price"
+
+    def _symbol_price_funding_snapshot(
+        self,
+        ticker: str,
+        row: dict[str, Any],
+        *,
+        now_ms: int,
+    ) -> dict[str, Any] | None:
+        try:
+            funding_rate = float(row["funding_rate"])
+            next_funding_time_ms = int(row["next_funding_time_ms"])
+        except Exception:
+            return None
+
+        mark_price = None
+        try:
+            best_bid = float(row.get("best_bid") or 0.0)
+            best_ask = float(row.get("best_ask") or 0.0)
+            if best_bid > 0 and best_ask > 0:
+                mark_price = (best_bid + best_ask) / 2.0
+        except Exception:
+            mark_price = None
+
+        funding_updated_at_ms = int(row.get("funding_updated_at_ms") or now_ms)
+        return {
+            "exchange": self.name,
+            "symbol": ticker.upper(),
+            "funding_rate": funding_rate,
+            "next_funding_time": next_funding_time_ms,
+            "funding_interval_hours": row.get("funding_interval_hours"),
+            "funding_interval_source": row.get("funding_interval_source") or "symbol_price",
+            "mark_price": mark_price,
+            "index_price": mark_price,
+            "timestamp": funding_updated_at_ms,
+            "source_updated_at_ms": funding_updated_at_ms,
+            "source": "symbol_price",
+        }
+
+    async def _refresh_funding_from_symbol_price(self, *, source: str, now_ms: int) -> bool:
+        if not db_persistence_enabled():
+            self._refresh_runtime_summary(
+                refresh_source=source,
+                error="symbol_price_funding_db_disabled",
+                touch_attempt=False,
+            )
+            return False
+
+        def _fetch() -> dict[str, dict[str, Any]]:
+            conn = get_db_connection()
+            try:
+                return fetch_latest_symbol_price_funding_rows(
+                    conn,
+                    exchange_name=self.persist_name,
+                    symbols=self.ticker_list,
+                    max_age_ms=self.funding_max_age_ms,
+                    now_ms=now_ms,
+                )
+            finally:
+                conn.close()
+
+        rows = await asyncio.to_thread(_fetch)
+        any_seen = False
+        for ticker in self.ticker_list:
+            row = rows.get(ticker.upper())
+            if not row:
+                continue
+            snapshot = self._symbol_price_funding_snapshot(ticker, row, now_ms=now_ms)
+            applied = self._apply_funding_snapshot(ticker, snapshot, source=source, now_ms=now_ms)
+            any_seen = any_seen or bool(applied or snapshot)
+        if not any_seen:
+            self.funding_snapshot_last_attempt_ms = now_ms
+        return any_seen
 
     def _build_funding_sync_summary(self) -> dict[str, Any]:
         valid_symbols: list[str] = []
@@ -604,19 +694,29 @@ class Exchange:
 
         if include_funding:
             any_funding_seen = False
-            for ticker in self.ticker_list:
+            if self._uses_symbol_price_funding():
                 try:
-                    funding = await get_funding_rate(ticker)
-                    applied = self._apply_funding_snapshot(
-                        ticker,
-                        funding,
+                    any_funding_seen = await self._refresh_funding_from_symbol_price(
                         source=f"reconcile:{reason}",
                         now_ms=attempt_ms,
                     )
-                    any_funding_seen = any_funding_seen or bool(applied or funding)
                 except Exception as exc:
                     first_error = first_error or str(exc)
-                    print(f"[{self.name}][reconcile][funding][{ticker}] {exc}")
+                    print(f"[{self.name}][reconcile][funding][symbol_price] {exc}")
+            else:
+                for ticker in self.ticker_list:
+                    try:
+                        funding = await get_funding_rate(ticker)
+                        applied = self._apply_funding_snapshot(
+                            ticker,
+                            funding,
+                            source=f"reconcile:{reason}",
+                            now_ms=attempt_ms,
+                        )
+                        any_funding_seen = any_funding_seen or bool(applied or funding)
+                    except Exception as exc:
+                        first_error = first_error or str(exc)
+                        print(f"[{self.name}][reconcile][funding][{ticker}] {exc}")
             funding_refreshed = any_funding_seen
 
         self._refresh_runtime_summary(
@@ -834,16 +934,45 @@ class Exchange:
             await asyncio.sleep(self.open_orders_interval)
 
     async def _fetch_open_orders_snapshot(self) -> list[dict[str, Any]] | None:
+        now_ms = int(time.time() * 1000)
+        full_reconcile_due = (
+            not self.open_orders_last_full_reconcile_ms
+            or now_ms - self.open_orders_last_full_reconcile_ms >= int(self.open_orders_full_reconcile_sec * 1000)
+        )
         symbol_scoped = (
             self.open_orders_symbol_scoped
             and bool(self.ticker_list)
             and len(self.ticker_list) <= self.open_orders_symbol_scoped_max_symbols
+            and not full_reconcile_due
         )
         if not symbol_scoped:
-            return await get_open_orders({})
+            rows = await get_open_orders({})
+            if rows is not None:
+                self.open_orders_last_full_reconcile_ms = now_ms
+            return rows
+
+        active_symbols = {
+            str(row.get("ticker") or row.get("symbol") or "").upper()
+            for row in self.waiting_list
+            if str(row.get("ticker") or row.get("symbol") or "").strip()
+        }
+        active_symbols.update(
+            str(symbol).upper()
+            for symbol, rows in (self.open_orders_snapshot or {}).items()
+            if rows
+        )
+        for ticker in self.ticker_list:
+            snapshot = self.get_symbol_snapshot(ticker) or {}
+            position = snapshot.get("position") or {}
+            try:
+                qty = float(position.get("qty") or position.get("positionAmt") or position.get("position_amt") or 0.0)
+            except Exception:
+                qty = 0.0
+            if abs(qty) > 1e-12:
+                active_symbols.add(ticker.upper())
 
         merged: list[dict[str, Any]] = []
-        for ticker in self.ticker_list:
+        for ticker in sorted(active_symbols):
             order_list = await get_open_orders({"symbol": ticker})
             if order_list is None:
                 return None
@@ -856,15 +985,19 @@ class Exchange:
         while self._running:
             try:
                 now_ms = int(time.time() * 1000)
-                for ticker in self.ticker_list:
-                    funding = await get_funding_rate(ticker)
-                    self._apply_funding_snapshot(ticker, funding, source="run_funding", now_ms=now_ms)
+                if self._uses_symbol_price_funding():
+                    await self._refresh_funding_from_symbol_price(source="run_funding:symbol_price", now_ms=now_ms)
+                else:
+                    for ticker in self.ticker_list:
+                        funding = await get_funding_rate(ticker)
+                        self._apply_funding_snapshot(ticker, funding, source="run_funding", now_ms=now_ms)
                 self._refresh_runtime_summary(refresh_source="run_funding", error="", touch_attempt=False)
             except Exception as e:
                 print(f"[{self.name}][run_funding][error] {e}")
                 self._refresh_runtime_summary(refresh_source="run_funding", error=str(e), touch_attempt=False)
 
-            await asyncio.sleep(self.funding_interval)
+            sleep_sec = self.collector_funding_interval if self._uses_symbol_price_funding() else self.funding_interval
+            await asyncio.sleep(sleep_sec)
 
     async def run_health(self):
         while self._running:
@@ -1011,12 +1144,27 @@ class Exchange:
         can_submit, _ = self.can_submit_order(ticker, require_funding=False)
         return can_submit
 
-    async def order(self, ticker: str, side: str, amount: float, price: float, *, is_hedge: bool = False):
+    async def order(
+        self,
+        ticker: str,
+        side: str,
+        amount: float,
+        price: float,
+        *,
+        is_hedge: bool = False,
+        owner: str | None = None,
+        strategy_order_role: str | None = None,
+    ):
         ticker = ticker.upper()
         side = side.lower()
         request_payload = build_order_request_payload(ticker, side, amount, price=price, order_type="limit")
         request_payload.setdefault("client_order_id", f"bnl{ticker}{int(time.time() * 1000)}")
         request_payload.setdefault("uuid", request_payload["client_order_id"])
+        if owner:
+            request_payload["owner"] = owner
+            request_payload["strategy_owner"] = owner
+        if strategy_order_role:
+            request_payload["strategy_order_role"] = strategy_order_role
         if is_hedge:
             request_payload["is_hedge"] = True
             snapshot = self.get_symbol_snapshot(ticker)
@@ -1058,6 +1206,11 @@ class Exchange:
         )
 
         if order_data and "error" not in order_data:
+            if owner:
+                order_data["owner"] = owner
+                order_data["strategy_owner"] = owner
+            if strategy_order_role:
+                order_data["strategy_order_role"] = strategy_order_role
             self._replace_waiting_order(order_data)
             self._remember_order_status(order_data)
 
@@ -1236,6 +1389,15 @@ class Exchange:
         if history is not None:
             self.funding_history[ticker] = history
         return history
+
+    async def get_funding_payments(
+        self,
+        *,
+        start_time_ms: int | None = None,
+        end_time_ms: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]] | None:
+        return await api_get_funding_payments(start_time_ms, end_time_ms, limit)
 
     async def get_ohlcv_snapshot(self, ticker: str, limit: int = 120):
         return await get_ohlcv_1m(ticker.upper(), limit=limit)
@@ -2114,6 +2276,7 @@ class Exchange:
             "ticker": ticker,
             "orderbook": self.ob.get(ticker, {}),
             "tick": self.tick.get(ticker, {}),
+            "market_meta": deepcopy(self.ticker_info.get(ticker, {})),
             "funding": funding_state,
             "position": self.position_snapshot.get(ticker, {}),
             "account_last_sync_ms": int(self.account_snapshot_last_sync_ms or 0),

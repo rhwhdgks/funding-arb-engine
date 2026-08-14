@@ -153,6 +153,12 @@ CREATE TABLE IF NOT EXISTS symbol_price (
     bid DECIMAL(28, 12) NULL,
     ask DECIMAL(28, 12) NULL,
 
+    funding_rate DECIMAL(18, 10) NULL,
+    next_funding_time_ms BIGINT UNSIGNED NULL,
+    funding_interval_hours TINYINT UNSIGNED NULL,
+    funding_interval_source VARCHAR(64) NULL,
+    funding_updated_at_ms BIGINT UNSIGNED NULL,
+
     PRIMARY KEY (id),
     UNIQUE KEY uq_symbol_price_exchange_symbol_bucket_notional (
         exchange_name,
@@ -160,8 +166,27 @@ CREATE TABLE IF NOT EXISTS symbol_price (
         bucket_start_ms
     ),
     KEY idx_symbol_price_exchange_symbol_bucket (exchange_name, symbol, bucket_start_ms),
-    KEY idx_symbol_price_exchange_symbol_desktop (exchange_name, symbol, desktop_time_ms)
+    KEY idx_symbol_price_exchange_symbol_desktop (exchange_name, symbol, desktop_time_ms),
+    KEY idx_symbol_price_exchange_symbol_funding (exchange_name, symbol, funding_updated_at_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE symbol_price
+    ADD COLUMN IF NOT EXISTS funding_rate DECIMAL(18, 10) NULL;
+
+ALTER TABLE symbol_price
+    ADD COLUMN IF NOT EXISTS next_funding_time_ms BIGINT UNSIGNED NULL;
+
+ALTER TABLE symbol_price
+    ADD COLUMN IF NOT EXISTS funding_updated_at_ms BIGINT UNSIGNED NULL;
+
+ALTER TABLE symbol_price
+    ADD COLUMN IF NOT EXISTS funding_interval_hours TINYINT UNSIGNED NULL;
+
+ALTER TABLE symbol_price
+    ADD COLUMN IF NOT EXISTS funding_interval_source VARCHAR(64) NULL;
+
+CREATE INDEX IF NOT EXISTS idx_symbol_price_exchange_symbol_funding
+    ON symbol_price (exchange_name, symbol, funding_updated_at_ms);
 
 
 CREATE TABLE IF NOT EXISTS funding_rate (
@@ -175,6 +200,8 @@ CREATE TABLE IF NOT EXISTS funding_rate (
 
     funding_rate DECIMAL(18, 10) NOT NULL,
     next_funding_time_ms BIGINT UNSIGNED NULL,
+    funding_interval_hours TINYINT UNSIGNED NULL,
+    funding_interval_source VARCHAR(64) NULL,
 
     raw_json LONGTEXT NULL,
 
@@ -183,6 +210,12 @@ CREATE TABLE IF NOT EXISTS funding_rate (
     KEY idx_funding_rate_exchange_symbol_bucket (exchange_name, symbol, bucket_start_ms),
     KEY idx_funding_rate_exchange_symbol_next_time (exchange_name, symbol, next_funding_time_ms)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+ALTER TABLE funding_rate
+    ADD COLUMN IF NOT EXISTS funding_interval_hours TINYINT UNSIGNED NULL;
+
+ALTER TABLE funding_rate
+    ADD COLUMN IF NOT EXISTS funding_interval_source VARCHAR(64) NULL;
 
 
 CREATE TABLE IF NOT EXISTS fx (

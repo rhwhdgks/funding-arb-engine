@@ -94,6 +94,7 @@ def korean_close_reason(reason: Any) -> str:
         "take_profit": "익절",
         "spread_nonpositive": "갭0이하",
         "funding_cost_over_gap": "펀딩비용초과",
+        "hold_for_positive_funding": "양수펀딩정산대기",
         "max_hold": "최대보유",
         "close_candidate": "후보전환",
         "manual": "수동",
@@ -112,7 +113,9 @@ def log_strategy_config_summary(*, config: Any, symbols: list[str]) -> None:
         f"최대페어={getattr(config, 'max_open_pairs', '-')} 레버리지={getattr(config, 'leverage', '-')} "
         f"진입기준={fmt_bps(getattr(config, 'min_expected_net_edge_bps', 0.0))}bps "
         f"체결후기준={fmt_bps(getattr(config, 'entry_post_fill_min_net_edge_bps', 0.0))}bps "
+        f"펀딩모델={'event' if getattr(config, 'funding_event_model_enabled', False) else 'legacy-shadow'} "
         f"메이커큐={_enabled_text(getattr(config, 'maker_entry_engine_enabled', False))} "
+        f"메이커Admission={_enabled_text(getattr(config, 'maker_entry_engine_require_full_admission', True))} "
         f"메이커심볼={symbol_text} 큐허용폭={fmt_bps(getattr(config, 'maker_entry_engine_queue_edge_gap_bps', 0.0))}bps "
         f"청산방식={_korean_close_mode(getattr(config, 'close_execution_mode', '-'))} "
         f"청산FeeGate={_enabled_text(getattr(config, 'normal_close_fee_gate_enabled', False))} "

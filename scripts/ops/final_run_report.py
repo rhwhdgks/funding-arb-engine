@@ -166,6 +166,8 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
     top_enterable_symbol_counts: Counter[str] = Counter()
     enterable_scan_count = 0
     max_enterable_candidates = 0
+    funding_shadow_changed_scan_count = 0
+    funding_shadow_changed_candidate_total = 0
 
     for row in run_rows:
         event_type = str(row.get("event_type") or "")
@@ -173,6 +175,9 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
             enterable_count = int(row.get("enterable_candidates") or 0)
             enterable_scan_count += 1 if enterable_count > 0 else 0
             max_enterable_candidates = max(max_enterable_candidates, enterable_count)
+            shadow_changed = int(row.get("funding_shadow_changed_candidates") or 0)
+            funding_shadow_changed_scan_count += 1 if shadow_changed > 0 else 0
+            funding_shadow_changed_candidate_total += shadow_changed
             block_reason_counts.update(row.get("reason_counts") or {})
 
             top_candidate = row.get("top_candidate") or {}
@@ -254,6 +259,9 @@ def build_strategy_performance_report(run_meta: dict[str, Any]) -> dict[str, Any
         "candidate_scan_count": int(event_counts.get("candidate_scan_summary", 0)),
         "enterable_scan_count": enterable_scan_count,
         "max_enterable_candidates": max_enterable_candidates,
+        "funding_shadow_changed_scan_count": funding_shadow_changed_scan_count,
+        "funding_shadow_changed_candidate_total": funding_shadow_changed_candidate_total,
+        "funding_close_shadow_changed_count": int(event_counts.get("pair_close_funding_shadow", 0)),
         "top_block_reasons": dict(block_reason_counts.most_common(10)),
         "top_candidate_symbols": dict(top_symbol_counts.most_common(10)),
         "top_enterable_symbols": dict(top_enterable_symbol_counts.most_common(10)),
@@ -460,8 +468,32 @@ def build_entry_quality_report(run_rows: list[dict[str, Any]]) -> dict[str, Any]
     expected_open_bps_values = [safe_float(row.get("expected_open_edge_bps")) for row in quality_rows]
     actual_bps_values = [safe_float(row.get("actual_open_edge_bps")) for row in quality_rows]
     slippage_bps_values = [safe_float(row.get("entry_edge_slippage_bps")) for row in quality_rows]
-    first_fill_to_hedge_values = [safe_float(row.get("first_fill_to_hedge_fill_ms")) for row in quality_rows]
+    def metric_values(key: str, fallback: str | None = None) -> list[float]:
+        values: list[float] = []
+        for row in quality_rows:
+            raw = row.get(key)
+            if raw is None and fallback:
+                raw = row.get(fallback)
+            if raw is not None:
+                values.append(safe_float(raw))
+        return values
+
+    first_fill_to_ack_values = metric_values("first_fill_to_hedge_ack_ms")
+    first_fill_to_first_fill_values = metric_values("first_fill_to_hedge_first_fill_ms")
+    first_fill_to_full_fill_values = metric_values(
+        "first_fill_to_hedge_full_fill_ms",
+        "first_fill_to_hedge_fill_ms",
+    )
+    first_fill_to_neutralized_values = metric_values("first_fill_to_neutralized_ms")
     total_entry_elapsed_values = [safe_float(row.get("total_entry_elapsed_ms")) for row in quality_rows]
+    legacy_funding_values = metric_values("legacy_funding_pnl_usd")
+    candidate_event_raw_values = metric_values("candidate_funding_event_raw_pnl_usd")
+    candidate_event_funding_values = metric_values("candidate_funding_event_pnl_usd")
+    actual_event_funding_values = metric_values("actual_funding_event_pnl_usd")
+    actual_entry_funding_adjustment_values = metric_values("actual_entry_funding_adjustment_usd")
+    shadow_admission_changed_count = sum(
+        1 for row in quality_rows if bool(row.get("funding_shadow_admission_changed"))
+    )
     bad_expected_rows = [
         row
         for row in quality_rows
@@ -488,7 +520,13 @@ def build_entry_quality_report(run_rows: list[dict[str, Any]]) -> dict[str, Any]
         bucket["expected_open_edge_bps_values"].append(safe_float(row.get("expected_open_edge_bps")))
         bucket["actual_open_edge_bps_values"].append(safe_float(row.get("actual_open_edge_bps")))
         bucket["slippage_bps_values"].append(safe_float(row.get("entry_edge_slippage_bps")))
-        bucket["first_fill_to_hedge_fill_ms_values"].append(safe_float(row.get("first_fill_to_hedge_fill_ms")))
+        bucket["first_fill_to_hedge_fill_ms_values"].append(
+            safe_float(
+                row.get("first_fill_to_hedge_full_fill_ms")
+                if row.get("first_fill_to_hedge_full_fill_ms") is not None
+                else row.get("first_fill_to_hedge_fill_ms")
+            )
+        )
 
     symbol_rows: list[dict[str, Any]] = []
     for symbol, bucket in by_symbol.items():
@@ -520,7 +558,11 @@ def build_entry_quality_report(run_rows: list[dict[str, Any]]) -> dict[str, Any]
                 "expected_open_edge_bps": safe_float(row.get("expected_open_edge_bps")),
                 "actual_open_edge_bps": safe_float(row.get("actual_open_edge_bps")),
                 "slippage_bps": safe_float(row.get("entry_edge_slippage_bps")),
-                "first_fill_to_hedge_fill_ms": safe_float(row.get("first_fill_to_hedge_fill_ms")),
+                "first_fill_to_hedge_fill_ms": safe_float(
+                    row.get("first_fill_to_hedge_full_fill_ms")
+                    if row.get("first_fill_to_hedge_full_fill_ms") is not None
+                    else row.get("first_fill_to_hedge_fill_ms")
+                ),
                 "total_entry_elapsed_ms": safe_float(row.get("total_entry_elapsed_ms")),
             }
         )
@@ -532,8 +574,23 @@ def build_entry_quality_report(run_rows: list[dict[str, Any]]) -> dict[str, Any]
         "expected_open_edge_bps_avg": avg(expected_open_bps_values),
         "actual_open_edge_bps_avg": avg(actual_bps_values),
         "slippage_bps_avg": avg(slippage_bps_values),
-        "first_fill_to_hedge_fill_ms_p50": percentile(first_fill_to_hedge_values, 0.50),
-        "first_fill_to_hedge_fill_ms_p90": percentile(first_fill_to_hedge_values, 0.90),
+        "legacy_funding_pnl_usd_avg": avg(legacy_funding_values),
+        "candidate_event_raw_pnl_usd_avg": avg(candidate_event_raw_values),
+        "candidate_event_funding_pnl_usd_avg": avg(candidate_event_funding_values),
+        "actual_event_funding_pnl_usd_avg": avg(actual_event_funding_values),
+        "actual_entry_funding_adjustment_usd_avg": avg(actual_entry_funding_adjustment_values),
+        "funding_shadow_admission_changed_count": shadow_admission_changed_count,
+        "first_fill_to_hedge_ack_ms_p50": percentile(first_fill_to_ack_values, 0.50),
+        "first_fill_to_hedge_ack_ms_p90": percentile(first_fill_to_ack_values, 0.90),
+        "first_fill_to_hedge_first_fill_ms_p50": percentile(first_fill_to_first_fill_values, 0.50),
+        "first_fill_to_hedge_first_fill_ms_p90": percentile(first_fill_to_first_fill_values, 0.90),
+        "first_fill_to_hedge_full_fill_ms_p50": percentile(first_fill_to_full_fill_values, 0.50),
+        "first_fill_to_hedge_full_fill_ms_p90": percentile(first_fill_to_full_fill_values, 0.90),
+        "first_fill_to_neutralized_ms_p50": percentile(first_fill_to_neutralized_values, 0.50),
+        "first_fill_to_neutralized_ms_p90": percentile(first_fill_to_neutralized_values, 0.90),
+        # Compatibility alias. This now means confirmed full fill, never ACK.
+        "first_fill_to_hedge_fill_ms_p50": percentile(first_fill_to_full_fill_values, 0.50),
+        "first_fill_to_hedge_fill_ms_p90": percentile(first_fill_to_full_fill_values, 0.90),
         "total_entry_elapsed_ms_p50": percentile(total_entry_elapsed_values, 0.50),
         "total_entry_elapsed_ms_p90": percentile(total_entry_elapsed_values, 0.90),
         "by_symbol": symbol_rows,
@@ -763,6 +820,85 @@ def db_skipped_report(reason: str, *, since_ms: int, run_meta: dict[str, Any]) -
     }
 
 
+def build_funding_cashflow_report(
+    rows: list[dict[str, Any]],
+    *,
+    run_meta: dict[str, Any],
+    sync_count: int = 0,
+    sync_failure_count: int = 0,
+    sync_expected: bool = False,
+) -> dict[str, Any]:
+    expected_account = str(run_meta.get("account_label") or os.getenv("STRATEGY_ACCOUNT_LABEL") or "").strip()
+    expected_logic = str(run_meta.get("logic") or os.getenv("STRATEGY_LOGIC") or "").strip()
+    matched: list[dict[str, Any]] = []
+    for row in rows:
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        if expected_account and str(raw.get("account_label") or "") != expected_account:
+            continue
+        if expected_logic and str(raw.get("logic") or "") != expected_logic:
+            continue
+        matched.append(row)
+
+    by_exchange: dict[str, dict[str, Any]] = {}
+    unattributed_count = 0
+    for row in matched:
+        exchange = str(row.get("exchange_name") or "unknown").lower()
+        amount = safe_float(row.get("amount"))
+        summary = by_exchange.setdefault(exchange, {"count": 0, "amount_usd": 0.0})
+        summary["count"] += 1
+        summary["amount_usd"] += amount
+        raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+        if not raw.get("pair_id"):
+            unattributed_count += 1
+
+    checks = [
+        check(
+            "WARN" if unattributed_count else "PASS",
+            "funding_payment_pair_attribution",
+            f"rows={len(matched)} unattributed={unattributed_count}",
+        ),
+        check(
+            "WARN" if sync_failure_count else "PASS",
+            "funding_payment_sync_failures_zero",
+            f"failures={sync_failure_count}",
+        ),
+    ]
+    if sync_expected:
+        checks.append(
+            check(
+                "PASS" if sync_count else "WARN",
+                "funding_payment_sync_observed",
+                f"sync_count={sync_count}",
+            )
+        )
+    warn_count = sum(1 for item in checks if item["status"] == "WARN")
+    return {
+        "verdict": "WARN" if warn_count else "PASS",
+        "fail_count": 0,
+        "warn_count": warn_count,
+        "checks": checks,
+        "row_count": len(matched),
+        "unattributed_count": unattributed_count,
+        "sync_count": sync_count,
+        "sync_failure_count": sync_failure_count,
+        "net_amount_usd": sum(safe_float(row.get("amount")) for row in matched),
+        "by_exchange": by_exchange,
+    }
+
+
+def funding_cashflow_error_report(exc: Exception | str) -> dict[str, Any]:
+    return {
+        "verdict": "WARN",
+        "fail_count": 0,
+        "warn_count": 1,
+        "checks": [check("WARN", "funding_payment_query_ok", str(exc))],
+        "row_count": 0,
+        "unattributed_count": 0,
+        "net_amount_usd": 0.0,
+        "by_exchange": {},
+    }
+
+
 def render_db_error_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Order/Trade DB Reconcile Report",
@@ -815,6 +951,7 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     live_report = payload.get("live_flat") or {}
     symbol_price_report = payload.get("symbol_price") or {}
     api_pressure = payload.get("api_pressure") or {}
+    funding_cashflow = payload.get("funding_cashflow") or {}
     performance = payload.get("strategy_performance") or {}
     artifacts = payload.get("artifacts") or {}
     event_counts = afterrun.get("event_counts") or {}
@@ -890,6 +1027,15 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- candidate_scan_count: {performance.get('candidate_scan_count', 0)}")
     lines.append(f"- enterable_scan_count: {performance.get('enterable_scan_count', 0)}")
     lines.append(f"- max_enterable_candidates: {performance.get('max_enterable_candidates', 0)}")
+    lines.append(
+        "- funding_shadow_changed_scan_count/candidate_total: "
+        f"{performance.get('funding_shadow_changed_scan_count', 0)}/"
+        f"{performance.get('funding_shadow_changed_candidate_total', 0)}"
+    )
+    lines.append(
+        "- funding_close_shadow_changed_count: "
+        f"{performance.get('funding_close_shadow_changed_count', 0)}"
+    )
     close_reasons = performance.get("pair_close_reasons") or {}
     if close_reasons:
         lines.append("- close_reasons: " + ", ".join(f"{key}={value}" for key, value in close_reasons.items()))
@@ -934,9 +1080,36 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
     lines.append(f"- actual_open_edge_bps_avg: {float(entry_quality.get('actual_open_edge_bps_avg') or 0):.2f}")
     lines.append(f"- slippage_bps_avg: {float(entry_quality.get('slippage_bps_avg') or 0):.2f}")
     lines.append(
-        f"- first_fill_to_hedge_fill_ms_p50/p90: "
-        f"{float(entry_quality.get('first_fill_to_hedge_fill_ms_p50') or 0):.1f}/"
-        f"{float(entry_quality.get('first_fill_to_hedge_fill_ms_p90') or 0):.1f}"
+        "- funding legacy/candidate-event-raw/candidate-adjustment/actual-event/actual-adjustment usd avg: "
+        f"{float(entry_quality.get('legacy_funding_pnl_usd_avg') or 0):.6f}/"
+        f"{float(entry_quality.get('candidate_event_raw_pnl_usd_avg') or 0):.6f}/"
+        f"{float(entry_quality.get('candidate_event_funding_pnl_usd_avg') or 0):.6f}/"
+        f"{float(entry_quality.get('actual_event_funding_pnl_usd_avg') or 0):.6f}/"
+        f"{float(entry_quality.get('actual_entry_funding_adjustment_usd_avg') or 0):.6f}"
+    )
+    lines.append(
+        "- funding_shadow_admission_changed_count: "
+        f"{int(entry_quality.get('funding_shadow_admission_changed_count') or 0)}"
+    )
+    lines.append(
+        f"- first_fill_to_hedge_ack_ms_p50/p90: "
+        f"{float(entry_quality.get('first_fill_to_hedge_ack_ms_p50') or 0):.1f}/"
+        f"{float(entry_quality.get('first_fill_to_hedge_ack_ms_p90') or 0):.1f}"
+    )
+    lines.append(
+        f"- first_fill_to_hedge_first_fill_ms_p50/p90: "
+        f"{float(entry_quality.get('first_fill_to_hedge_first_fill_ms_p50') or 0):.1f}/"
+        f"{float(entry_quality.get('first_fill_to_hedge_first_fill_ms_p90') or 0):.1f}"
+    )
+    lines.append(
+        f"- first_fill_to_hedge_full_fill_ms_p50/p90: "
+        f"{float(entry_quality.get('first_fill_to_hedge_full_fill_ms_p50') or 0):.1f}/"
+        f"{float(entry_quality.get('first_fill_to_hedge_full_fill_ms_p90') or 0):.1f}"
+    )
+    lines.append(
+        f"- first_fill_to_neutralized_ms_p50/p90: "
+        f"{float(entry_quality.get('first_fill_to_neutralized_ms_p50') or 0):.1f}/"
+        f"{float(entry_quality.get('first_fill_to_neutralized_ms_p90') or 0):.1f}"
     )
     symbol_quality = entry_quality.get("by_symbol") or []
     if symbol_quality:
@@ -1013,6 +1186,19 @@ def render_final_markdown(payload: dict[str, Any]) -> str:
             f"- {row.get('exchange')}: latest_bucket={row.get('latest_bucket_utc') or '-'} "
             f"age_ms={row.get('latest_age_ms')} "
             f"symbols={row.get('latest_symbol_count')}/{row.get('expected_symbol_count')}"
+        )
+    lines.append("")
+    lines.append("## Actual Funding Cashflow")
+    lines.extend(render_check_lines(funding_cashflow.get("checks") or []))
+    lines.append(f"- row_count: {funding_cashflow.get('row_count', 0)}")
+    lines.append(f"- unattributed_count: {funding_cashflow.get('unattributed_count', 0)}")
+    lines.append(f"- sync_count: {funding_cashflow.get('sync_count', 0)}")
+    lines.append(f"- sync_failure_count: {funding_cashflow.get('sync_failure_count', 0)}")
+    lines.append(f"- net_amount_usd: {float(funding_cashflow.get('net_amount_usd') or 0):.8f}")
+    for exchange_name, row in sorted((funding_cashflow.get("by_exchange") or {}).items()):
+        lines.append(
+            f"- {exchange_name}: count={int(row.get('count') or 0)} "
+            f"amount_usd={float(row.get('amount_usd') or 0):.8f}"
         )
     lines.append("")
     lines.append("## API Pressure")
@@ -1103,9 +1289,20 @@ def main() -> int:
     afterrun_output.write_text(render_summary_markdown(afterrun_payload), encoding="utf-8")
 
     since_ms = int(run_meta.get("started_at_ms") or 0)
+    run_rows_for_scope = load_run_rows_from_meta(run_meta)
+    run_end_ms = max((int(row.get("ts_ms") or 0) for row in run_rows_for_scope), default=now_ms())
+    run_event_counts = Counter(str(row.get("event_type") or "") for row in run_rows_for_scope)
+    funding_sync_count = int(run_event_counts.get("funding_cashflow_synced", 0))
+    funding_sync_failure_count = int(run_event_counts.get("funding_cashflow_sync_failed", 0))
+    funding_sync_interval_sec = max(float(os.getenv("STRATEGY_FUNDING_CASHFLOW_INTERVAL_SEC", "300") or 300), 60.0)
+    funding_sync_expected = (
+        boolish(os.getenv("STRATEGY_FUNDING_CASHFLOW_ENABLED", "1"))
+        and max(run_end_ms - since_ms, 0) >= int(funding_sync_interval_sec * 1000)
+    )
     db_markdown = ""
+    funding_cashflow: dict[str, Any]
     try:
-        from src.ops.persistence.db import db_persistence_enabled, get_db_connection
+        from src.ops.persistence.db import db_persistence_enabled, fetch_cashflow_rows, get_db_connection
 
         if db_persistence_enabled():
             conn = get_db_connection()
@@ -1115,14 +1312,30 @@ def main() -> int:
                     since_ms=since_ms,
                     run_meta=run_meta,
                 )
+                funding_rows = fetch_cashflow_rows(
+                    conn,
+                    flow_type="funding_payment",
+                    start_time_ms=since_ms,
+                    end_time_ms=run_end_ms,
+                    limit=10_000,
+                )
+                funding_cashflow = build_funding_cashflow_report(
+                    funding_rows,
+                    run_meta=run_meta,
+                    sync_count=funding_sync_count,
+                    sync_failure_count=funding_sync_failure_count,
+                    sync_expected=funding_sync_expected,
+                )
             finally:
                 conn.close()
             db_markdown = render_order_trade_markdown(db_report)
         else:
             db_report = db_skipped_report("db_persistence_disabled", since_ms=since_ms, run_meta=run_meta)
+            funding_cashflow = funding_cashflow_error_report("db_persistence_disabled")
             db_markdown = render_db_error_markdown(db_report)
     except Exception as exc:
         db_report = db_error_report(exc, since_ms=since_ms, run_meta=run_meta)
+        funding_cashflow = funding_cashflow_error_report(exc)
         db_markdown = render_db_error_markdown(db_report)
     reconcile_output.parent.mkdir(parents=True, exist_ok=True)
     reconcile_output.write_text(db_markdown, encoding="utf-8")
@@ -1165,10 +1378,11 @@ def main() -> int:
         verdict_to_check("live_exchange_flat_passed", live_flat),
         verdict_to_check("symbol_price_collector_passed", symbol_price),
         verdict_to_check("api_pressure_passed", api_pressure),
+        verdict_to_check("funding_cashflow_observed", funding_cashflow),
     ]
     final = build_final_verdict(
         component_checks,
-        [afterrun_payload.get("verdict") or {}, db_report, live_flat, symbol_price, api_pressure],
+        [afterrun_payload.get("verdict") or {}, db_report, live_flat, symbol_price, api_pressure, funding_cashflow],
         allow_warnings=args.allow_warnings,
     )
     payload = {
@@ -1181,6 +1395,7 @@ def main() -> int:
         "live_flat": live_flat,
         "symbol_price": symbol_price,
         "api_pressure": api_pressure,
+        "funding_cashflow": funding_cashflow,
         "strategy_performance": strategy_performance,
         "artifacts": {
             "afterrun_summary_md": str(afterrun_output),

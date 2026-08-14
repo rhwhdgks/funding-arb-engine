@@ -110,6 +110,9 @@
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; }
     .row3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.45rem; }
     .chips { display: flex; gap: 0.45rem; flex-wrap: wrap; justify-content: flex-end; }
+    .auth-controls { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .auth-controls input { width: 10rem; padding: 0.42rem 0.55rem; font-size: 0.78rem; }
+    .auth-controls button { width: auto; padding: 0.42rem 0.65rem; font-size: 0.78rem; }
     .chip {
       border: 1px solid var(--line);
       padding: 0.3rem 0.55rem;
@@ -121,6 +124,32 @@
     .chip.good { color: var(--good); border-color: rgba(119, 211, 123, 0.45); }
     .chip.warn { color: var(--warn); border-color: rgba(241, 201, 107, 0.45); }
     .chip.bad { color: var(--bad); border-color: rgba(255, 125, 112, 0.45); }
+    .kv-value { word-break: break-word; }
+    .kv-symbols {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 0.28rem;
+      max-width: 34rem;
+      margin-left: auto;
+    }
+    .symbol-pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(51, 66, 54, 0.75);
+      border-radius: 999px;
+      padding: 0.12rem 0.42rem;
+      background: rgba(12, 18, 14, 0.5);
+      color: var(--text);
+      font-size: 0.7rem;
+      line-height: 1.25;
+    }
+    .kv-note {
+      flex-basis: 100%;
+      color: var(--muted);
+      font-size: 0.7rem;
+      text-align: right;
+    }
     .muted { color: var(--muted); }
     .good { color: var(--good); }
     .warn { color: var(--warn); }
@@ -297,7 +326,14 @@
       <h1>Ops Console</h1>
       <div class="sub">resident runtime cache 기반 수동 운영 콘솔</div>
     </div>
-    <div class="chips" id="statusChips"></div>
+    <div>
+      <div class="auth-controls">
+        <input id="opsOperator" type="text" value="local_operator" aria-label="operator" placeholder="operator" />
+        <input id="opsToken" type="password" aria-label="action token" placeholder="action token" autocomplete="off" />
+        <button id="enableActionsBtn" class="secondary">실행 5분 허용</button>
+      </div>
+      <div class="chips" id="statusChips"></div>
+    </div>
   </header>
 
   <main>
@@ -430,6 +466,8 @@
     let refreshInFlight = false;
     let refreshStrategyInFlight = false;
     let strategyHealthInFlight = false;
+    const savedOperator = sessionStorage.getItem("opsOperator");
+    if (savedOperator) $("opsOperator").value = savedOperator;
 
     function fmt(v, d = 4) {
       const n = Number(v);
@@ -448,8 +486,17 @@
       if (values.includes(current)) select.value = current;
     }
 
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
     function chip(label, cls = "") {
-      return `<span class="chip ${cls}">${label}</span>`;
+      return `<span class="chip ${cls}">${escapeHtml(label)}</span>`;
     }
 
     function decimalPlaces(value) {
@@ -837,6 +884,10 @@
         chip(`source=${state.runtime?.symbols_source || "-"}`),
         chip(state.runtime?.entry_control?.entry_paused ? "entry paused" : "entry active", state.runtime?.entry_control?.entry_paused ? "warn" : "good"),
         chip(state.runtime?.web_trading_enabled ? "web trading on" : "web trading off", state.runtime?.web_trading_enabled ? "warn" : ""),
+        chip(
+          state.runtime?.live_action_window?.enabled ? "live actions unlocked" : "live actions locked",
+          state.runtime?.live_action_window?.enabled ? "warn" : "good"
+        ),
         orphans.length ? chip(`⚠ 헷지깨진 포지션 ${orphans.length}: ${orphans.map(o => o.symbol).join(",")}`, "bad") : ""
       ].join("");
 
@@ -873,7 +924,19 @@
     }
 
     function renderKeyValueTable(obj) {
-      const rows = Object.entries(obj || {}).map(([k, v]) => `<tr><td>${k}</td><td>${Array.isArray(v) || typeof v === "object" ? JSON.stringify(v) : v ?? "-"}</td></tr>`).join("");
+      const renderValue = (key, value) => {
+        if (key === "symbols" && Array.isArray(value)) {
+          const pills = value.map(symbol => `<span class="symbol-pill">${escapeHtml(symbol)}</span>`).join("");
+          return `<div class="kv-symbols"><div class="kv-note">${value.length} symbols</div>${pills || "-"}</div>`;
+        }
+        if (Array.isArray(value) || (value && typeof value === "object")) {
+          return escapeHtml(JSON.stringify(value));
+        }
+        return escapeHtml(value ?? "-");
+      };
+      const rows = Object.entries(obj || {})
+        .map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td class="kv-value">${renderValue(k, v)}</td></tr>`)
+        .join("");
       return `<table><tbody>${rows || `<tr><td class="muted">empty</td><td></td></tr>`}</tbody></table>`;
     }
 
@@ -1168,6 +1231,9 @@
       if (text.includes("invalid action token")) {
         return "실행 권한 토큰이 올바르지 않습니다.";
       }
+      if (text.includes("live action window is closed")) {
+        return "실행 허용 시간이 닫혀 있습니다. action token을 입력하고 '실행 5분 허용'을 먼저 누르세요.";
+      }
       if (text.includes("stale market data")) {
         const age = text.match(/age_ms=([^\\s]+)/)?.[1];
         return `시장 데이터가 오래되어 주문을 막았습니다.${age ? ` 현재 age=${age}ms` : ""}`;
@@ -1216,7 +1282,14 @@
     }
 
     async function post(path, body) {
-      const headers = {"Content-Type": "application/json"};
+      const token = $("opsToken")?.value || "";
+      const operator = $("opsOperator")?.value || "local_operator";
+      sessionStorage.setItem("opsOperator", operator);
+      const headers = {
+        "Content-Type": "application/json",
+        "X-OPS-OPERATOR": operator,
+      };
+      if (token) headers["X-OPS-TOKEN"] = token;
       const res = await fetch(path, {method: "POST", headers, body: JSON.stringify(body), cache: "no-store"});
       const data = await res.json();
       const ok = Boolean(data.ok);
@@ -1226,6 +1299,10 @@
         : `요청 실패: ${explainError(res.status, data.detail || JSON.stringify(data))}`;
       await refresh();
     }
+
+    $("enableActionsBtn").onclick = async () => {
+      await post("/api/runtime/enable-actions", {duration_sec: 300});
+    };
 
     function orderPayload() {
       return {

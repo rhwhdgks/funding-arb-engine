@@ -14,7 +14,7 @@ import uvicorn
 
 from src.core.api_pressure import current_api_pressure_summary
 from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
-from src.ops_console.action_gate import set_active_strategy_symbols_provider
+from src.ops_console.action_gate import live_action_window_status, set_active_strategy_symbols_provider
 from src.ops_console.runtime import (
     PROJECT_ROOT,
     action_token_required,
@@ -36,6 +36,8 @@ from src.ops_console.strategy_dashboard import (
 )
 
 if TYPE_CHECKING:
+    from src.core.action_gate import ActionGate
+    from src.core.order_intent import OrderIntentJournal
     from src.strategy.control import EntryControlStore
     from src.strategy.models import OpenPairState, StrategyConfig
 
@@ -138,6 +140,7 @@ class StrategyControlCommand:
     payload: Any
     response_future: asyncio.Future[Any]
     ops_token: str | None = None
+    operator: str = "local_operator"
     enqueued_at_ms: int = field(default_factory=now_ms)
     command_id: str = field(default_factory=new_control_command_id)
 
@@ -261,6 +264,8 @@ class StrategyControlService:
         symbol_recent_close_ms: dict[str, int],
         wake_queue: asyncio.Queue[tuple[str, str, int]],
         command_queue: asyncio.Queue[StrategyControlCommand],
+        action_gate: "ActionGate | None" = None,
+        order_intent_journal: "OrderIntentJournal | None" = None,
         event_sink: Callable[..., None] | None = None,
     ) -> None:
         self.config = config
@@ -273,6 +278,8 @@ class StrategyControlService:
         self.symbol_recent_close_ms = symbol_recent_close_ms
         self.wake_queue = wake_queue
         self.command_queue = command_queue
+        self.action_gate = action_gate
+        self.order_intent_journal = order_intent_journal
         self.event_sink = event_sink
         self.stale_ms = int(os.getenv("OPS_CONSOLE_STALE_MS", "1500"))
         self.account_label = resolve_account_label()
@@ -368,6 +375,7 @@ class StrategyControlService:
             enqueued_at_ms=command.enqueued_at_ms,
             payload_summary=command_payload_summary(command.payload),
             ops_token_present=bool(command.ops_token),
+            operator=command.operator,
             **payload,
         )
 
@@ -406,6 +414,9 @@ class StrategyControlService:
             "generated_at_ms": generated_at_ms,
             "data_age_ms": max(ages) if ages else 0,
             "source_status": source_status,
+            "source": "embedded_strategy",
+            "exchange_owner": "strategy",
+            "standalone_enabled": False,
             "last_error": self.last_error or None,
             "mode": os.getenv("STRATEGY_MODE", "LIVE"),
             "symbols": self.symbols,
@@ -419,8 +430,12 @@ class StrategyControlService:
                 "entry_control": self.entry_control_dict(),
                 "web_trading_enabled": parse_bool(os.getenv("ENABLE_WEB_TRADING"), False),
                 "token_required": action_token_required(),
+                "live_action_window": live_action_window_status(),
                 "account_label": self.account_label,
                 "logic": self.logic,
+                "source": "embedded_strategy",
+                "exchange_owner": "strategy",
+                "standalone_enabled": False,
             },
         }
 
@@ -464,6 +479,9 @@ class StrategyControlService:
             "generated_at_ms": now,
             "data_age_ms": max(age_candidates) if age_candidates else 0,
             "source_status": source_status,
+            "source": "embedded_strategy",
+            "exchange_owner": "strategy",
+            "standalone_enabled": False,
             "last_error": self.last_error or None,
             "paths": {
                 "log_dir": str(log_dir),
@@ -487,6 +505,9 @@ class StrategyControlService:
                 "logic": self.logic,
                 "runtime_stopped": False,
                 "entry_control": self.entry_control_dict(),
+                "source": "embedded_strategy",
+                "exchange_owner": "strategy",
+                "standalone_enabled": False,
             },
             "health": {
                 "danger_total": sum(danger_counts.values()),
@@ -521,6 +542,9 @@ class StrategyControlService:
             "artifacts": latest_artifacts(log_dir),
             "meta": {
                 "embedded": True,
+                "source": "embedded_strategy",
+                "exchange_owner": "strategy",
+                "standalone_enabled": False,
                 "startup_block_reasons": list(self.startup_block_reasons),
                 "open_pair_ids": sorted(self.open_pairs.keys()),
                 "assumed_flat_keys": [
@@ -528,6 +552,12 @@ class StrategyControlService:
                     for (exchange, symbol), until_ms in sorted(self.assumed_flat_until_ms.items())
                 ],
                 "recent_close_symbols": dict(self.symbol_recent_close_ms),
+                "action_gate": self.action_gate.snapshot() if self.action_gate is not None else {},
+                "order_intents": (
+                    self.order_intent_journal.snapshot()
+                    if self.order_intent_journal is not None
+                    else {}
+                ),
             },
         }
 
@@ -605,6 +635,23 @@ class StrategyControlService:
             {"reasons": startup_block_reasons},
         )
 
+        order_intents = (state.get("meta") or {}).get("order_intents") or {}
+        unresolved_intents = order_intents.get("unresolved") or []
+        add_check(
+            "PASS" if not unresolved_intents else "FAIL",
+            "unresolved_order_intents_empty",
+            f"count={len(unresolved_intents)}",
+            {"intents": unresolved_intents[:10]},
+        )
+
+        token_configured = bool(os.getenv("OPS_CONSOLE_ACTION_TOKEN", "").strip())
+        token_required = action_token_required()
+        add_check(
+            "PASS" if token_required and token_configured else "FAIL",
+            "ops_console_action_token_configured",
+            f"required={token_required} configured={token_configured}",
+        )
+
         api_failures = 0
         api_warnings = 0
         api_metrics: dict[str, Any] = {}
@@ -672,6 +719,7 @@ class StrategyControlService:
         payload: Any,
         *,
         ops_token: str | None,
+        operator: str = "local_operator",
         timeout_sec: float | None = None,
     ) -> dict[str, Any]:
         loop = asyncio.get_running_loop()
@@ -681,6 +729,7 @@ class StrategyControlService:
             payload=payload,
             response_future=future,
             ops_token=ops_token,
+            operator=str(operator or "local_operator")[:64],
         )
         self.command_queue.put_nowait(command)
         with contextlib.suppress(asyncio.QueueFull):

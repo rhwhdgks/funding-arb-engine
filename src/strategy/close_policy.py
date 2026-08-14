@@ -153,16 +153,25 @@ def decide_pair_close_reason(
     close_edge_usd: float,
     reference_notional_usd: float | None = None,
     action_inputs_fresh: bool = True,
+    next_funding_pnl_usd: float = 0.0,
+    funding_wait_sec: float = float("inf"),
 ) -> str:
     if not action_inputs_fresh:
         return "await_account_sync"
 
+    if entry_age_sec >= config.max_hold_sec:
+        return "max_hold"
     if close_edge_usd <= 0:
+        if (
+            config.close_positive_funding_wait_enabled
+            and next_funding_pnl_usd > 0
+            and hold_pnl_usd > 0
+            and 0 <= funding_wait_sec <= config.close_positive_funding_wait_max_sec
+        ):
+            return "hold_for_positive_funding"
         return "spread_nonpositive"
     if hold_pnl_usd <= 0:
         return "funding_cost_over_gap"
-    if entry_age_sec >= config.max_hold_sec:
-        return "max_hold"
     return "hold_spread_support"
 
 
@@ -213,6 +222,8 @@ def evaluate_close_policy(
     close_edge_usd: float,
     reference_notional_usd: float | None = None,
     action_inputs_fresh: bool = True,
+    next_funding_pnl_usd: float = 0.0,
+    funding_wait_sec: float = float("inf"),
 ) -> ClosePolicyEvaluation:
     thresholds = close_thresholds_usd(pair, config, reference_notional_usd)
     decision = decide_pair_close_reason(
@@ -224,6 +235,8 @@ def evaluate_close_policy(
         close_edge_usd=close_edge_usd,
         reference_notional_usd=thresholds["reference_notional_usd"],
         action_inputs_fresh=action_inputs_fresh,
+        next_funding_pnl_usd=next_funding_pnl_usd,
+        funding_wait_sec=funding_wait_sec,
     )
     return ClosePolicyEvaluation(
         decision=decision,

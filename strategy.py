@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 from src.core.action_gate import ActionGate
 from src.core.api_pressure import flush_api_pressure
+from src.core.order_intent import OrderIntentJournal, active_order_intent_journal
 from dotenv import load_dotenv
 from src.ops.position_ownership import active_manual_symbols
 from src.ops.orphan_guard import active_orphan_symbols, active_orphans, mark_orphan, clear_orphan
 from src.ops.persistence.entry_quality import schedule_entry_quality_persist
+from src.ops.persistence.funding_cashflow import observe_pair_lifecycle_event, run_funding_cashflow_loop
 from src.ops.persistence.runtime import build_runtime_persistence_from_env
 from src.ops_console.action_gate import assert_action_token
 from src.ops_console.actions import (
@@ -32,7 +34,7 @@ from src.ops_console.embedded import (
 )
 from src.ops_console.runtime import write_entry_control
 from src.core.exchange_registry import build_exchange, validate_exchange_interface, validate_exchange_snapshot_shape
-from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_csv
+from src.strategy.config import load_strategy_config, normalize_exchange_name, parse_bool, parse_csv
 from src.strategy.candidates import (
     CandidateBuildHooks,
     CandidateCollectionHooks,
@@ -43,6 +45,7 @@ from src.strategy.candidates import (
     extract_best_ask,
     extract_best_bid,
     extract_funding_rate,
+    extract_funding_interval,
     extract_mid_price,
     extract_next_funding_ms,
     rank_candidates,
@@ -68,6 +71,7 @@ from src.strategy.logging import (
     log_strategy_config_summary,
 )
 from src.strategy.maker_entry_engine import MakerEntryEngine, MakerEntryHooks
+from src.strategy.order_intent_supervisor import reconcile_unresolved_order_intents as reconcile_order_intents
 from src.strategy.risk_gate import (
     OrderSlot,
     RiskGateContext,
@@ -81,6 +85,7 @@ from src.strategy.close_policy import (
     pair_entry_reference_notional_usd,
 )
 from src.strategy.entry_policy import evaluate_post_first_fill_edge
+from src.strategy.funding_events import estimate_pair_funding_events
 from src.strategy.rules import (
     close_first_leg_plan,
     close_hedge_leg_plan,
@@ -137,6 +142,9 @@ def flatten_leg_result_payload(result: FlattenLegResult | None) -> dict[str, Any
         "error_code": result.error_code,
         "error_message": result.error_message,
         "temporarily_unavailable": result.temporarily_unavailable,
+        "filled_snapshot_pending": result.filled_snapshot_pending,
+        "order_id": result.order_id,
+        "client_order_id": result.client_order_id,
     }
 
 
@@ -278,6 +286,7 @@ def record_live_event(config: StrategyConfig, event_type: str, **payload: Any) -
         "event_type": event_type,
         **payload,
     }
+    observe_pair_lifecycle_event(event_type, payload, timestamp_ms)
     try:
         append_jsonl(config.live_event_log_path, row)
     except Exception as exc:
@@ -1625,6 +1634,72 @@ def extract_order_avg_price(order_result: dict[str, Any] | None, fallback_price:
     return _execution_extract_order_avg_price(order_result, fallback_price)
 
 
+def extract_order_client_id(order_result: dict[str, Any] | None) -> str:
+    if not isinstance(order_result, dict):
+        return ""
+    for key in ("client_order_id", "clientOrderId", "clOrdId", "client_id"):
+        value = order_result.get(key)
+        if value:
+            return str(value)
+    raw = order_result.get("raw")
+    if isinstance(raw, dict):
+        for key in ("clOrdId", "clientOrderId", "client_order_id"):
+            value = raw.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def attach_order_refs(result: FlattenLegResult, order_result: dict[str, Any] | None) -> None:
+    result.order_id = extract_order_uuid(order_result) or ""
+    result.client_order_id = extract_order_client_id(order_result)
+
+
+def is_filled_snapshot_pending_leg(result: FlattenLegResult | None) -> bool:
+    if result is None:
+        return False
+    return bool(result.filled_snapshot_pending or result.failure_reason == "filled_but_snapshot_stale")
+
+
+def has_filled_snapshot_pending_leg(flatten_result: PairFlattenResult | None) -> bool:
+    if flatten_result is None:
+        return False
+    if is_filled_snapshot_pending_leg(flatten_result.failed_leg):
+        return True
+    return any(is_filled_snapshot_pending_leg(leg) for leg in flatten_result.leg_results)
+
+
+async def wait_for_close_fill_snapshot_settle(
+    *,
+    exchange: Any,
+    symbol: str,
+    config: StrategyConfig,
+    reason: str,
+) -> float:
+    settle_sec = max(float(config.close_filled_settle_sec), 0.0)
+    poll_sec = max(float(config.close_filled_settle_poll_sec), 0.05)
+    deadline = time.monotonic() + settle_sec
+    last_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+
+    while True:
+        request_account_refresh(
+            exchange,
+            reason,
+            priority="urgent",
+            symbol=symbol,
+        )
+        await refresh_symbol_state(
+            exchange,
+            symbol,
+            reason,
+            include_account=True,
+        )
+        last_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+        if abs(last_qty) <= EPS or time.monotonic() >= deadline:
+            return last_qty
+        await asyncio.sleep(poll_sec)
+
+
 def pair_entry_spread_usd(pair: OpenPairState) -> float:
     return pair.qty * (pair.short_entry_price - pair.long_entry_price)
 
@@ -2069,8 +2144,18 @@ async def settle_pair_close_state(
     long_qty = 0.0
     short_qty = 0.0
     for attempt in range(attempts):
-        await refresh_symbol_state(exchanges[pair.long_exchange], pair.symbol, f"{reason_prefix}_long_{attempt + 1}")
-        await refresh_symbol_state(exchanges[pair.short_exchange], pair.symbol, f"{reason_prefix}_short_{attempt + 1}")
+        await refresh_symbol_state(
+            exchanges[pair.long_exchange],
+            pair.symbol,
+            f"{reason_prefix}_long_{attempt + 1}",
+            include_account=True,
+        )
+        await refresh_symbol_state(
+            exchanges[pair.short_exchange],
+            pair.symbol,
+            f"{reason_prefix}_short_{attempt + 1}",
+            include_account=True,
+        )
         long_snapshot = exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol)
         short_snapshot = exchanges[pair.short_exchange].get_symbol_snapshot(pair.symbol)
         long_qty = effective_position_qty(long_snapshot, exchanges[pair.long_exchange], pair.symbol, config)
@@ -2096,11 +2181,17 @@ async def emergency_flatten_symbol_state_detailed(
     aggressive_bps: float = 20.0,
     *,
     role: str = "",
+    config: StrategyConfig | None = None,
 ) -> FlattenLegResult:
     exchange_name = getattr(exchange, "persist_name", getattr(exchange, "name", "unknown"))
     result = FlattenLegResult(exchange_name=exchange_name, symbol=symbol, role=role)
     for attempt in range(3):
-        await refresh_symbol_state(exchange, symbol, f"strategy_emergency_flatten_{attempt + 1}")
+        await refresh_symbol_state(
+            exchange,
+            symbol,
+            f"strategy_emergency_flatten_{attempt + 1}",
+            include_account=True,
+        )
         current_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
         if attempt == 0:
             result.start_qty = current_qty
@@ -2149,6 +2240,7 @@ async def emergency_flatten_symbol_state_detailed(
                 close_qty,
                 is_close=use_reduce_only_market_close(exchange, current_qty, side),
             )
+            attach_order_refs(result, market_result)
             if not (market_result and market_result.get("error")):
                 request_account_refresh(
                     exchange,
@@ -2167,12 +2259,46 @@ async def emergency_flatten_symbol_state_detailed(
                     reason=f"strategy_emergency_flatten_market_{attempt + 1}",
                 )
                 result.closed_qty += max(resolved_close_qty, 0.0)
-                await asyncio.sleep(1.2)
-                await refresh_symbol_state(exchange, symbol, f"strategy_emergency_flatten_check_{attempt + 1}")
-                current_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
+                filled_target = resolved_close_qty + qty_match_tolerance(close_qty) >= close_qty
+                if config is not None and filled_target:
+                    current_qty = await wait_for_close_fill_snapshot_settle(
+                        exchange=exchange,
+                        symbol=symbol,
+                        config=config,
+                        reason=f"strategy_emergency_flatten_filled_settle_{attempt + 1}",
+                    )
+                else:
+                    await asyncio.sleep(1.2)
+                    await refresh_symbol_state(
+                        exchange,
+                        symbol,
+                        f"strategy_emergency_flatten_check_{attempt + 1}",
+                        include_account=True,
+                    )
+                    current_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
                 if abs(current_qty) <= EPS:
                     result.end_qty = current_qty
                     result.ok = True
+                    return result
+                if config is not None and filled_target:
+                    result.end_qty = current_qty
+                    result.filled_snapshot_pending = True
+                    result.failure_reason = "filled_but_snapshot_stale"
+                    record_live_event(
+                        config,
+                        "close_leg_filled_snapshot_pending",
+                        exchange=exchange_name,
+                        symbol=symbol,
+                        role=role,
+                        side=side,
+                        requested_qty=close_qty,
+                        closed_qty=resolved_close_qty,
+                        start_qty=result.start_qty,
+                        snapshot_qty_after=current_qty,
+                        order_id=result.order_id,
+                        client_order_id=result.client_order_id,
+                        settle_wait_sec=config.close_filled_settle_sec,
+                    )
                     return result
                 remaining_preview = exchange_position_close_preview(
                     exchange,
@@ -2281,7 +2407,7 @@ async def close_leg_market_qty(
 ) -> FlattenLegResult:
     exchange_name = getattr(exchange, "persist_name", getattr(exchange, "name", "unknown"))
     result = FlattenLegResult(exchange_name=exchange_name, symbol=symbol, role=role, side=side)
-    await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_pre_{role}")
+    await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_pre_{role}", include_account=True)
     pre_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
     result.start_qty = pre_qty
 
@@ -2316,6 +2442,7 @@ async def close_leg_market_qty(
         if is_close:
             market_kwargs["is_close"] = use_reduce_only_market_close(exchange, pre_qty, side)
         market_result = await exchange.market_order(symbol, side, close_qty, **market_kwargs)
+        attach_order_refs(result, market_result)
         if market_result and market_result.get("error"):
             if is_close and error_means_no_position_to_close(market_result):
                 result.ok = True
@@ -2347,11 +2474,23 @@ async def close_leg_market_qty(
             reason=f"strategy_close_exact_market_{role}",
         )
         result.closed_qty = resolved_qty
-        await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_post_{role}")
-        result.end_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
         if resolved_qty + qty_match_tolerance(close_qty) >= close_qty:
+            if is_close:
+                result.end_qty = await wait_for_close_fill_snapshot_settle(
+                    exchange=exchange,
+                    symbol=symbol,
+                    config=config,
+                    reason=f"strategy_close_exact_filled_settle_{role}",
+                )
+                if abs(result.end_qty) > EPS:
+                    result.filled_snapshot_pending = True
+            else:
+                await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_post_{role}", include_account=True)
+                result.end_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
             result.ok = True
             return result
+        await refresh_symbol_state(exchange, symbol, f"strategy_close_exact_post_{role}", include_account=True)
+        result.end_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
         result.failure_reason = "partial_fill"
         return result
     except Exception as exc:
@@ -2482,8 +2621,18 @@ async def restore_pair_neutrality_after_close_failure(
         payload["error_message"] = str(exc)
         return payload
 
-    await refresh_symbol_state(exchanges[pair_like.long_exchange], symbol, "strategy_close_restore_long_post")
-    await refresh_symbol_state(exchanges[pair_like.short_exchange], symbol, "strategy_close_restore_short_post")
+    await refresh_symbol_state(
+        exchanges[pair_like.long_exchange],
+        symbol,
+        "strategy_close_restore_long_post",
+        include_account=True,
+    )
+    await refresh_symbol_state(
+        exchanges[pair_like.short_exchange],
+        symbol,
+        "strategy_close_restore_short_post",
+        include_account=True,
+    )
     long_qty_after = effective_position_qty(
         exchanges[pair_like.long_exchange].get_symbol_snapshot(symbol),
         exchanges[pair_like.long_exchange],
@@ -2543,6 +2692,7 @@ async def emergency_flatten_pair_state(
             symbol,
             aggressive_bps=aggressive_bps,
             role=spec["role"],
+            config=config,
         )
         leg_results.append(leg_result)
         if leg_result.assumed_flat:
@@ -2631,6 +2781,49 @@ def remove_shutdown_signal_handlers(installed: list[signal.Signals]) -> None:
             loop.remove_signal_handler(sig)
         except Exception:
             pass
+
+
+async def refresh_shutdown_exchange_state(
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+    reason: str,
+) -> None:
+    for exchange in exchanges.values():
+        reconcile = getattr(exchange, "reconcile_state", None)
+        if callable(reconcile):
+            with contextlib.suppress(Exception):
+                await reconcile(
+                    include_account=True,
+                    include_open_orders=True,
+                    include_funding=False,
+                    reason=reason,
+                )
+        request_account_refresh(exchange, reason, priority="urgent")
+    await asyncio.sleep(max(config.action_settle_wait_sec, 0.2))
+
+
+def shutdown_active_symbols(
+    *,
+    symbols: list[str],
+    exchanges: dict[str, Any],
+    open_pairs: dict[str, OpenPairState],
+    extra_symbols: set[str] | None = None,
+) -> list[str]:
+    active = {str(symbol).upper() for symbol in (extra_symbols or set())}
+    active.update(
+        pair.symbol.upper()
+        for pair in open_pairs.values()
+        if pair.status not in {"closed", "failed"}
+    )
+    for exchange in exchanges.values():
+        open_order_map = getattr(exchange, "get_open_order_map", lambda: {})() or {}
+        active.update(str(symbol).upper() for symbol, rows in open_order_map.items() if rows)
+        for symbol in symbols:
+            snapshot = exchange.get_symbol_snapshot(symbol) or {}
+            if abs(extract_position_qty(snapshot)) > EPS or snapshot.get("open_orders"):
+                active.add(symbol.upper())
+    allowed = {symbol.upper() for symbol in symbols}
+    return sorted(active & allowed)
 
 
 async def cancel_shutdown_open_orders(
@@ -2749,12 +2942,6 @@ async def collect_remaining_positions(
             if symbol.upper() in skip_symbols:
                 continue
             try:
-                await refresh_symbol_state(
-                    exchange,
-                    symbol,
-                    "strategy_shutdown_final_check",
-                    include_account=True,
-                )
                 qty = effective_position_qty(
                     exchange.get_symbol_snapshot(symbol),
                     exchange,
@@ -2781,19 +2968,12 @@ async def collect_remaining_open_orders(
         return remaining
 
     for exchange_name, exchange in exchanges.items():
+        open_order_map = getattr(exchange, "get_open_order_map", lambda: {})() or {}
         for symbol in symbols:
             if symbol.upper() in skip_symbols:
                 continue
             try:
-                await refresh_symbol_state(
-                    exchange,
-                    symbol,
-                    "strategy_shutdown_final_open_orders_check",
-                    include_account=False,
-                    include_open_orders=True,
-                )
-                snapshot = exchange.get_symbol_snapshot(symbol) or {}
-                open_orders = snapshot.get("open_orders") or []
+                open_orders = open_order_map.get(symbol.upper()) or []
                 if open_orders:
                     remaining.append(
                         {
@@ -2817,6 +2997,9 @@ async def graceful_shutdown_flatten(
     config: StrategyConfig,
     assumed_flat_until_ms: dict[tuple[str, str], int],
     manual_locked_symbols: set[str] | None = None,
+    extra_active_symbols: set[str] | None = None,
+    order_intent_journal: OrderIntentJournal | None = None,
+    action_gate: ActionGate | None = None,
 ) -> None:
     if not config.enable_live or not config.graceful_shutdown_enabled:
         return
@@ -2841,11 +3024,28 @@ async def graceful_shutdown_flatten(
         open_pair_ids=pair_ids,
         manual_locked_symbols=sorted(manual_locked_symbols),
     )
-    for exchange in exchanges.values():
-        request_account_refresh(exchange, "shutdown_cleanup_before", priority="urgent")
+    await refresh_shutdown_exchange_state(exchanges, config, "shutdown_cleanup_before")
+    target_symbols = shutdown_active_symbols(
+        symbols=symbols,
+        exchanges=exchanges,
+        open_pairs=open_pairs,
+        extra_symbols=extra_active_symbols,
+    )
+    shutdown_lease_owner = f"shutdown:{reason}:{now_ms()}"
+    shutdown_lease_takeovers: list[dict[str, Any]] = []
+    if action_gate is not None:
+        for symbol in target_symbols:
+            previous = action_gate.takeover_symbol(
+                owner_id=shutdown_lease_owner,
+                symbol=symbol,
+                domain="shutdown",
+                note=reason,
+            )
+            if previous is not None and previous.get("owner_id") != shutdown_lease_owner:
+                shutdown_lease_takeovers.append({"symbol": symbol, "previous": previous})
 
     cancel_before = await cancel_shutdown_open_orders(
-        symbols=symbols,
+        symbols=target_symbols,
         exchanges=exchanges,
         config=config,
         skip_symbols=manual_locked_symbols,
@@ -2866,26 +3066,31 @@ async def graceful_shutdown_flatten(
             pending_pairs.append(pair_id)
             print(f"[종료][페어종료][경고] pair_id={pair_id} 오류={exc}")
 
-    cancel_after = await cancel_shutdown_open_orders(
+    target_symbols = shutdown_active_symbols(
         symbols=symbols,
+        exchanges=exchanges,
+        open_pairs=open_pairs,
+        extra_symbols=set(target_symbols),
+    )
+    cancel_after = await cancel_shutdown_open_orders(
+        symbols=target_symbols,
         exchanges=exchanges,
         config=config,
         skip_symbols=manual_locked_symbols,
     )
     flatten_summary = await flatten_shutdown_symbols(
-        symbols=symbols,
+        symbols=target_symbols,
         exchanges=exchanges,
         config=config,
         skip_symbols=manual_locked_symbols,
     )
     cancel_final = await cancel_shutdown_open_orders(
-        symbols=symbols,
+        symbols=target_symbols,
         exchanges=exchanges,
         config=config,
         skip_symbols=manual_locked_symbols,
     )
-    for exchange in exchanges.values():
-        request_account_refresh(exchange, "shutdown_cleanup_after", priority="urgent")
+    await refresh_shutdown_exchange_state(exchanges, config, "shutdown_cleanup_after")
     remaining_open_orders = await collect_remaining_open_orders(
         symbols=symbols,
         exchanges=exchanges,
@@ -2898,6 +3103,12 @@ async def graceful_shutdown_flatten(
         config=config,
         skip_symbols=manual_locked_symbols,
     )
+    resolved_intents: list[dict[str, Any]] = []
+    if not remaining_open_orders and not remaining_positions and order_intent_journal is not None:
+        resolved_intents = order_intent_journal.resolve_all_unresolved(
+            state="COMPENSATED",
+            note=f"shutdown_verified_flat:{reason}",
+        )
 
     if remaining_open_orders:
         print(f"[종료][정리경고] 잔여주문={remaining_open_orders}")
@@ -2915,11 +3126,21 @@ async def graceful_shutdown_flatten(
         cancel_before=cancel_before,
         cancel_after=cancel_after,
         cancel_final=cancel_final,
+        targeted_symbols=target_symbols,
         flatten=flatten_summary,
         remaining_open_orders=remaining_open_orders,
         remaining_positions=remaining_positions,
+        resolved_order_intent_ids=[row.get("intent_id") for row in resolved_intents],
+        shutdown_lease_takeovers=shutdown_lease_takeovers,
         manual_locked_symbols=sorted(manual_locked_symbols),
     )
+    if action_gate is not None:
+        for symbol in target_symbols:
+            action_gate.release_symbol(
+                owner_id=shutdown_lease_owner,
+                symbol=symbol,
+                note="shutdown_cleanup_done",
+            )
 
 
 def active_open_pair_symbols(open_pairs: dict[str, OpenPairState]) -> set[str]:
@@ -3070,6 +3291,7 @@ async def recover_account_imbalances(
     assumed_flat_until_ms: dict[tuple[str, str], int],
     next_retry_ms_by_key: dict[tuple[str, str, str, float], int],
     skip_symbols: set[str] | None = None,
+    action_gate: ActionGate | None = None,
 ) -> None:
     if not config.enable_live or not config.account_imbalance_hedge_enabled:
         return
@@ -3156,12 +3378,40 @@ async def recover_account_imbalances(
 
             hedge_completed = False
             for hedge_exchange_name, hedge_side, raw_target_qty in candidate_legs:
+                lease_owner = (
+                    f"account-recovery:{symbol}:{left_exchange}:{right_exchange}:"
+                    f"{hedge_exchange_name}:{current_ms}"
+                )
+                lease_acquired = False
+                if action_gate is not None:
+                    lease_acquired, lease_reason = action_gate.try_acquire_symbol(
+                        owner_id=lease_owner,
+                        symbol=symbol,
+                        domain="account_recovery",
+                        note=f"{hedge_exchange_name}:{hedge_side}",
+                    )
+                    if not lease_acquired:
+                        record_live_event(
+                            config,
+                            "account_recovery_blocked_by_action_lease",
+                            symbol=symbol,
+                            left_exchange=left_exchange,
+                            right_exchange=right_exchange,
+                            reason=lease_reason,
+                        )
+                        continue
                 hedge_exchange = exchanges[hedge_exchange_name]
                 if exchange_has_symbol_waiting_order(hedge_exchange, symbol):
                     print(
                         f"[복구][대기] 심볼={symbol} 사유=대기주문존재 "
                         f"헷지={hedge_exchange_name}:{hedge_side}"
                     )
+                    if action_gate is not None and lease_acquired:
+                        action_gate.release_symbol(
+                            owner_id=lease_owner,
+                            symbol=symbol,
+                            note="recovery_waiting_order",
+                        )
                     continue
 
                 hedge_price = marketable_limit_price_with_bps(
@@ -3177,6 +3427,12 @@ async def recover_account_imbalances(
                         f"좌측={left_exchange}:{left_qty:.12f} 우측={right_exchange}:{right_qty:.12f} "
                         f"헷지={hedge_exchange_name}:{hedge_side} 원수량={raw_target_qty:.12f}"
                     )
+                    if action_gate is not None and lease_acquired:
+                        action_gate.release_symbol(
+                            owner_id=lease_owner,
+                            symbol=symbol,
+                            note="recovery_below_min_qty",
+                        )
                     continue
 
                 print(
@@ -3213,7 +3469,20 @@ async def recover_account_imbalances(
                         f"[복구][경고] 심볼={symbol} 사유=헷지주문오류 "
                         f"헷지={hedge_exchange_name}:{hedge_side} 수량={hedge_qty:.6f} 오류={exc}"
                     )
+                    if action_gate is not None and lease_acquired:
+                        action_gate.release_symbol(
+                            owner_id=lease_owner,
+                            symbol=symbol,
+                            note="recovery_hedge_error",
+                        )
                     continue
+
+                if action_gate is not None and lease_acquired:
+                    action_gate.release_symbol(
+                        owner_id=lease_owner,
+                        symbol=symbol,
+                        note="recovery_hedge_resolved",
+                    )
 
                 if hedge_execution.remaining_qty > EPS:
                     print(
@@ -3595,7 +3864,8 @@ async def enter_pair_limit_then_hedge(
         settle_grace_sec=settle_grace_sec,
         record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
-    hedge_done_ms = now_ms()
+    hedge_returned_ms = now_ms()
+    hedge_done_ms = hedge_execution.full_fill_ms or hedge_returned_ms
     hedged_qty = hedge_execution.filled_qty
     hedge_price_used = hedge_execution.avg_price
     remaining_qty = hedge_execution.remaining_qty
@@ -3899,9 +4169,29 @@ async def enter_pair_limit_then_hedge(
     entry_edge_slippage_usd = actual_entry_open_edge_usd - expected_open_edge_usd_for_actual_qty
     entry_edge_slippage_bps = actual_entry_open_edge_bps - candidate.entry_open_edge_bps
     qty_scale = pair_qty / candidate.executable_qty if candidate.executable_qty > EPS else 1.0
+    funding_estimated_at_ms = now_ms()
+    actual_funding_event = estimate_pair_funding_events(
+        long_rate=candidate.funding_long_rate,
+        short_rate=candidate.funding_short_rate,
+        long_notional_usd=pair_qty * long_entry_price,
+        short_notional_usd=pair_qty * short_entry_price,
+        long_next_funding_ms=candidate.long_next_funding_ms,
+        short_next_funding_ms=candidate.short_next_funding_ms,
+        long_interval_hours=candidate.long_funding_interval_hours,
+        short_interval_hours=candidate.short_funding_interval_hours,
+        long_interval_source=candidate.long_funding_interval_source,
+        short_interval_source=candidate.short_funding_interval_source,
+        entry_complete_ms=funding_estimated_at_ms,
+        forecast_end_ms=funding_estimated_at_ms + int(max(config.max_hold_sec, 0.0) * 1000),
+    )
+    actual_funding_pnl_usd = (
+        0.0
+        if config.funding_event_model_enabled
+        else candidate.effective_funding_pnl_usd * qty_scale
+    )
     actual_estimated_net_edge_usd = (
         actual_entry_open_edge_usd
-        + candidate.effective_funding_pnl_usd * qty_scale
+        + actual_funding_pnl_usd
         - candidate.open_fee_cost_usd * qty_scale
         - candidate.expected_close_cost_usd * qty_scale
         - candidate.risk_buffer_usd * qty_scale
@@ -3913,6 +4203,7 @@ async def enter_pair_limit_then_hedge(
         else 0.0
     )
     first_fill_detected_ms = int(entry_telemetry.get("first_fill_detected_ms") or first_leg_done_ms)
+    neutralized_ms = now_ms()
     record_live_event(
         config,
         "entry_quality_analysis",
@@ -3931,6 +4222,15 @@ async def enter_pair_limit_then_hedge(
         actual_open_edge_bps=actual_entry_open_edge_bps,
         actual_estimated_net_edge_usd=actual_estimated_net_edge_usd,
         actual_estimated_net_edge_bps=actual_estimated_net_edge_bps,
+        funding_model="event" if config.funding_event_model_enabled else "legacy_prorated",
+        funding_direction_pnl_usd=candidate.funding_direction_pnl_usd * qty_scale,
+        legacy_funding_pnl_usd=candidate.legacy_prorated_funding_pnl_usd * qty_scale,
+        candidate_funding_event_raw_pnl_usd=candidate.funding_event_raw_pnl_usd * qty_scale,
+        candidate_funding_event_pnl_usd=candidate.funding_event_pnl_usd * qty_scale,
+        actual_funding_event_pnl_usd=actual_funding_event.pnl_usd,
+        actual_entry_funding_adjustment_usd=actual_funding_pnl_usd,
+        actual_funding_event_count=actual_funding_event.event_count,
+        funding_shadow_admission_changed=candidate.legacy_can_enter != candidate.event_can_enter,
         entry_edge_slippage_usd=entry_edge_slippage_usd,
         entry_edge_slippage_bps=entry_edge_slippage_bps,
         first_exchange=first_exchange_name,
@@ -3955,11 +4255,36 @@ async def enter_pair_limit_then_hedge(
         first_fill_detected_ms=first_fill_detected_ms,
         first_leg_done_ms=first_leg_done_ms,
         hedge_start_ms=hedge_start_ms,
+        hedge_acknowledged_ms=hedge_execution.acknowledged_ms,
+        hedge_first_fill_ms=hedge_execution.first_fill_ms,
+        hedge_full_fill_ms=hedge_execution.full_fill_ms,
+        hedge_neutralized_ms=neutralized_ms,
+        hedge_execution_returned_ms=hedge_returned_ms,
         hedge_done_ms=hedge_done_ms,
         first_leg_elapsed_ms=max(first_leg_done_ms - entry_started_ms, 0),
-        first_fill_to_hedge_fill_ms=max(hedge_done_ms - first_fill_detected_ms, 0),
+        first_fill_to_hedge_ack_ms=(
+            max(hedge_execution.acknowledged_ms - first_fill_detected_ms, 0)
+            if hedge_execution.acknowledged_ms is not None
+            else None
+        ),
+        first_fill_to_hedge_first_fill_ms=(
+            max(hedge_execution.first_fill_ms - first_fill_detected_ms, 0)
+            if hedge_execution.first_fill_ms is not None
+            else None
+        ),
+        first_fill_to_hedge_full_fill_ms=(
+            max(hedge_execution.full_fill_ms - first_fill_detected_ms, 0)
+            if hedge_execution.full_fill_ms is not None
+            else None
+        ),
+        first_fill_to_neutralized_ms=max(neutralized_ms - first_fill_detected_ms, 0),
+        first_fill_to_hedge_fill_ms=(
+            max(hedge_execution.full_fill_ms - first_fill_detected_ms, 0)
+            if hedge_execution.full_fill_ms is not None
+            else None
+        ),
         hedge_elapsed_ms=max(hedge_done_ms - hedge_start_ms, 0),
-        total_entry_elapsed_ms=max(hedge_done_ms - entry_started_ms, 0),
+        total_entry_elapsed_ms=max(neutralized_ms - entry_started_ms, 0),
         first_leg_submit_count=int(entry_telemetry.get("submit_count") or 0),
     )
 
@@ -4058,7 +4383,7 @@ async def complete_entry_after_maker_first_fill(
         config.close_aggressive_bps,
     )
     hedgeable_first_fill_qty = _safe_float(hedge_preview.get("executable_qty"), 0.0)
-    if config.maker_entry_q4_fast_hedge:
+    if config.maker_entry_fast_hedge:
         hedge_price = _safe_float(hedge_preview.get("price"), 0.0)
         hedgeable_first_fill_qty = normalize_exchange_qty_for_order(
             hedge_exchange,
@@ -4087,10 +4412,10 @@ async def complete_entry_after_maker_first_fill(
             log_danger(title="메이커체결헤지불가정리실패", symbol=symbol, first_qty=f"{first_filled_qty:.6f}")
         return None
 
-    if config.maker_entry_q4_fast_hedge:
+    if config.maker_entry_fast_hedge:
         record_live_event(
             config,
-            "maker_entry_q4_fast_hedge",
+            "maker_entry_fast_hedge",
             source=source,
             candidate_id=candidate.id,
             symbol=symbol,
@@ -4102,7 +4427,7 @@ async def complete_entry_after_maker_first_fill(
             hedgeable_qty=hedgeable_first_fill_qty,
             first_fill_price=first_price_used,
             hedge_price=_safe_float(hedge_preview.get("price"), 0.0),
-            reason="question4_style_skip_post_fill_edge_check",
+            reason="fast_hedge_skip_post_fill_edge_check",
         )
     else:
         post_fill_edge_decision = evaluate_post_first_fill_edge(
@@ -4214,7 +4539,8 @@ async def complete_entry_after_maker_first_fill(
         settle_grace_sec=settle_grace_sec,
         record_order_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
-    hedge_done_ms = now_ms()
+    hedge_returned_ms = now_ms()
+    hedge_done_ms = hedge_execution.full_fill_ms or hedge_returned_ms
     hedged_qty = hedge_execution.filled_qty
     hedge_price_used = hedge_execution.avg_price
     if hedge_execution.remaining_qty > EPS:
@@ -4349,9 +4675,29 @@ async def complete_entry_after_maker_first_fill(
     entry_edge_slippage_usd = actual_entry_open_edge_usd - expected_open_edge_usd_for_actual_qty
     entry_edge_slippage_bps = actual_entry_open_edge_bps - candidate.entry_open_edge_bps
     qty_scale = pair_qty / candidate.executable_qty if candidate.executable_qty > EPS else 1.0
+    funding_estimated_at_ms = now_ms()
+    actual_funding_event = estimate_pair_funding_events(
+        long_rate=candidate.funding_long_rate,
+        short_rate=candidate.funding_short_rate,
+        long_notional_usd=pair_qty * long_entry_price,
+        short_notional_usd=pair_qty * short_entry_price,
+        long_next_funding_ms=candidate.long_next_funding_ms,
+        short_next_funding_ms=candidate.short_next_funding_ms,
+        long_interval_hours=candidate.long_funding_interval_hours,
+        short_interval_hours=candidate.short_funding_interval_hours,
+        long_interval_source=candidate.long_funding_interval_source,
+        short_interval_source=candidate.short_funding_interval_source,
+        entry_complete_ms=funding_estimated_at_ms,
+        forecast_end_ms=funding_estimated_at_ms + int(max(config.max_hold_sec, 0.0) * 1000),
+    )
+    actual_funding_pnl_usd = (
+        0.0
+        if config.funding_event_model_enabled
+        else candidate.effective_funding_pnl_usd * qty_scale
+    )
     actual_estimated_net_edge_usd = (
         actual_entry_open_edge_usd
-        + candidate.effective_funding_pnl_usd * qty_scale
+        + actual_funding_pnl_usd
         - candidate.open_fee_cost_usd * qty_scale
         - candidate.expected_close_cost_usd * qty_scale
         - candidate.risk_buffer_usd * qty_scale
@@ -4362,6 +4708,7 @@ async def complete_entry_after_maker_first_fill(
         if reference_notional_usd > EPS
         else 0.0
     )
+    neutralized_ms = now_ms()
     record_live_event(
         config,
         "entry_quality_analysis",
@@ -4381,6 +4728,15 @@ async def complete_entry_after_maker_first_fill(
         actual_open_edge_bps=actual_entry_open_edge_bps,
         actual_estimated_net_edge_usd=actual_estimated_net_edge_usd,
         actual_estimated_net_edge_bps=actual_estimated_net_edge_bps,
+        funding_model="event" if config.funding_event_model_enabled else "legacy_prorated",
+        funding_direction_pnl_usd=candidate.funding_direction_pnl_usd * qty_scale,
+        legacy_funding_pnl_usd=candidate.legacy_prorated_funding_pnl_usd * qty_scale,
+        candidate_funding_event_raw_pnl_usd=candidate.funding_event_raw_pnl_usd * qty_scale,
+        candidate_funding_event_pnl_usd=candidate.funding_event_pnl_usd * qty_scale,
+        actual_funding_event_pnl_usd=actual_funding_event.pnl_usd,
+        actual_entry_funding_adjustment_usd=actual_funding_pnl_usd,
+        actual_funding_event_count=actual_funding_event.event_count,
+        funding_shadow_admission_changed=candidate.legacy_can_enter != candidate.event_can_enter,
         entry_edge_slippage_usd=entry_edge_slippage_usd,
         entry_edge_slippage_bps=entry_edge_slippage_bps,
         first_exchange=first_exchange_name,
@@ -4397,9 +4753,34 @@ async def complete_entry_after_maker_first_fill(
         short_entry_price=short_entry_price,
         first_leg_done_ms=first_leg_done_ms,
         hedge_start_ms=hedge_start_ms,
+        hedge_acknowledged_ms=hedge_execution.acknowledged_ms,
+        hedge_first_fill_ms=hedge_execution.first_fill_ms,
+        hedge_full_fill_ms=hedge_execution.full_fill_ms,
+        hedge_neutralized_ms=neutralized_ms,
+        hedge_execution_returned_ms=hedge_returned_ms,
         hedge_done_ms=hedge_done_ms,
-        total_entry_elapsed_ms=max(hedge_done_ms - entry_started_ms, 0),
-        first_fill_to_hedge_fill_ms=max(hedge_done_ms - first_leg_done_ms, 0),
+        first_fill_to_hedge_ack_ms=(
+            max(hedge_execution.acknowledged_ms - first_leg_done_ms, 0)
+            if hedge_execution.acknowledged_ms is not None
+            else None
+        ),
+        first_fill_to_hedge_first_fill_ms=(
+            max(hedge_execution.first_fill_ms - first_leg_done_ms, 0)
+            if hedge_execution.first_fill_ms is not None
+            else None
+        ),
+        first_fill_to_hedge_full_fill_ms=(
+            max(hedge_execution.full_fill_ms - first_leg_done_ms, 0)
+            if hedge_execution.full_fill_ms is not None
+            else None
+        ),
+        first_fill_to_neutralized_ms=max(neutralized_ms - first_leg_done_ms, 0),
+        total_entry_elapsed_ms=max(neutralized_ms - entry_started_ms, 0),
+        first_fill_to_hedge_fill_ms=(
+            max(hedge_execution.full_fill_ms - first_leg_done_ms, 0)
+            if hedge_execution.full_fill_ms is not None
+            else None
+        ),
     )
 
     log_pair_opened(
@@ -4464,22 +4845,30 @@ async def complete_entry_after_maker_first_fill(
     return pair
 
 
-def estimate_hold_pnl_next_funding(
+def estimate_hold_funding_context(
     pair: OpenPairState,
     exchanges: dict[str, Any],
     config: StrategyConfig,
-) -> float:
+) -> dict[str, float | int | bool | str]:
     long_snapshot = exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol)
     short_snapshot = exchanges[pair.short_exchange].get_symbol_snapshot(pair.symbol)
     long_ref = extract_mid_price(long_snapshot)
     short_ref = extract_mid_price(short_snapshot)
     if long_ref <= 0 or short_ref <= 0:
-        return -1e18
+        return {
+            "hold_pnl_usd": -1e18,
+            "next_funding_pnl_usd": 0.0,
+            "funding_wait_sec": float("inf"),
+            "funding_event_count": 0,
+            "funding_model": "unavailable",
+        }
 
     long_notional = pair.qty * long_ref
     short_notional = pair.qty * short_ref
     long_next_funding_ms = extract_next_funding_ms(long_snapshot)
     short_next_funding_ms = extract_next_funding_ms(short_snapshot)
+    long_interval_hours, long_interval_source = extract_funding_interval(long_snapshot)
+    short_interval_hours, short_interval_source = extract_funding_interval(short_snapshot)
     now_ms = int(time.time() * 1000)
     # This estimator answers "what's the PnL if we hold until the next funding
     # settlement?" — the relevant horizon is whichever side settles first.
@@ -4512,7 +4901,60 @@ def estimate_hold_pnl_next_funding(
         config,
     )
     _long_ask, _short_bid, open_edge_usd = current_pair_open_edge(pair, exchanges)
-    return open_edge_usd + effective_funding_pnl_usd - stale_data_penalty_usd
+    event_times = [
+        value
+        for value in (long_next_funding_ms, short_next_funding_ms)
+        if value > now_ms
+    ]
+    next_event_time_ms = max(event_times) if len(event_times) == 2 else 0
+    event_estimate = estimate_pair_funding_events(
+        long_rate=extract_funding_rate(long_snapshot),
+        short_rate=extract_funding_rate(short_snapshot),
+        long_notional_usd=long_notional,
+        short_notional_usd=short_notional,
+        long_next_funding_ms=long_next_funding_ms,
+        short_next_funding_ms=short_next_funding_ms,
+        long_interval_hours=long_interval_hours,
+        short_interval_hours=short_interval_hours,
+        long_interval_source=long_interval_source,
+        short_interval_source=short_interval_source,
+        entry_complete_ms=now_ms,
+        forecast_end_ms=next_event_time_ms,
+    )
+    selected_funding_pnl_usd = (
+        event_estimate.pnl_usd
+        if config.funding_event_model_enabled
+        else effective_funding_pnl_usd
+    )
+    legacy_hold_pnl_usd = open_edge_usd + effective_funding_pnl_usd - stale_data_penalty_usd
+    event_hold_pnl_usd = open_edge_usd + event_estimate.pnl_usd - stale_data_penalty_usd
+    return {
+        "hold_pnl_usd": event_hold_pnl_usd if config.funding_event_model_enabled else legacy_hold_pnl_usd,
+        "legacy_hold_pnl_usd": legacy_hold_pnl_usd,
+        "event_hold_pnl_usd": event_hold_pnl_usd,
+        "next_funding_pnl_usd": (
+            event_estimate.pnl_usd
+            if event_estimate.schedule_complete and event_estimate.event_count == 2
+            else 0.0
+        ),
+        "funding_wait_sec": (
+            max((next_event_time_ms - now_ms) / 1000.0, 0.0)
+            if next_event_time_ms > 0
+            else float("inf")
+        ),
+        "funding_event_count": event_estimate.event_count,
+        "funding_event_schedule_complete": event_estimate.schedule_complete,
+        "legacy_funding_pnl_usd": effective_funding_pnl_usd,
+        "funding_model": "event" if config.funding_event_model_enabled else "legacy_prorated",
+    }
+
+
+def estimate_hold_pnl_next_funding(
+    pair: OpenPairState,
+    exchanges: dict[str, Any],
+    config: StrategyConfig,
+) -> float:
+    return float(estimate_hold_funding_context(pair, exchanges, config)["hold_pnl_usd"])
 
 
 def current_pair_reference_notional_usd(
@@ -4813,34 +5255,55 @@ async def close_pair_limit_then_hedge(
         forced_flat_exchanges=forced_flat_exchanges,
     )
     pair.qty = balanced_qty_after
+    filled_snapshot_pending = has_filled_snapshot_pending_leg(flatten_result)
+    if filled_snapshot_pending:
+        pair.next_auto_close_retry_ms = max(
+            pair.next_auto_close_retry_ms,
+            now_ms() + int(max(config.close_filled_settle_sec, config.action_settle_wait_sec) * 1000),
+        )
     if flatten_result.failed_leg is not None:
         failed_payload = flatten_leg_result_payload(flatten_result.failed_leg)
-        log_danger(
-            title="페어종료레그실패",
-            id=pair.pair_id,
-            symbol=pair.symbol,
-            failed_exchange=flatten_result.failed_leg.exchange_name,
-            failed_side=flatten_result.failed_leg.side,
-            failed_qty=f"{flatten_result.failed_leg.requested_qty:.6f}",
-            reason=flatten_result.failed_leg.failure_reason,
-            other_leg_action=flatten_result.other_leg_action,
-            long_after=f"{long_qty_after:.6f}",
-            short_after=f"{short_qty_after:.6f}",
-            net_qty=f"{(long_qty_after + short_qty_after):.6f}",
-        )
-        record_live_event(
-            config,
-            "pair_close_leg_failed",
-            pair=pair_event_payload(pair),
-            failed_leg=failed_payload,
-            other_leg_action=flatten_result.other_leg_action,
-            close_state=close_state,
-            long_qty_after=long_qty_after,
-            short_qty_after=short_qty_after,
-            net_qty_after=long_qty_after + short_qty_after,
-            neutralized=flatten_result.neutralized,
-            neutralize=flatten_result.neutralize_payload,
-        )
+        if filled_snapshot_pending:
+            record_live_event(
+                config,
+                "pair_close_reconcile_pending",
+                pair=pair_event_payload(pair),
+                failed_leg=failed_payload,
+                other_leg_action=flatten_result.other_leg_action,
+                close_state=close_state,
+                long_qty_after=long_qty_after,
+                short_qty_after=short_qty_after,
+                net_qty_after=long_qty_after + short_qty_after,
+                neutralized=flatten_result.neutralized,
+                neutralize=flatten_result.neutralize_payload,
+            )
+        else:
+            log_danger(
+                title="페어종료레그실패",
+                id=pair.pair_id,
+                symbol=pair.symbol,
+                failed_exchange=flatten_result.failed_leg.exchange_name,
+                failed_side=flatten_result.failed_leg.side,
+                failed_qty=f"{flatten_result.failed_leg.requested_qty:.6f}",
+                reason=flatten_result.failed_leg.failure_reason,
+                other_leg_action=flatten_result.other_leg_action,
+                long_after=f"{long_qty_after:.6f}",
+                short_after=f"{short_qty_after:.6f}",
+                net_qty=f"{(long_qty_after + short_qty_after):.6f}",
+            )
+            record_live_event(
+                config,
+                "pair_close_leg_failed",
+                pair=pair_event_payload(pair),
+                failed_leg=failed_payload,
+                other_leg_action=flatten_result.other_leg_action,
+                close_state=close_state,
+                long_qty_after=long_qty_after,
+                short_qty_after=short_qty_after,
+                net_qty_after=long_qty_after + short_qty_after,
+                neutralized=flatten_result.neutralized,
+                neutralize=flatten_result.neutralize_payload,
+            )
     if close_state == "closed":
         pair.status = "closed"
         pair.assumed_flat_exchanges = [pair.long_exchange, pair.short_exchange]
@@ -4861,14 +5324,14 @@ async def close_pair_limit_then_hedge(
         return True
 
     if close_state == "balanced_open":
-        pair.status = "close_pending"
+        pair.status = "close_reconcile_pending" if filled_snapshot_pending else "close_pending"
         print(
             f"[페어종료][보류] pair_id={pair.pair_id} 사유=균형포지션잔존 "
             f"잔여페어수량={pair.qty:.6f} 청산시도성공={flattened}"
         )
         record_live_event(
             config,
-            "pair_close_pending",
+            "pair_close_reconcile_pending" if filled_snapshot_pending else "pair_close_pending",
             pair=pair_event_payload(pair),
             close_state=close_state,
             long_qty_after=long_qty_after,
@@ -4877,19 +5340,20 @@ async def close_pair_limit_then_hedge(
         )
         return False
 
-    pair.status = "close_imbalance"
-    log_danger(
-        title="청산불균형",
-        id=pair.pair_id,
-        long_after=f"{long_qty_after:.6f}",
-        short_after=f"{short_qty_after:.6f}",
-        residual_gap=f"{residual_gap:.6f}",
-        state=close_state,
-        flattened=flattened,
-        cause=(flatten_result.failed_leg.failure_reason if flatten_result.failed_leg else close_state),
-        other_leg_action=flatten_result.other_leg_action,
-    )
-    pair.status = "close_pending"
+    pair.status = "close_reconcile_pending" if filled_snapshot_pending else "close_imbalance"
+    if not filled_snapshot_pending:
+        log_danger(
+            title="청산불균형",
+            id=pair.pair_id,
+            long_after=f"{long_qty_after:.6f}",
+            short_after=f"{short_qty_after:.6f}",
+            residual_gap=f"{residual_gap:.6f}",
+            state=close_state,
+            flattened=flattened,
+            cause=(flatten_result.failed_leg.failure_reason if flatten_result.failed_leg else close_state),
+            other_leg_action=flatten_result.other_leg_action,
+        )
+        pair.status = "close_pending"
     print(
         f"[페어종료][보류] pair_id={pair.pair_id} 사유=청산후불균형 "
         f"롱수량={long_qty_after:.6f} 숏수량={short_qty_after:.6f} "
@@ -4897,7 +5361,7 @@ async def close_pair_limit_then_hedge(
     )
     record_live_event(
         config,
-        "pair_close_pending",
+        "pair_close_reconcile_pending" if filled_snapshot_pending else "pair_close_pending",
         pair=pair_event_payload(pair),
         close_state=close_state,
         long_qty_after=long_qty_after,
@@ -4916,6 +5380,7 @@ async def manage_open_pairs(
     config: StrategyConfig,
     assumed_flat_until_ms: dict[tuple[str, str], int],
     symbol_recent_close_ms: dict[str, int] | None = None,
+    action_gate: ActionGate | None = None,
 ) -> None:
     for pair_id, pair in list(open_pairs.items()):
         long_snapshot = exchanges[pair.long_exchange].get_symbol_snapshot(pair.symbol)
@@ -5024,14 +5489,39 @@ async def manage_open_pairs(
                 continue
 
             pair.next_recovery_retry_ms = current_ms + int(config.recovery_retry_cooldown_sec * 1000)
-            flatten_result = await emergency_flatten_pair_state(
-                pair,
-                exchanges,
-                aggressive_bps=config.emergency_flatten_bps,
-                config=config,
-                close_first_leg_role=config.close_first_leg_role,
-                restore_neutrality=True,
-            )
+            lease_owner = f"pair-recovery:{pair_id}:{current_ms}"
+            lease_ok = True
+            if action_gate is not None:
+                lease_ok, lease_reason = action_gate.try_acquire_symbol(
+                    owner_id=lease_owner,
+                    symbol=pair.symbol,
+                    domain="pair_recovery",
+                    note="direction_mismatch",
+                )
+                if not lease_ok:
+                    record_live_event(
+                        config,
+                        "pair_recovery_blocked_by_action_lease",
+                        pair=pair_event_payload(pair),
+                        reason=lease_reason,
+                    )
+                    continue
+            try:
+                flatten_result = await emergency_flatten_pair_state(
+                    pair,
+                    exchanges,
+                    aggressive_bps=config.emergency_flatten_bps,
+                    config=config,
+                    close_first_leg_role=config.close_first_leg_role,
+                    restore_neutrality=True,
+                )
+            finally:
+                if action_gate is not None and lease_ok:
+                    action_gate.release_symbol(
+                        owner_id=lease_owner,
+                        symbol=pair.symbol,
+                        note="pair_recovery_completed",
+                    )
             flattened = flatten_result.ok
             forced_flat_exchanges = flatten_result.forced_flat_exchanges
             mismatch_state, long_qty_after, short_qty_after, balanced_qty_after, residual_gap = await settle_pair_close_state(
@@ -5044,7 +5534,10 @@ async def manage_open_pairs(
             )
             pair.qty = balanced_qty_after
             if flatten_result.failed_leg is not None:
-                event_type = "pair_micro_residual_cleanup_failed" if is_micro_residual else "pair_close_leg_failed"
+                if has_filled_snapshot_pending_leg(flatten_result):
+                    event_type = "pair_close_reconcile_pending"
+                else:
+                    event_type = "pair_micro_residual_cleanup_failed" if is_micro_residual else "pair_close_leg_failed"
                 record_live_event(
                     config,
                     event_type,
@@ -5108,7 +5601,8 @@ async def manage_open_pairs(
         )
         close_pnl_now = close_pnl_breakdown.net_close_pnl_usd
         _, _, open_edge_now = current_pair_open_edge(pair, exchanges)
-        hold_pnl = estimate_hold_pnl_next_funding(pair, exchanges, config)
+        hold_funding = estimate_hold_funding_context(pair, exchanges, config)
+        hold_pnl = float(hold_funding["hold_pnl_usd"])
         entry_age_sec = max((now_ms() - pair.entry_time_ms) / 1000.0, 0.0)
         close_reference_notional_usd = current_pair_reference_notional_usd(pair, exchanges)
         close_evaluation = evaluate_close_policy(
@@ -5120,11 +5614,54 @@ async def manage_open_pairs(
             close_edge_usd=open_edge_now,
             reference_notional_usd=close_reference_notional_usd,
             action_inputs_fresh=action_inputs_fresh,
+            next_funding_pnl_usd=float(hold_funding["next_funding_pnl_usd"]),
+            funding_wait_sec=float(hold_funding["funding_wait_sec"]),
         )
         decision = close_evaluation.decision
         close_thresholds = close_evaluation.thresholds
         close_reference_notional_usd = close_evaluation.reference_notional_usd
         previous_close_reason = pair.last_close_reason
+        legacy_close_evaluation = evaluate_close_policy(
+            pair,
+            config,
+            hold_pnl_usd=float(hold_funding["legacy_hold_pnl_usd"]),
+            entry_age_sec=entry_age_sec,
+            close_pnl_usd=close_pnl_now,
+            close_edge_usd=open_edge_now,
+            reference_notional_usd=close_reference_notional_usd,
+            action_inputs_fresh=action_inputs_fresh,
+            next_funding_pnl_usd=float(hold_funding["next_funding_pnl_usd"]),
+            funding_wait_sec=float(hold_funding["funding_wait_sec"]),
+        )
+        event_close_evaluation = evaluate_close_policy(
+            pair,
+            config,
+            hold_pnl_usd=float(hold_funding["event_hold_pnl_usd"]),
+            entry_age_sec=entry_age_sec,
+            close_pnl_usd=close_pnl_now,
+            close_edge_usd=open_edge_now,
+            reference_notional_usd=close_reference_notional_usd,
+            action_inputs_fresh=action_inputs_fresh,
+            next_funding_pnl_usd=float(hold_funding["next_funding_pnl_usd"]),
+            funding_wait_sec=float(hold_funding["funding_wait_sec"]),
+        )
+        if (
+            legacy_close_evaluation.decision != event_close_evaluation.decision
+            and previous_close_reason != decision
+        ):
+            record_live_event(
+                config,
+                "pair_close_funding_shadow",
+                pair=pair_event_payload(pair),
+                selected_model=hold_funding["funding_model"],
+                selected_decision=decision,
+                legacy_decision=legacy_close_evaluation.decision,
+                event_decision=event_close_evaluation.decision,
+                legacy_hold_pnl_usd=hold_funding["legacy_hold_pnl_usd"],
+                event_hold_pnl_usd=hold_funding["event_hold_pnl_usd"],
+                next_funding_pnl_usd=hold_funding["next_funding_pnl_usd"],
+                funding_wait_sec=hold_funding["funding_wait_sec"],
+            )
         pair.last_close_pnl_usd = close_evaluation.close_pnl_usd
         pair.last_close_edge_usd = close_evaluation.close_edge_usd
         pair.last_close_reason = decision
@@ -5142,6 +5679,9 @@ async def manage_open_pairs(
                 f"close_pnl_now={pair.last_close_pnl_usd:.4f} "
                 f"open_edge_now={pair.last_close_edge_usd:.4f} "
                 f"close_edge_now={close_edge_now:.4f} "
+                f"next_funding_pnl={float(hold_funding['next_funding_pnl_usd']):.4f} "
+                f"funding_wait_sec={float(hold_funding['funding_wait_sec']):.1f} "
+                f"funding_model={hold_funding['funding_model']} "
                 f"entry_age_sec={entry_age_sec:.1f} min_hold_sec={config.min_hold_sec:.1f}"
             )
 
@@ -5208,7 +5748,32 @@ async def manage_open_pairs(
                 entry_age_sec=entry_age_sec,
                 close_thresholds=close_thresholds,
             )
-            ok = await close_pair_limit_then_hedge(pair, exchanges, config)
+            lease_owner = f"pair-close:{pair_id}:{current_ms}"
+            lease_ok = True
+            if action_gate is not None:
+                lease_ok, lease_reason = action_gate.try_acquire_symbol(
+                    owner_id=lease_owner,
+                    symbol=pair.symbol,
+                    domain="pair_close",
+                    note=decision,
+                )
+                if not lease_ok:
+                    record_live_event(
+                        config,
+                        "pair_auto_close_blocked_by_action_lease",
+                        pair=pair_event_payload(pair),
+                        reason=lease_reason,
+                    )
+                    continue
+            try:
+                ok = await close_pair_limit_then_hedge(pair, exchanges, config)
+            finally:
+                if action_gate is not None and lease_ok:
+                    action_gate.release_symbol(
+                        owner_id=lease_owner,
+                        symbol=pair.symbol,
+                        note="pair_close_completed",
+                    )
             if ok and pair.status == "closed":
                 register_pair_assumed_flat(pair, assumed_flat_until_ms, config)
                 mark_symbol_recently_closed(symbol_recent_close_ms, pair.symbol)
@@ -5442,6 +6007,38 @@ async def execute_control_plane_command(
             return
 
     started_ms = now_ms()
+    lease_symbol = _control_command_symbol(command)
+    lease_owner = f"console:{command.command_id}"
+    lease_acquired = False
+    if lease_symbol and control_service.action_gate is not None:
+        lease_acquired, lease_reason = control_service.action_gate.try_acquire_symbol(
+            owner_id=lease_owner,
+            symbol=lease_symbol,
+            domain="manual_console",
+            note=command.command_type,
+        )
+        if not lease_acquired:
+            error = RuntimeError(
+                f"symbol action is busy symbol={lease_symbol} reason={lease_reason}"
+            )
+            control_service.last_error = str(error)
+            control_service.audit_command_event(
+                "ops_console_command_blocked_by_action_lease",
+                command,
+                symbol=lease_symbol,
+                reason=lease_reason,
+            )
+            command.response_future.set_exception(error)
+            return
+
+    def release_command_lease(note: str) -> None:
+        if lease_acquired and control_service.action_gate is not None:
+            control_service.action_gate.release_symbol(
+                owner_id=lease_owner,
+                symbol=lease_symbol,
+                note=note,
+            )
+
     control_service.audit_command_event(
         "ops_console_command_started",
         command,
@@ -5504,8 +6101,10 @@ async def execute_control_plane_command(
         )
         if not command.response_future.done():
             command.response_future.set_exception(exc)
+        release_command_lease("command_failed")
         return
 
+    release_command_lease("command_completed")
     control_service.audit_command_event(
         "ops_console_command_completed",
         command,
@@ -5537,6 +6136,7 @@ async def handle_command(
     symbol_recent_close_ms: dict[str, int] | None = None,
     entry_control_store: EntryControlStore | None = None,
     startup_block_reasons: tuple[str, ...] = (),
+    action_gate: ActionGate | None = None,
 ) -> bool:
     if not command:
         return True
@@ -5593,13 +6193,33 @@ async def handle_command(
         if not config.enable_live:
             print(f"[strategy][paper] live disabled: {describe_live_plan(candidate, config)}")
             return True
-        pair = await enter_pair_limit_then_hedge(
-            candidate,
-            exchanges,
-            config,
-            assumed_flat_until_ms=assumed_flat_until_ms,
-            last_entry_order_submit_ms_by_key=last_entry_order_submit_ms_by_key,
-        )
+        lease_owner = f"stdin-entry:{candidate.id}:{now_ms()}"
+        lease_ok = True
+        if action_gate is not None:
+            lease_ok, lease_reason = action_gate.try_acquire_symbol(
+                owner_id=lease_owner,
+                symbol=candidate.symbol,
+                domain="manual_stdin_entry",
+                note="enter_command",
+            )
+            if not lease_ok:
+                print(f"[strategy][enter] action lease blocked reason={lease_reason}")
+                return True
+        try:
+            pair = await enter_pair_limit_then_hedge(
+                candidate,
+                exchanges,
+                config,
+                assumed_flat_until_ms=assumed_flat_until_ms,
+                last_entry_order_submit_ms_by_key=last_entry_order_submit_ms_by_key,
+            )
+        finally:
+            if action_gate is not None and lease_ok:
+                action_gate.release_symbol(
+                    owner_id=lease_owner,
+                    symbol=candidate.symbol,
+                    note="stdin_entry_completed",
+                )
         if pair is not None:
             open_pairs[pair.pair_id] = pair
         return True
@@ -5615,7 +6235,27 @@ async def handle_command(
         if not config.enable_live:
             print(f"[strategy][paper] live disabled: close pair_id={pair.pair_id}")
             return True
-        ok = await close_pair_limit_then_hedge(pair, exchanges, config)
+        lease_owner = f"stdin-close:{pair.pair_id}:{now_ms()}"
+        lease_ok = True
+        if action_gate is not None:
+            lease_ok, lease_reason = action_gate.try_acquire_symbol(
+                owner_id=lease_owner,
+                symbol=pair.symbol,
+                domain="manual_stdin_close",
+                note="close_command",
+            )
+            if not lease_ok:
+                print(f"[strategy][close] action lease blocked reason={lease_reason}")
+                return True
+        try:
+            ok = await close_pair_limit_then_hedge(pair, exchanges, config)
+        finally:
+            if action_gate is not None and lease_ok:
+                action_gate.release_symbol(
+                    owner_id=lease_owner,
+                    symbol=pair.symbol,
+                    note="stdin_close_completed",
+                )
         if ok and pair.status == "closed":
             register_pair_assumed_flat(pair, assumed_flat_until_ms, config)
             mark_symbol_recently_closed(symbol_recent_close_ms, pair.symbol)
@@ -5712,10 +6352,11 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"maker_entry_engine_max_open_orders={config.maker_entry_engine_max_open_orders} "
         f"maker_entry_engine_requote_sec={config.maker_entry_engine_requote_sec} "
         f"maker_entry_engine_replace_edge_bps={config.maker_entry_engine_replace_edge_bps} "
+        f"maker_entry_engine_replace_price_bps={config.maker_entry_engine_replace_price_bps} "
         f"maker_entry_engine_queue_edge_gap_bps={config.maker_entry_engine_queue_edge_gap_bps} "
         f"maker_entry_engine_transient_pause_sec={config.maker_entry_engine_transient_pause_sec} "
         f"maker_entry_engine_stale_pause_sec={config.maker_entry_engine_stale_pause_sec} "
-        f"maker_entry_q4_fast_hedge={config.maker_entry_q4_fast_hedge} "
+        f"maker_entry_fast_hedge={config.maker_entry_fast_hedge} "
         f"hedge_fast_ack={config.hedge_fast_ack} "
         f"auto_enter_cooldown_sec={config.auto_enter_cooldown_sec} "
         f"render_interval_sec={config.render_interval_sec} "
@@ -5758,6 +6399,8 @@ def print_strategy_config(config: StrategyConfig, symbols: list[str]) -> None:
         f"min_effective_funding_usd={effective_funding_floor} "
         f"require_funding_payment={config.require_funding_payment} "
         f"entry_funding_forecast_sec={config.entry_funding_forecast_sec} "
+        f"funding_source={config.funding_source} "
+        f"funding_max_age_sec={config.funding_max_age_sec} "
         f"hold_buffer_usd={config.hold_buffer_usd} "
         f"hold_buffer_bps={config.hold_buffer_bps} "
         f"min_hold_sec={config.min_hold_sec} "
@@ -5807,6 +6450,7 @@ async def strategy_loop() -> None:
     )
 
     snapshot_task: asyncio.Task[Any] | None = None
+    funding_cashflow_task: asyncio.Task[Any] | None = None
     console_task: asyncio.Task[Any] | None = None
     listener_tasks: list[asyncio.Task[Any]] = []
 
@@ -5823,6 +6467,8 @@ async def strategy_loop() -> None:
     shutdown_requested = asyncio.Event()
     shutdown_reason: dict[str, str] = {"reason": "normal_exit"}
     installed_signal_handlers: list[signal.Signals] = []
+    order_intent_journal = active_order_intent_journal()
+    action_gate = ActionGate(stale_timeout_sec=config.action_lease_timeout_sec)
     maker_entry_engine = MakerEntryEngine(
         MakerEntryHooks(
             first_leg_plan=first_leg_plan,
@@ -5839,7 +6485,8 @@ async def strategy_loop() -> None:
             bootstrap_candidate=bootstrap_candidate_exchanges,
             complete_after_first_fill=complete_entry_after_maker_first_fill,
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
-        )
+        ),
+        action_gate=action_gate,
     )
     control_service = StrategyControlService(
         config=config,
@@ -5851,6 +6498,8 @@ async def strategy_loop() -> None:
         symbol_recent_close_ms=symbol_recent_close_ms,
         wake_queue=wake_queue,
         command_queue=control_command_queue,
+        action_gate=action_gate,
+        order_intent_journal=order_intent_journal,
         event_sink=lambda event_type, **payload: record_live_event(config, event_type, **payload),
     )
     control_service.extra_active_symbols_provider = maker_entry_engine.active_symbols
@@ -5860,6 +6509,7 @@ async def strategy_loop() -> None:
     last_render_ts = 0.0
     last_recompute_ts = 0.0
     last_auto_enter_ts = 0.0
+    last_intent_reconcile_ts = 0.0
     startup_block_reasons: tuple[str, ...] = ()
 
     try:
@@ -5871,12 +6521,24 @@ async def strategy_loop() -> None:
 
         await start_strategy_exchanges(exchanges)
         await control_server.start()
-        startup_block_reasons = await check_startup_margin_mode_guard(
+        margin_mode_block_reasons = await check_startup_margin_mode_guard(
             exchanges=exchanges,
             symbols=symbols,
             margin_mode=config.margin_mode,
             enabled=config.startup_margin_mode_guard_enabled,
             record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
+        )
+        unresolved_intents = await reconcile_order_intents(
+            order_intent_journal,
+            exchanges,
+            position_qty=extract_position_qty,
+            record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
+        )
+        startup_block_reasons = tuple(
+            dict.fromkeys(
+                tuple(margin_mode_block_reasons)
+                + (("risk:unresolved_order_intent",) if unresolved_intents else ())
+            )
         )
         control_service.set_startup_block_reasons(startup_block_reasons)
         startup_bootstrap_failures = await bootstrap_strategy_symbols_once(exchanges, symbols, config)
@@ -5895,6 +6557,17 @@ async def strategy_loop() -> None:
                 ),
                 name="strategy-snapshot-loop",
             )
+            if parse_bool(os.getenv("STRATEGY_FUNDING_CASHFLOW_ENABLED"), True):
+                funding_cashflow_task = asyncio.create_task(
+                    run_funding_cashflow_loop(
+                        exchanges=exchanges,
+                        open_pairs=open_pairs,
+                        record_event=lambda event_type, **payload: record_live_event(
+                            config, event_type, **payload
+                        ),
+                    ),
+                    name="strategy-funding-cashflow-loop",
+                )
 
         print_strategy_config(config, symbols)
         record_live_event(
@@ -5942,6 +6615,24 @@ async def strategy_loop() -> None:
 
             prune_assumed_flat(assumed_flat_until_ms)
             manual_locked_symbols = entry_locked_symbols(config)
+
+            if order_intent_journal.unresolved() and (
+                time.monotonic() - last_intent_reconcile_ts
+            ) >= max(config.scan_interval_sec, 5.0):
+                unresolved_intents = await reconcile_order_intents(
+                    order_intent_journal,
+                    exchanges,
+                    position_qty=extract_position_qty,
+                    record_event=lambda event_type, **payload: record_live_event(config, event_type, **payload),
+                )
+                startup_block_reasons = tuple(
+                    dict.fromkeys(
+                        tuple(margin_mode_block_reasons)
+                        + (("risk:unresolved_order_intent",) if unresolved_intents else ())
+                    )
+                )
+                control_service.set_startup_block_reasons(startup_block_reasons)
+                last_intent_reconcile_ts = time.monotonic()
 
             candidates = collect_candidates(
                 symbols,
@@ -6008,6 +6699,7 @@ async def strategy_loop() -> None:
                     assumed_flat_until_ms=assumed_flat_until_ms,
                     next_retry_ms_by_key=account_imbalance_next_retry_ms,
                     skip_symbols=recovery_skip_symbols,
+                    action_gate=action_gate,
                 )
                 reconcile_orphan_markers(exchanges, config)
 
@@ -6070,13 +6762,36 @@ async def strategy_loop() -> None:
                             expected_net_edge_bps=candidate.expected_net_edge_bps,
                         )
 
-                        pair = await enter_pair_limit_then_hedge(
-                            candidate,
-                            exchanges,
-                            config,
-                            assumed_flat_until_ms=assumed_flat_until_ms,
-                            last_entry_order_submit_ms_by_key=last_entry_order_submit_ms_by_key,
+                        lease_owner = f"direct-entry:{candidate.id}:{now_ms()}"
+                        lease_ok, lease_reason = action_gate.try_acquire_symbol(
+                            owner_id=lease_owner,
+                            symbol=candidate.symbol,
+                            domain="auto_entry",
+                            note="direct_entry",
                         )
+                        if not lease_ok:
+                            record_live_event(
+                                config,
+                                "entry_blocked_by_action_lease",
+                                candidate_id=candidate.id,
+                                symbol=candidate.symbol,
+                                reason=lease_reason,
+                            )
+                            continue
+                        try:
+                            pair = await enter_pair_limit_then_hedge(
+                                candidate,
+                                exchanges,
+                                config,
+                                assumed_flat_until_ms=assumed_flat_until_ms,
+                                last_entry_order_submit_ms_by_key=last_entry_order_submit_ms_by_key,
+                            )
+                        finally:
+                            action_gate.release_symbol(
+                                owner_id=lease_owner,
+                                symbol=candidate.symbol,
+                                note="direct_entry_completed",
+                            )
                         if pair is not None:
                             open_pairs[pair.pair_id] = pair
 
@@ -6097,6 +6812,7 @@ async def strategy_loop() -> None:
                     symbol_recent_close_ms,
                     entry_control_store,
                     startup_block_reasons,
+                    action_gate,
                 )
                 if not should_continue:
                     shutdown_reason["reason"] = "console_command"
@@ -6112,9 +6828,23 @@ async def strategy_loop() -> None:
                 config,
                 assumed_flat_until_ms,
                 symbol_recent_close_ms,
+                action_gate,
             )
 
     finally:
+        shutdown_maker_symbols = set(maker_entry_engine.active_symbols())
+        if maker_entry_engine.active is not None:
+            state = maker_entry_engine.active
+            with contextlib.suppress(Exception):
+                filled_pair = await maker_entry_engine.cancel_active(
+                    exchanges,
+                    state.candidate.symbol,
+                    "shutdown",
+                    config,
+                    assumed_flat_until_ms,
+                )
+                if filled_pair is not None:
+                    open_pairs[filled_pair.pair_id] = filled_pair
         try:
             await graceful_shutdown_flatten(
                 reason=shutdown_reason.get("reason") or "normal_exit",
@@ -6124,6 +6854,9 @@ async def strategy_loop() -> None:
                 config=config,
                 assumed_flat_until_ms=assumed_flat_until_ms,
                 manual_locked_symbols=active_manual_symbols(config.position_ownership_file),
+                extra_active_symbols=shutdown_maker_symbols,
+                order_intent_journal=order_intent_journal,
+                action_gate=action_gate,
             )
         except Exception as exc:
             print(f"[종료][정리오류] 오류={exc}")
@@ -6153,6 +6886,15 @@ async def strategy_loop() -> None:
                 pass
             except Exception as exc:
                 print(f"[snapshot-loop][stop][error] {exc}")
+
+        if funding_cashflow_task is not None:
+            funding_cashflow_task.cancel()
+            try:
+                await funding_cashflow_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                print(f"[funding-cashflow-loop][stop][error] {exc}")
 
         if console_task is not None:
             console_task.cancel()

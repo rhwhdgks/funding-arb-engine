@@ -381,6 +381,8 @@ def build_funding_rate_rows(
                 "server_time_ms": _safe_int(funding.get("timestamp")),
                 "funding_rate": funding_rate if funding_rate is not None else 0.0,
                 "next_funding_time_ms": next_funding_time_ms,
+                "funding_interval_hours": _safe_int(funding.get("funding_interval_hours")),
+                "funding_interval_source": funding.get("funding_interval_source"),
                 "raw_json": json_dumps(funding),
             }
         )
@@ -392,6 +394,7 @@ def build_symbol_price_rows(
     exchange_name: str,
     api_snapshots: dict[str, dict[str, Any]] | None,
     impact_snapshots: dict[str, dict[str, Any]] | None = None,
+    funding_snapshots: dict[str, dict[str, Any]] | None = None,
     *,
     snapshot_time_ms: int | None = None,
 ) -> list[dict[str, Any]]:
@@ -399,6 +402,7 @@ def build_symbol_price_rows(
     bucket_start_ms = _bucket_start_ms(captured_at_ms, "SYMBOL_PRICE_BUCKET_SEC", 60)
     rows: list[dict[str, Any]] = []
     impact_snapshots = impact_snapshots or {}
+    funding_snapshots = funding_snapshots or {}
 
     for symbol, api_row in sorted((api_snapshots or {}).items()):
         normalized_symbol = _normalize_symbol(symbol)
@@ -417,6 +421,12 @@ def build_symbol_price_rows(
             [value for value in (api_server_time_ms, impact_server_time_ms) if value is not None],
             default=None,
         )
+        funding_row = dict(funding_snapshots.get(normalized_symbol) or {})
+        funding_rate = _safe_float(funding_row.get("funding_rate"))
+        next_funding_time_ms = _safe_int(funding_row.get("next_funding_time_ms"))
+        funding_interval_hours = _safe_int(funding_row.get("funding_interval_hours"))
+        funding_interval_source = funding_row.get("funding_interval_source")
+        funding_updated_at_ms = _safe_int(funding_row.get("funding_updated_at_ms"))
 
         rows.append(
             {
@@ -429,6 +439,11 @@ def build_symbol_price_rows(
                 "best_ask": best_ask,
                 "bid": _safe_float(impact_row.get("bid")),
                 "ask": _safe_float(impact_row.get("ask")),
+                "funding_rate": funding_rate,
+                "next_funding_time_ms": next_funding_time_ms,
+                "funding_interval_hours": funding_interval_hours,
+                "funding_interval_source": funding_interval_source,
+                "funding_updated_at_ms": funding_updated_at_ms,
             }
         )
 

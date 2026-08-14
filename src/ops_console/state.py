@@ -99,8 +99,10 @@ def build_symbol_state(exchange_name: str, symbol: str, snapshot: dict[str, Any]
     position = snapshot.get("position") or {}
     health = snapshot.get("health") or {}
     funding = snapshot.get("funding") or {}
+    raw_market_meta = snapshot.get("market_meta") or {}
     open_orders = snapshot.get("open_orders") or []
     account_last_sync_ms = int(safe_float(snapshot.get("account_last_sync_ms"), 0.0))
+    tick_size = safe_float(raw_market_meta.get("tick_size"), 0.0)
 
     market_ready = bool(snapshot.get("market_ready", health.get("market_ready", False)))
     account_ready = bool(snapshot.get("account_ready", health.get("account_ready", False)))
@@ -116,6 +118,13 @@ def build_symbol_state(exchange_name: str, symbol: str, snapshot: dict[str, Any]
         "stale": stale,
         "block_reasons": block_reasons,
         "account_last_sync_ms": account_last_sync_ms,
+        "market_meta": {
+            "tick_size": tick_size,
+            "step_size": safe_float(raw_market_meta.get("step_size"), 0.0),
+            "min_qty": safe_float(raw_market_meta.get("min_qty", raw_market_meta.get("min_q")), 0.0),
+            "price_precision": int(safe_float(raw_market_meta.get("price_precision"), 0.0)),
+            "source": "exchange_meta" if tick_size > 0 else "",
+        },
         "orderbook": orderbook,
         "position": {
             "qty": safe_float(position.get("qty", position.get("balance")), 0.0),

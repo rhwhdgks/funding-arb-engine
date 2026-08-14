@@ -3,17 +3,42 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 .env
-.env.notion
-test_server/.env
+.env.*
+!.env.example
+!**/.env.example
+!**/.env.*.example
 
 logs/
 /runtime/
 /test_server/runtime/
+/market_data_collector/logs/
+/market_data_collector/runtime/
+dist/
 
 .vscode/
-.pytest_cache/
+.idea/
+.claude/
+
+# Local AI review/handoff artifacts are not part of the public project.
+/handoff/
+/funding_arb_handoff_*.md
+/funding_arb_project_analysis_*.md
+
+# Private/proprietary comparison material is kept outside the public source tree.
+/reference/question4/
+
+# Never publish private key or certificate containers.
+*.key
+*.pem
+*.p12
+*.pfx
 
 *.log
 *.jsonl

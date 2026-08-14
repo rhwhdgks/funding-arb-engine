@@ -52,6 +52,8 @@ class StrategyConfig:
     entry_post_fill_min_open_edge_bps: float = 0.0
     entry_post_fill_min_net_edge_bps: float = 0.0
     action_settle_wait_sec: float = 0.6
+    close_filled_settle_sec: float = 2.0
+    close_filled_settle_poll_sec: float = 0.25
     entry_order_settle_sec: float = 1.2
     entry_order_cooldown_sec: float = 1.0
     symbol_recent_close_cooldown_sec: float = 3.0
@@ -93,6 +95,12 @@ class StrategyConfig:
     funding_alignment_full_penalty_sec: float = 14400.0
     funding_time_decay_min_factor: float = 0.35
     funding_time_decay_full_penalty_sec: float = 28800.0
+    funding_source: str = "runtime"
+    funding_max_age_sec: float = 900.0
+    funding_event_model_enabled: bool = False
+    funding_event_entry_buffer_sec: float = 5.0
+    close_positive_funding_wait_enabled: bool = False
+    close_positive_funding_wait_max_sec: float = 1800.0
     approval_mode: str = "console"
     enable_live: bool = False
     auto_enter_enabled: bool = False
@@ -102,12 +110,14 @@ class StrategyConfig:
     maker_entry_engine_max_open_orders: int = 1
     maker_entry_engine_requote_sec: float = 1.0
     maker_entry_engine_replace_edge_bps: float = 5.0
+    maker_entry_engine_replace_price_bps: float = 2.0
     maker_entry_engine_queue_edge_gap_bps: float = 10.0
     maker_entry_engine_keep_edge_buffer_bps: float = 2.0
     maker_entry_engine_active_stale_sec: float = 3.0
     maker_entry_engine_transient_pause_sec: float = 60.0
     maker_entry_engine_stale_pause_sec: float = 30.0
-    maker_entry_q4_fast_hedge: bool = False
+    maker_entry_engine_require_full_admission: bool = True
+    maker_entry_fast_hedge: bool = False
     max_candidates_print: int = 10
     max_open_pairs: int = 1
     assumed_flat_grace_sec: float = 8.0
@@ -119,6 +129,7 @@ class StrategyConfig:
     micro_residual_info_notional_usd: float = 50.0
     micro_residual_info_ratio: float = 0.02
     action_account_fresh_sec: float = 2.5
+    action_lease_timeout_sec: float = 120.0
     account_imbalance_hedge_enabled: bool = True
     account_imbalance_cooldown_sec: float = 60.0
     graceful_shutdown_enabled: bool = True
@@ -168,6 +179,24 @@ class PairCandidate:
     short_next_funding_ms: int
     can_enter: bool
     block_reasons: list[str] = field(default_factory=list)
+    funding_direction_pnl_usd: float = 0.0
+    legacy_prorated_funding_pnl_usd: float = 0.0
+    funding_event_raw_pnl_usd: float = 0.0
+    funding_event_pnl_usd: float = 0.0
+    funding_event_count: int = 0
+    funding_event_next_time_ms: int = 0
+    funding_event_schedule_complete: bool = False
+    funding_event_model_enabled: bool = False
+    long_funding_interval_hours: int | None = None
+    short_funding_interval_hours: int | None = None
+    long_funding_interval_source: str = "unknown"
+    short_funding_interval_source: str = "unknown"
+    legacy_expected_net_edge_usd: float = 0.0
+    legacy_expected_net_edge_bps: float = 0.0
+    event_expected_net_edge_usd: float = 0.0
+    event_expected_net_edge_bps: float = 0.0
+    legacy_can_enter: bool = False
+    event_can_enter: bool = False
 
     @property
     def id(self) -> str:
@@ -221,6 +250,9 @@ class FlattenLegResult:
     error_code: str = ""
     error_message: str = ""
     temporarily_unavailable: bool = False
+    filled_snapshot_pending: bool = False
+    order_id: str = ""
+    client_order_id: str = ""
 
 
 @dataclass

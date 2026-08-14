@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hmac
 import os
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,8 @@ TERMINAL_PAIR_EVENTS = {
     "pair_closed_after_shutdown",
 }
 _ACTIVE_STRATEGY_SYMBOLS_PROVIDER = None
+_LIVE_ACTION_WINDOW_UNTIL_MS = 0
+_LIVE_ACTION_WINDOW_OPERATOR = ""
 
 
 def set_active_strategy_symbols_provider(provider) -> None:
@@ -87,8 +91,41 @@ def assert_action_token(provided_token: str | None) -> None:
     expected = action_token()
     if not expected:
         raise PermissionError("action token is required but not configured")
-    if (provided_token or "").strip() != expected:
+    if not hmac.compare_digest((provided_token or "").strip(), expected):
         raise PermissionError("invalid action token")
+
+
+def enable_live_action_window(
+    provided_token: str | None,
+    *,
+    operator: str,
+    duration_sec: float | None = None,
+) -> dict[str, Any]:
+    global _LIVE_ACTION_WINDOW_OPERATOR, _LIVE_ACTION_WINDOW_UNTIL_MS
+    assert_action_token(provided_token)
+    default_sec = float(os.getenv("OPS_CONSOLE_LIVE_ACTION_WINDOW_SEC", "300") or 300)
+    max_sec = max(float(os.getenv("OPS_CONSOLE_LIVE_ACTION_WINDOW_MAX_SEC", "900") or 900), 1.0)
+    requested_sec = default_sec if duration_sec is None else float(duration_sec)
+    effective_sec = min(max(requested_sec, 1.0), max_sec)
+    _LIVE_ACTION_WINDOW_UNTIL_MS = int(time.time() * 1000 + effective_sec * 1000)
+    _LIVE_ACTION_WINDOW_OPERATOR = str(operator or "local_operator").strip()[:64]
+    return live_action_window_status()
+
+
+def live_action_window_status() -> dict[str, Any]:
+    now_ms = int(time.time() * 1000)
+    return {
+        "enabled": _LIVE_ACTION_WINDOW_UNTIL_MS > now_ms,
+        "until_ms": _LIVE_ACTION_WINDOW_UNTIL_MS,
+        "remaining_ms": max(_LIVE_ACTION_WINDOW_UNTIL_MS - now_ms, 0),
+        "operator": _LIVE_ACTION_WINDOW_OPERATOR or None,
+    }
+
+
+def assert_live_action_window() -> None:
+    status = live_action_window_status()
+    if not status["enabled"]:
+        raise PermissionError("live action window is closed")
 
 
 def _symbol_state(snapshot: dict[str, Any], exchange: str, symbol: str) -> dict[str, Any]:
@@ -131,6 +168,7 @@ def assert_live_action_allowed(
     if not web_trading_enabled():
         raise PermissionError("web trading disabled; set ENABLE_WEB_TRADING=1")
     assert_action_token(ops_token)
+    assert_live_action_window()
     assert_symbol_not_stale(snapshot, exchange, symbol)
     if check_strategy_conflict:
         assert_no_strategy_conflict(symbol)

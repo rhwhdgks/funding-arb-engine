@@ -298,8 +298,8 @@ def action_token() -> str:
 def action_token_required() -> bool:
     raw = os.getenv("OPS_CONSOLE_ACTION_TOKEN_REQUIRED")
     if raw is not None:
-        return parse_bool(raw, False)
-    return bool(action_token())
+        return parse_bool(raw, True)
+    return True
 
 
 def position_qty_for_symbol(snapshot: dict[str, Any], exchange_name: str, symbol: str) -> float:

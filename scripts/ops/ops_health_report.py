@@ -373,8 +373,11 @@ def collect_db_report(*, exchanges: list[str], interval_sec: float) -> dict[str,
         return {"enabled": False, "verdict": "WARN", "checks": checks, "symbol_price": symbol_price}
 
     try:
+        from src.ops.persistence.account_context import resolve_account_label, resolve_logic_name
         from src.ops.persistence.db import get_db_connection
 
+        account_label = resolve_account_label()
+        logic = resolve_logic_name()
         conn = get_db_connection()
     except Exception as exc:
         checks.append(check("FAIL", "db_connection_ok", str(exc)))
@@ -465,11 +468,20 @@ def collect_db_report(*, exchanges: list[str], interval_sec: float) -> dict[str,
                 """
                 SELECT COUNT(*)
                 FROM order_history
-                WHERE UPPER(COALESCE(status, '')) IN ('NEW', 'LIVE', 'OPEN', 'PARTIALLY_FILLED', 'SUBMITTED', 'UPDATED')
-                """
+                WHERE account_label = ?
+                  AND logic = ?
+                  AND UPPER(COALESCE(status, '')) IN ('NEW', 'LIVE', 'OPEN', 'PARTIALLY_FILLED', 'SUBMITTED', 'UPDATED')
+                """,
+                (account_label, logic),
             )
             open_like_count = int((cur.fetchone() or [0])[0] or 0)
-            checks.append(check("INFO", "db_open_like_orders_current", f"rows={open_like_count}"))
+            checks.append(
+                check(
+                    "INFO",
+                    "db_open_like_orders_current",
+                    f"account_label={account_label} logic={logic} rows={open_like_count}",
+                )
+            )
         except Exception as exc:
             checks.append(check("WARN", "db_open_like_orders_query_ok", str(exc)))
 

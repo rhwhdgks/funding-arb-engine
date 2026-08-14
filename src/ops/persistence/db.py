@@ -10,7 +10,6 @@ import mariadb
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-LEGACY_SCHEMA_PATH = PROJECT_ROOT / "sql" / "mariadb_schema.sql"
 TRADING_DEV_SCHEMA_PATH = PROJECT_ROOT / "sql" / "trading_dev_schema.sql"
 DEFAULT_DB_NAME = "trading_dev"
 DB_PERSISTENCE_TRUE_VALUES = {"1", "true", "on"}
@@ -51,10 +50,7 @@ _load_persistence_env()
 
 
 def resolve_default_schema_path() -> Path:
-    database_name = (os.getenv("MARIADB_DATABASE") or DEFAULT_DB_NAME).strip().lower()
-    if database_name == "trading_dev" and TRADING_DEV_SCHEMA_PATH.exists():
-        return TRADING_DEV_SCHEMA_PATH
-    return LEGACY_SCHEMA_PATH
+    return TRADING_DEV_SCHEMA_PATH
 
 
 DEFAULT_SCHEMA_PATH = resolve_default_schema_path()
@@ -1192,6 +1188,15 @@ def insert_cashflow_row(conn, row: dict[str, Any]) -> int:
         event_time_ms, memo, raw_json,
         created_at_ms, updated_at_ms
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+        status = VALUES(status),
+        reconcile_status = VALUES(reconcile_status),
+        amount = VALUES(amount),
+        fee_amount = VALUES(fee_amount),
+        event_time_ms = VALUES(event_time_ms),
+        memo = VALUES(memo),
+        raw_json = VALUES(raw_json),
+        updated_at_ms = VALUES(updated_at_ms)
     """
 
     now_ms = current_utc_ms()
@@ -1201,7 +1206,11 @@ def insert_cashflow_row(conn, row: dict[str, Any]) -> int:
         _string_or_none(row.get("status")),
         _string_or_none(row.get("reconcile_status")) or "pending",
         (_string_or_none(row.get("asset_code")) or "").upper(),
-        abs(_safe_float(row.get("amount")) or 0.0),
+        (
+            _safe_float(row.get("amount")) or 0.0
+            if str(row.get("flow_type") or "").lower() == "funding_payment"
+            else abs(_safe_float(row.get("amount")) or 0.0)
+        ),
         _safe_float(row.get("fee_amount")),
         _string_or_none(row.get("exchange_name")),
         _string_or_none(row.get("from_exchange_name")),

@@ -5,6 +5,12 @@ from typing import Any, Callable
 
 from src.strategy.close_policy import close_fee_cost_usd
 from src.strategy.entry_policy import evaluate_entry_policy
+from src.strategy.funding_events import (
+    estimate_pair_funding_events,
+    legacy_prorated_funding_pnl_usd,
+    normalize_funding_interval_hours,
+    per_settlement_direction_pnl_usd,
+)
 from src.strategy.models import PairCandidate, StrategyConfig
 
 
@@ -117,6 +123,13 @@ def extract_next_funding_ms(snapshot: dict[str, Any]) -> int:
     return 0
 
 
+def extract_funding_interval(snapshot: dict[str, Any]) -> tuple[int | None, str]:
+    funding = snapshot.get("funding", {}) or {}
+    interval = normalize_funding_interval_hours(funding.get("funding_interval_hours"))
+    source = str(funding.get("funding_interval_source") or "unknown")
+    return interval, source
+
+
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
@@ -171,7 +184,7 @@ def compute_funding_time_decay_factor(
     return max(min_factor, 1.0 - penalty_ratio * (1.0 - min_factor))
 
 
-FUNDING_SETTLEMENT_SEC = 28800.0  # 8h per funding settlement on binance/okx perps
+FUNDING_SETTLEMENT_SEC = 28800.0
 
 
 def compute_effective_funding_components(
@@ -186,11 +199,17 @@ def compute_effective_funding_components(
     forecast_hold_sec: float,
     now_ms: int | None = None,
 ) -> tuple[float, float, float, float, float]:
-    # Funding rates are per 8h settlement. Scale to the forecast hold horizon
-    # so expected_net_edge reflects what we'd realistically collect/pay during
-    # the trade rather than a full settlement's worth.
-    hold_scale = max(0.0, float(forecast_hold_sec)) / FUNDING_SETTLEMENT_SEC
-    raw_funding_pnl_usd = ((-long_rate * long_notional) + (short_rate * short_notional)) * hold_scale
+    direction_pnl_usd = per_settlement_direction_pnl_usd(
+        long_rate=long_rate,
+        short_rate=short_rate,
+        long_notional_usd=long_notional,
+        short_notional_usd=short_notional,
+    )
+    raw_funding_pnl_usd = legacy_prorated_funding_pnl_usd(
+        direction_pnl_usd=direction_pnl_usd,
+        forecast_hold_sec=forecast_hold_sec,
+        settlement_sec=FUNDING_SETTLEMENT_SEC,
+    )
     funding_confidence = compute_funding_confidence(long_next_funding_ms, short_next_funding_ms, config)
     funding_alignment_factor = compute_funding_alignment_factor(long_next_funding_ms, short_next_funding_ms, config)
     funding_time_decay_factor = compute_funding_time_decay_factor(
@@ -314,6 +333,8 @@ def compute_pair_candidate(
     funding_short_rate = extract_funding_rate(short_snapshot)
     long_next_funding_ms = extract_next_funding_ms(long_snapshot)
     short_next_funding_ms = extract_next_funding_ms(short_snapshot)
+    long_funding_interval_hours, long_funding_interval_source = extract_funding_interval(long_snapshot)
+    short_funding_interval_hours, short_funding_interval_source = extract_funding_interval(short_snapshot)
     current_ms = int(time.time() * 1000)
 
     entry_unit_edge = short_bid - long_ask
@@ -335,7 +356,7 @@ def compute_pair_candidate(
     )
     risk_buffer_usd = reference_notional * config.risk_buffer_bps / 10000.0
     (
-        raw_funding_pnl_usd,
+        legacy_prorated_funding_usd,
         funding_confidence,
         funding_alignment_factor,
         funding_time_decay_factor,
@@ -351,6 +372,35 @@ def compute_pair_candidate(
         forecast_hold_sec=config.entry_funding_forecast_sec,
         now_ms=current_ms,
     )
+    funding_direction_pnl_usd = per_settlement_direction_pnl_usd(
+        long_rate=funding_long_rate,
+        short_rate=funding_short_rate,
+        long_notional_usd=notional_long,
+        short_notional_usd=notional_short,
+    )
+    entry_complete_ms = current_ms + int(max(config.funding_event_entry_buffer_sec, 0.0) * 1000)
+    event_estimate = estimate_pair_funding_events(
+        long_rate=funding_long_rate,
+        short_rate=funding_short_rate,
+        long_notional_usd=notional_long,
+        short_notional_usd=notional_short,
+        long_next_funding_ms=long_next_funding_ms,
+        short_next_funding_ms=short_next_funding_ms,
+        long_interval_hours=long_funding_interval_hours,
+        short_interval_hours=short_funding_interval_hours,
+        long_interval_source=long_funding_interval_source,
+        short_interval_source=short_funding_interval_source,
+        entry_complete_ms=entry_complete_ms,
+        forecast_end_ms=current_ms + int(max(config.max_hold_sec, 0.0) * 1000),
+    )
+    # Entry duration is unknown. Keep the next-event cashflow for shadow
+    # observability, but do not add or subtract it from entry expected edge.
+    event_funding_pnl_usd = 0.0
+    selected_funding_pnl_usd = (
+        event_funding_pnl_usd
+        if config.funding_event_model_enabled
+        else effective_funding_pnl_usd
+    )
     stale_data_penalty_usd = compute_stale_data_penalty_usd(
         reference_notional,
         funding_confidence,
@@ -359,15 +409,23 @@ def compute_pair_candidate(
         config,
     )
 
-    expected_net_edge_usd = (
+    cost_without_funding_usd = (
         entry_open_edge_usd
-        + effective_funding_pnl_usd
         - open_fee_cost_usd
         - expected_close_cost_usd
         - risk_buffer_usd
         - stale_data_penalty_usd
     )
+    legacy_expected_net_edge_usd = cost_without_funding_usd + effective_funding_pnl_usd
+    event_expected_net_edge_usd = cost_without_funding_usd + event_funding_pnl_usd
+    expected_net_edge_usd = cost_without_funding_usd + selected_funding_pnl_usd
     expected_net_edge_bps = (expected_net_edge_usd / reference_notional * 10000.0) if reference_notional > 0 else 0.0
+    legacy_expected_net_edge_bps = (
+        legacy_expected_net_edge_usd / reference_notional * 10000.0 if reference_notional > 0 else 0.0
+    )
+    event_expected_net_edge_bps = (
+        event_expected_net_edge_usd / reference_notional * 10000.0 if reference_notional > 0 else 0.0
+    )
 
     block_reasons: list[str] = []
     if long_ask <= 0:
@@ -404,14 +462,34 @@ def compute_pair_candidate(
             balance_reports_by_exchange=balance_reports_by_exchange,
         )
     )
-    entry_decision = evaluate_entry_policy(
+    legacy_entry_decision = evaluate_entry_policy(
         config=config,
         base_reasons=block_reasons,
-        raw_funding_pnl_usd=raw_funding_pnl_usd,
+        raw_funding_pnl_usd=legacy_prorated_funding_usd,
+        funding_direction_pnl_usd=funding_direction_pnl_usd,
         effective_funding_pnl_usd=effective_funding_pnl_usd,
-        expected_net_edge_usd=expected_net_edge_usd,
-        expected_net_edge_bps=expected_net_edge_bps,
+        expected_net_edge_usd=legacy_expected_net_edge_usd,
+        expected_net_edge_bps=legacy_expected_net_edge_bps,
     )
+    event_base_reasons = list(block_reasons)
+    if not event_estimate.schedule_complete:
+        event_base_reasons.append("funding_schedule_incomplete")
+    entry_buffer_end_ms = current_ms + int(max(config.funding_event_entry_buffer_sec, 0.0) * 1000)
+    if any(
+        current_ms < funding_ms <= entry_buffer_end_ms
+        for funding_ms in (long_next_funding_ms, short_next_funding_ms)
+    ):
+        event_base_reasons.append("funding_event_too_close")
+    event_entry_decision = evaluate_entry_policy(
+        config=config,
+        base_reasons=event_base_reasons,
+        raw_funding_pnl_usd=event_funding_pnl_usd,
+        funding_direction_pnl_usd=funding_direction_pnl_usd,
+        effective_funding_pnl_usd=event_funding_pnl_usd,
+        expected_net_edge_usd=event_expected_net_edge_usd,
+        expected_net_edge_bps=event_expected_net_edge_bps,
+    )
+    entry_decision = event_entry_decision if config.funding_event_model_enabled else legacy_entry_decision
     block_reasons = entry_decision.reasons
     can_enter = entry_decision.can_enter
     return PairCandidate(
@@ -429,8 +507,8 @@ def compute_pair_candidate(
         entry_open_edge_usd=entry_open_edge_usd,
         entry_open_edge_bps=entry_open_edge_bps,
         open_fee_cost_usd=open_fee_cost_usd,
-        raw_funding_pnl_usd=raw_funding_pnl_usd,
-        effective_funding_pnl_usd=effective_funding_pnl_usd,
+        raw_funding_pnl_usd=selected_funding_pnl_usd,
+        effective_funding_pnl_usd=selected_funding_pnl_usd,
         funding_confidence=funding_confidence,
         funding_alignment_factor=funding_alignment_factor,
         funding_time_decay_factor=funding_time_decay_factor,
@@ -445,6 +523,24 @@ def compute_pair_candidate(
         short_next_funding_ms=short_next_funding_ms,
         can_enter=can_enter,
         block_reasons=block_reasons,
+        funding_direction_pnl_usd=funding_direction_pnl_usd,
+        legacy_prorated_funding_pnl_usd=legacy_prorated_funding_usd,
+        funding_event_raw_pnl_usd=event_estimate.pnl_usd,
+        funding_event_pnl_usd=event_funding_pnl_usd,
+        funding_event_count=event_estimate.event_count,
+        funding_event_next_time_ms=event_estimate.next_event_time_ms,
+        funding_event_schedule_complete=event_estimate.schedule_complete,
+        funding_event_model_enabled=config.funding_event_model_enabled,
+        long_funding_interval_hours=long_funding_interval_hours,
+        short_funding_interval_hours=short_funding_interval_hours,
+        long_funding_interval_source=long_funding_interval_source,
+        short_funding_interval_source=short_funding_interval_source,
+        legacy_expected_net_edge_usd=legacy_expected_net_edge_usd,
+        legacy_expected_net_edge_bps=legacy_expected_net_edge_bps,
+        event_expected_net_edge_usd=event_expected_net_edge_usd,
+        event_expected_net_edge_bps=event_expected_net_edge_bps,
+        legacy_can_enter=legacy_entry_decision.can_enter,
+        event_can_enter=event_entry_decision.can_enter,
     )
 
 
@@ -485,6 +581,18 @@ def candidate_scan_item(candidate: PairCandidate | None) -> dict[str, Any] | Non
         "expected_net_edge_usd": candidate.expected_net_edge_usd,
         "expected_net_edge_bps": candidate.expected_net_edge_bps,
         "effective_funding_pnl_usd": candidate.effective_funding_pnl_usd,
+        "funding_model": "event" if candidate.funding_event_model_enabled else "legacy_prorated",
+        "funding_direction_pnl_usd": candidate.funding_direction_pnl_usd,
+        "legacy_prorated_funding_pnl_usd": candidate.legacy_prorated_funding_pnl_usd,
+        "funding_event_raw_pnl_usd": candidate.funding_event_raw_pnl_usd,
+        "funding_event_pnl_usd": candidate.funding_event_pnl_usd,
+        "funding_event_count": candidate.funding_event_count,
+        "funding_event_next_time_ms": candidate.funding_event_next_time_ms,
+        "legacy_expected_net_edge_bps": candidate.legacy_expected_net_edge_bps,
+        "event_expected_net_edge_bps": candidate.event_expected_net_edge_bps,
+        "legacy_can_enter": candidate.legacy_can_enter,
+        "event_can_enter": candidate.event_can_enter,
+        "funding_shadow_admission_changed": candidate.legacy_can_enter != candidate.event_can_enter,
         "can_enter": candidate.can_enter,
         "block_reasons": list(candidate.block_reasons[:5]),
         "normalized_block_reasons": [
@@ -498,6 +606,13 @@ def build_candidate_scan_summary(candidates: list[PairCandidate]) -> dict[str, A
     total = len(candidates)
     enterable = [candidate for candidate in candidates if candidate.can_enter]
     blocked = [candidate for candidate in candidates if not candidate.can_enter]
+    legacy_enterable = [candidate for candidate in candidates if candidate.legacy_can_enter]
+    event_enterable = [candidate for candidate in candidates if candidate.event_can_enter]
+    funding_shadow_changed = [
+        candidate
+        for candidate in candidates
+        if candidate.legacy_can_enter != candidate.event_can_enter
+    ]
 
     reason_counter: Counter[str] = Counter()
     for candidate in blocked:
@@ -513,6 +628,9 @@ def build_candidate_scan_summary(candidates: list[PairCandidate]) -> dict[str, A
         "total_candidates": total,
         "enterable_candidates": len(enterable),
         "blocked_candidates": len(blocked),
+        "legacy_enterable_candidates": len(legacy_enterable),
+        "event_enterable_candidates": len(event_enterable),
+        "funding_shadow_changed_candidates": len(funding_shadow_changed),
         "top_candidate": candidate_scan_item(top_candidate),
         "top_enterable_candidate": candidate_scan_item(top_enterable),
         "top_blocked_candidate": candidate_scan_item(top_blocked),

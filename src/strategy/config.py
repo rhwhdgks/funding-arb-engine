@@ -60,6 +60,30 @@ def parse_optional_float_env(key: str) -> float | None:
         raise ValueError(f"{key} must be a number") from exc
 
 
+def validate_live_runtime_env(config: StrategyConfig) -> None:
+    if not config.enable_live:
+        return
+    required_by_exchange = {
+        "binance": ("BINANCE_ACCESS_KEY", "BINANCE_SECRET_KEY"),
+        "okx": ("OKX_ACCESS_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"),
+        "gateio": ("GATEIO_ACCESS_KEY", "GATEIO_SECRET_KEY"),
+    }
+    missing = [
+        key
+        for exchange_name in config.exchange_names
+        for key in required_by_exchange.get(exchange_name, ())
+        if not (os.getenv(key) or "").strip()
+    ]
+    if missing:
+        raise ValueError("live exchange credentials missing: " + ", ".join(sorted(missing)))
+
+    if parse_bool(os.getenv("ENABLE_WEB_TRADING"), False):
+        if not parse_bool(os.getenv("OPS_CONSOLE_ACTION_TOKEN_REQUIRED"), True):
+            raise ValueError("ENABLE_WEB_TRADING=1 requires OPS_CONSOLE_ACTION_TOKEN_REQUIRED=1")
+        if not (os.getenv("OPS_CONSOLE_ACTION_TOKEN") or os.getenv("WEB_ACTION_TOKEN") or "").strip():
+            raise ValueError("ENABLE_WEB_TRADING=1 requires OPS_CONSOLE_ACTION_TOKEN")
+
+
 def normalize_exchange_name(name: str) -> str:
     normalized = str(name).strip().lower()
     if normalized not in SUPPORTED_EXCHANGES:
@@ -116,6 +140,8 @@ def load_strategy_config() -> StrategyConfig:
     if len(exchange_names) < 2:
         raise ValueError("STRATEGY_EXCHANGES must include at least two exchanges")
 
+    raw_funding_source = os.getenv("STRATEGY_FUNDING_SOURCE", "runtime").strip().lower()
+    funding_source = "symbol_price" if raw_funding_source in {"symbol_price", "collector", "db"} else "runtime"
     symbol_input = os.getenv("STRATEGY_SYMBOLS", "ALL").strip()
     raw_min_effective_funding_usd = os.getenv("STRATEGY_MIN_EFFECTIVE_FUNDING_USD")
     raw_hold_buffer_bps = parse_optional_float_env("STRATEGY_HOLD_BUFFER_BPS")
@@ -172,6 +198,8 @@ def load_strategy_config() -> StrategyConfig:
             os.getenv("STRATEGY_ENTRY_POST_FILL_MIN_NET_EDGE_BPS", "0.0") or 0.0
         ),
         action_settle_wait_sec=float(os.getenv("STRATEGY_ACTION_SETTLE_WAIT_SEC", "0.6") or 0.6),
+        close_filled_settle_sec=float(os.getenv("STRATEGY_CLOSE_FILLED_SETTLE_SEC", "2.0") or 2.0),
+        close_filled_settle_poll_sec=float(os.getenv("STRATEGY_CLOSE_FILLED_SETTLE_POLL_SEC", "0.25") or 0.25),
         entry_order_settle_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_SETTLE_SEC", "1.2") or 1.2),
         entry_order_cooldown_sec=float(os.getenv("STRATEGY_ENTRY_ORDER_COOLDOWN_SEC", "1.0") or 1.0),
         symbol_recent_close_cooldown_sec=float(
@@ -231,6 +259,19 @@ def load_strategy_config() -> StrategyConfig:
         funding_alignment_full_penalty_sec=float(os.getenv("STRATEGY_FUNDING_ALIGNMENT_FULL_PENALTY_SEC", "14400") or 14400.0),
         funding_time_decay_min_factor=float(os.getenv("STRATEGY_FUNDING_TIME_DECAY_MIN_FACTOR", "0.35") or 0.35),
         funding_time_decay_full_penalty_sec=float(os.getenv("STRATEGY_FUNDING_TIME_DECAY_FULL_PENALTY_SEC", "28800") or 28800.0),
+        funding_source=funding_source,
+        funding_max_age_sec=float(os.getenv("STRATEGY_FUNDING_MAX_AGE_SEC", "900") or 900.0),
+        funding_event_model_enabled=parse_bool(os.getenv("STRATEGY_FUNDING_EVENT_MODEL_ENABLED"), False),
+        funding_event_entry_buffer_sec=float(
+            os.getenv("STRATEGY_FUNDING_EVENT_ENTRY_BUFFER_SEC", "5.0") or 5.0
+        ),
+        close_positive_funding_wait_enabled=parse_bool(
+            os.getenv("STRATEGY_CLOSE_POSITIVE_FUNDING_WAIT_ENABLED"),
+            False,
+        ),
+        close_positive_funding_wait_max_sec=float(
+            os.getenv("STRATEGY_CLOSE_POSITIVE_FUNDING_WAIT_MAX_SEC", "1800.0") or 1800.0
+        ),
         approval_mode=os.getenv("STRATEGY_APPROVAL_MODE", "console").strip().lower(),
         enable_live=parse_bool(os.getenv("STRATEGY_ENABLE_LIVE"), False),
         auto_enter_enabled=parse_bool(os.getenv("STRATEGY_AUTO_ENTER_ENABLED"), False),
@@ -241,6 +282,9 @@ def load_strategy_config() -> StrategyConfig:
         maker_entry_engine_requote_sec=float(os.getenv("STRATEGY_MAKER_ENGINE_REQUOTE_SEC", "1.0") or 1.0),
         maker_entry_engine_replace_edge_bps=float(
             os.getenv("STRATEGY_MAKER_ENGINE_REPLACE_EDGE_BPS", "5.0") or 5.0
+        ),
+        maker_entry_engine_replace_price_bps=float(
+            os.getenv("STRATEGY_MAKER_ENGINE_REPLACE_PRICE_BPS", "2.0") or 2.0
         ),
         maker_entry_engine_queue_edge_gap_bps=float(
             os.getenv("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS", "10.0") or 10.0
@@ -257,7 +301,11 @@ def load_strategy_config() -> StrategyConfig:
         maker_entry_engine_stale_pause_sec=float(
             os.getenv("STRATEGY_MAKER_ENGINE_STALE_PAUSE_SEC", "30.0") or 30.0
         ),
-        maker_entry_q4_fast_hedge=parse_bool(os.getenv("STRATEGY_MAKER_ENTRY_Q4_FAST_HEDGE"), False),
+        maker_entry_engine_require_full_admission=parse_bool(
+            os.getenv("STRATEGY_MAKER_ENGINE_REQUIRE_FULL_ADMISSION"),
+            True,
+        ),
+        maker_entry_fast_hedge=parse_bool(os.getenv("STRATEGY_MAKER_ENTRY_FAST_HEDGE"), False),
         max_candidates_print=int(os.getenv("STRATEGY_MAX_CANDIDATES_PRINT", "10") or 10),
         max_open_pairs=parse_nonnegative_int_env("STRATEGY_MAX_OPEN_PAIRS", 1),
         assumed_flat_grace_sec=float(os.getenv("STRATEGY_ASSUMED_FLAT_GRACE_SEC", "8.0") or 8.0),
@@ -271,6 +319,7 @@ def load_strategy_config() -> StrategyConfig:
         ),
         micro_residual_info_ratio=float(os.getenv("STRATEGY_MICRO_RESIDUAL_INFO_RATIO", "0.02") or 0.02),
         action_account_fresh_sec=float(os.getenv("STRATEGY_ACTION_ACCOUNT_FRESH_SEC", "2.5") or 2.5),
+        action_lease_timeout_sec=float(os.getenv("STRATEGY_ACTION_LEASE_TIMEOUT_SEC", "120.0") or 120.0),
         account_imbalance_hedge_enabled=parse_bool(os.getenv("STRATEGY_ACCOUNT_IMBALANCE_HEDGE_ENABLED"), True),
         account_imbalance_cooldown_sec=float(os.getenv("STRATEGY_ACCOUNT_IMBALANCE_COOLDOWN_SEC", "60.0") or 60.0),
         graceful_shutdown_enabled=parse_bool(os.getenv("STRATEGY_GRACEFUL_SHUTDOWN_ENABLED"), True),
@@ -323,10 +372,16 @@ def load_strategy_config() -> StrategyConfig:
         raise ValueError("STRATEGY_ENTRY_POST_FILL_MIN_NET_EDGE_BPS must be >= 0")
     if config.close_spread_confirm_sec < 0:
         raise ValueError("STRATEGY_CLOSE_SPREAD_CONFIRM_SEC must be >= 0")
+    if config.close_filled_settle_sec < 0:
+        raise ValueError("STRATEGY_CLOSE_FILLED_SETTLE_SEC must be >= 0")
+    if config.close_filled_settle_poll_sec <= 0:
+        raise ValueError("STRATEGY_CLOSE_FILLED_SETTLE_POLL_SEC must be > 0")
     if config.maker_entry_engine_requote_sec < 0:
         raise ValueError("STRATEGY_MAKER_ENGINE_REQUOTE_SEC must be >= 0")
     if config.maker_entry_engine_replace_edge_bps < 0:
         raise ValueError("STRATEGY_MAKER_ENGINE_REPLACE_EDGE_BPS must be >= 0")
+    if config.maker_entry_engine_replace_price_bps < 0:
+        raise ValueError("STRATEGY_MAKER_ENGINE_REPLACE_PRICE_BPS must be >= 0")
     if config.maker_entry_engine_queue_edge_gap_bps < 0:
         raise ValueError("STRATEGY_MAKER_ENGINE_QUEUE_EDGE_GAP_BPS must be >= 0")
     if config.maker_entry_engine_keep_edge_buffer_bps < 0:
@@ -341,4 +396,11 @@ def load_strategy_config() -> StrategyConfig:
         raise ValueError("STRATEGY_STDOUT_LOG_STYLE must be 'verbose' or 'simple'")
     if config.max_gross_leverage < 0 or config.max_long_leverage < 0 or config.max_short_leverage < 0:
         raise ValueError("STRATEGY_MAX_*_LEVERAGE values must be >= 0")
+    if config.funding_max_age_sec <= 0:
+        raise ValueError("STRATEGY_FUNDING_MAX_AGE_SEC must be > 0")
+    if config.funding_event_entry_buffer_sec < 0:
+        raise ValueError("STRATEGY_FUNDING_EVENT_ENTRY_BUFFER_SEC must be >= 0")
+    if config.close_positive_funding_wait_max_sec < 0:
+        raise ValueError("STRATEGY_CLOSE_POSITIVE_FUNDING_WAIT_MAX_SEC must be >= 0")
+    validate_live_runtime_env(config)
     return config

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Awaitable
 
@@ -15,6 +16,9 @@ class HedgeExecutionResult:
     avg_price: float = 0.0
     order_id: str | None = None
     client_order_id: str | None = None
+    acknowledged_ms: int | None = None
+    first_fill_ms: int | None = None
+    full_fill_ms: int | None = None
 
 
 def emit_hedge_event(
@@ -79,6 +83,9 @@ async def execute_residual_hedge(
     last_logged_hedged_qty = 0.0
     last_order_id: str | None = None
     last_client_order_id: str | None = None
+    acknowledged_ms: int | None = None
+    first_fill_ms: int | None = None
+    full_fill_ms: int | None = None
 
     if target_qty <= eps:
         return HedgeExecutionResult(
@@ -97,6 +104,14 @@ async def execute_residual_hedge(
 
     def outstanding_qty() -> float:
         return max(target_qty - hedged_qty, 0.0)
+
+    def mark_fill_timestamps() -> None:
+        nonlocal first_fill_ms, full_fill_ms
+        observed_ms = int(time.time() * 1000)
+        if hedged_qty > eps and first_fill_ms is None:
+            first_fill_ms = observed_ms
+        if outstanding_qty() <= eps and full_fill_ms is None:
+            full_fill_ms = observed_ms
 
     def log_progress(reason: str) -> None:
         nonlocal last_logged_hedged_qty
@@ -136,6 +151,7 @@ async def execute_residual_hedge(
                 fast_ack=(reason == "market_fast_ack"),
             )
         last_logged_hedged_qty = hedged_qty
+        mark_fill_timestamps()
 
     log_hedge_start(
         symbol=symbol,
@@ -162,6 +178,7 @@ async def execute_residual_hedge(
                 market_kwargs["is_close"] = use_reduce_only_market_close(exchange, current_hedge_qty, side)
             market_result = await exchange.market_order(symbol, side, remaining_qty, **market_kwargs)
             if isinstance(market_result, dict) and not market_result.get("error"):
+                acknowledged_ms = int(time.time() * 1000)
                 last_order_id = market_result.get("order_id")
                 last_client_order_id = market_result.get("client_order_id") or market_result.get("uuid")
                 request_account_refresh_if_available(
@@ -172,23 +189,22 @@ async def execute_residual_hedge(
                 )
             if market_result and market_result.get("error"):
                 print(f"[strategy][{market_log_prefix}][market][error] {market_log_text} 오류 result={market_result}")
-            if fast_ack_enabled and market_result and not market_result.get("error"):
-                hedged_qty = max(hedged_qty, remaining_qty)
+            if market_result and not market_result.get("error"):
                 emit_hedge_event(
                     record_order_event,
-                    "entry_hedge_fast_ack_assumed",
+                    "entry_hedge_order_acknowledged",
                     exchange=exchange_name,
                     symbol=symbol,
                     side=side,
                     target_qty=target_qty,
-                    assumed_filled_qty=hedged_qty,
-                    remaining_qty=outstanding_qty(),
+                    acknowledged_qty=remaining_qty,
                     order_id=last_order_id,
                     client_order_id=last_client_order_id,
                     reason="market_order_accepted",
+                    fast_ack_requested=fast_ack_enabled,
                 )
-                log_progress("market_fast_ack")
-            else:
+
+            if market_result and not market_result.get("error"):
                 await asyncio.sleep(config.action_settle_wait_sec)
                 hedged_qty = max(
                     hedged_qty,
@@ -203,7 +219,39 @@ async def execute_residual_hedge(
                         reason=f"{probe_reason_prefix}_market",
                     ),
                 )
-                log_progress("market")
+                log_progress("market_actual_fill")
+                if outstanding_qty() > eps:
+                    fill_wait_sec = max(
+                        float(getattr(config, "entry_order_settle_sec", 0.0) or 0.0),
+                        float(settle_grace_sec(config)),
+                        float(getattr(config, "action_settle_wait_sec", 0.0) or 0.0) * 2.0,
+                        0.5,
+                    )
+                    hedged_qty = max(
+                        hedged_qty,
+                        await position_waiter(
+                            exchange,
+                            symbol,
+                            side,
+                            pre_qty,
+                            target_qty,
+                            fill_wait_sec,
+                        ),
+                    )
+                    hedged_qty = max(
+                        hedged_qty,
+                        await resolve_effective_order_qty(
+                            exchange=exchange,
+                            symbol=symbol,
+                            side=side,
+                            pre_qty=pre_qty,
+                            target_qty=target_qty,
+                            order_result=market_result,
+                            is_close=is_close,
+                            reason=f"{probe_reason_prefix}_market_settled",
+                        ),
+                    )
+                    log_progress("market_actual_fill_settled")
             hedge_price_used = extract_order_avg_price(market_result, hedge_price_used)
         if outstanding_qty() <= eps:
             log_hedge_done(
@@ -221,6 +269,9 @@ async def execute_residual_hedge(
             avg_price=hedge_price_used,
             order_id=last_order_id,
             client_order_id=last_client_order_id,
+            acknowledged_ms=acknowledged_ms,
+            first_fill_ms=first_fill_ms,
+            full_fill_ms=full_fill_ms,
         )
 
     for attempt in range(config.hedge_requote_count + 1):
@@ -309,4 +360,7 @@ async def execute_residual_hedge(
         avg_price=hedge_price_used,
         order_id=last_order_id,
         client_order_id=last_client_order_id,
+        acknowledged_ms=acknowledged_ms,
+        first_fill_ms=first_fill_ms,
+        full_fill_ms=full_fill_ms,
     )

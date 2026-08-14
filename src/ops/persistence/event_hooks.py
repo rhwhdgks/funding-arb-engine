@@ -4,6 +4,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from src.core.order_intent import record_order_intent_event
+
 from .db import db_persistence_enabled, get_db_connection
 from .trading_dev_normalizers import build_order_history_row, build_trade_history_rows
 from .trading_dev_store import mark_absent_open_order_rows, upsert_order_history_rows, upsert_trade_history_rows
@@ -196,13 +198,23 @@ def schedule_matched_trade_history_upsert(
 
 
 def schedule_order_event(exchange_name: str, symbol: str, event_type: str, event_source: str, payload: dict[str, Any]) -> None:
-    if not _event_enabled():
-        return
-
     normalized_symbol = str(symbol or "").upper()
     normalized_payload = _with_event_context(payload, event_type=event_type, event_source=event_source)
     normalized_payload.setdefault("symbol", normalized_symbol)
     normalized_payload.setdefault("ticker", normalized_symbol)
+    try:
+        record_order_intent_event(exchange_name, normalized_symbol, event_type, normalized_payload)
+    except Exception as exc:
+        # A journal failure must be visible before a live submit proceeds.
+        if event_type == "order_submit":
+            raise RuntimeError(f"order intent journal failed: {exc}") from exc
+        print(
+            f"[order-intent] journal warning exchange={exchange_name} "
+            f"symbol={normalized_symbol} event={event_type}: {exc}"
+        )
+
+    if not _event_enabled():
+        return
     _run_background(_store_order_history_sync, exchange_name, normalized_symbol, event_type, normalized_payload)
 
 

@@ -137,4 +137,3 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label
 
 - [strategy_evaluation_criteria.md](strategy_evaluation_criteria.md)
 - [strategy_live_operations_runbook.md](strategy_live_operations_runbook.md)
-- [strategy_quality_roadmap.md](strategy_quality_roadmap.md)

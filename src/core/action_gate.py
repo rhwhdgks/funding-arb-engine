@@ -22,6 +22,16 @@ class IntentLock:
     note: str = ""
 
 
+@dataclass
+class SymbolLease:
+    owner_id: str
+    symbol: str
+    domain: str
+    created_ms: int = field(default_factory=_now_ms)
+    last_update_ms: int = field(default_factory=_now_ms)
+    note: str = ""
+
+
 class ActionGate:
     """
     Lightweight in-memory gate.
@@ -33,6 +43,7 @@ class ActionGate:
     def __init__(self, *, stale_timeout_sec: float = 30.0):
         self._locks_by_intent: dict[str, IntentLock] = {}
         self._locks_by_slot: dict[str, str] = {}
+        self._symbol_leases: dict[str, SymbolLease] = {}
         self._stale_timeout_ms = int(stale_timeout_sec * 1000)
 
     @staticmethod
@@ -58,6 +69,99 @@ class ActionGate:
             current_intent = self._locks_by_slot.get(slot)
             if current_intent == intent_id:
                 self._locks_by_slot.pop(slot, None)
+
+        stale_symbols = [
+            symbol
+            for symbol, lease in self._symbol_leases.items()
+            if (now_ms - lease.last_update_ms) > self._stale_timeout_ms
+        ]
+        for symbol in stale_symbols:
+            self._symbol_leases.pop(symbol, None)
+
+    def try_acquire_symbol(
+        self,
+        *,
+        owner_id: str,
+        symbol: str,
+        domain: str,
+        note: str = "",
+    ) -> tuple[bool, str]:
+        self._gc()
+        normalized_symbol = symbol.upper()
+        existing = self._symbol_leases.get(normalized_symbol)
+        if existing is not None and existing.owner_id != owner_id:
+            return (
+                False,
+                f"symbol_locked:{normalized_symbol}:{existing.domain}:{existing.owner_id}",
+            )
+        if existing is not None:
+            existing.last_update_ms = _now_ms()
+            existing.note = note or existing.note
+            return (True, "already_owned")
+        self._symbol_leases[normalized_symbol] = SymbolLease(
+            owner_id=owner_id,
+            symbol=normalized_symbol,
+            domain=domain,
+            note=note,
+        )
+        return (True, "ok")
+
+    def touch_symbol(self, *, owner_id: str, symbol: str, note: str = "") -> bool:
+        self._gc()
+        lease = self._symbol_leases.get(symbol.upper())
+        if lease is None or lease.owner_id != owner_id:
+            return False
+        lease.last_update_ms = _now_ms()
+        lease.note = note or lease.note
+        return True
+
+    def release_symbol(self, *, owner_id: str, symbol: str, note: str = "") -> bool:
+        normalized_symbol = symbol.upper()
+        lease = self._symbol_leases.get(normalized_symbol)
+        if lease is None or lease.owner_id != owner_id:
+            return False
+        lease.note = note or lease.note
+        self._symbol_leases.pop(normalized_symbol, None)
+        return True
+
+    def takeover_symbol(
+        self,
+        *,
+        owner_id: str,
+        symbol: str,
+        domain: str,
+        note: str = "",
+    ) -> dict[str, Any] | None:
+        """Replace a leaked lease during terminal shutdown cleanup.
+
+        Normal actions must use ``try_acquire_symbol``. Shutdown runs after the
+        coordinator stops dispatching commands, so a remaining lease is stale
+        ownership metadata rather than useful mutual exclusion.
+        """
+        self._gc()
+        normalized_symbol = symbol.upper()
+        previous = self.symbol_lease(normalized_symbol)
+        self._symbol_leases[normalized_symbol] = SymbolLease(
+            owner_id=owner_id,
+            symbol=normalized_symbol,
+            domain=domain,
+            note=note,
+        )
+        return previous
+
+    def symbol_lease(self, symbol: str) -> dict[str, Any] | None:
+        self._gc()
+        lease = self._symbol_leases.get(symbol.upper())
+        if lease is None:
+            return None
+        return {
+            "owner_id": lease.owner_id,
+            "symbol": lease.symbol,
+            "domain": lease.domain,
+            "created_ms": lease.created_ms,
+            "last_update_ms": lease.last_update_ms,
+            "note": lease.note,
+        }
 
     def try_acquire(
         self,
@@ -146,15 +250,27 @@ class ActionGate:
     def snapshot(self) -> dict[str, Any]:
         self._gc()
         return {
-            intent_id: {
-                "exchange_name": lock.exchange_name,
-                "symbol": lock.symbol,
-                "side": lock.side,
-                "reduce_only": lock.reduce_only,
-                "state": lock.state,
-                "created_ms": lock.created_ms,
-                "last_update_ms": lock.last_update_ms,
-                "note": lock.note,
-            }
-            for intent_id, lock in self._locks_by_intent.items()
+            "intent_locks": {
+                intent_id: {
+                    "exchange_name": lock.exchange_name,
+                    "symbol": lock.symbol,
+                    "side": lock.side,
+                    "reduce_only": lock.reduce_only,
+                    "state": lock.state,
+                    "created_ms": lock.created_ms,
+                    "last_update_ms": lock.last_update_ms,
+                    "note": lock.note,
+                }
+                for intent_id, lock in self._locks_by_intent.items()
+            },
+            "symbol_leases": {
+                symbol: {
+                    "owner_id": lease.owner_id,
+                    "domain": lease.domain,
+                    "created_ms": lease.created_ms,
+                    "last_update_ms": lease.last_update_ms,
+                    "note": lease.note,
+                }
+                for symbol, lease in self._symbol_leases.items()
+            },
         }

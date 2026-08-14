@@ -102,6 +102,7 @@ class AccountRefreshScheduler:
         self.failure_count = 0
         self.deferred_count = 0
         self.skipped_count = 0
+        self.coalesced_count = 0
         self.request_count = 0
         self.last_reason = ""
         self.last_priority = ""
@@ -115,6 +116,7 @@ class AccountRefreshScheduler:
         normalized_symbol = str(symbol or "").strip().upper()
         key = (normalized_reason, normalized_priority, normalized_symbol)
         now_ms = _now_ms()
+        existed = key in self._pending
         item = self._pending.setdefault(
             key,
             {
@@ -128,6 +130,10 @@ class AccountRefreshScheduler:
         item["last_requested_ms"] = now_ms
         item["count"] = int(item.get("count", 0) or 0) + 1
         self.request_count += 1
+        if existed:
+            self.coalesced_count += 1
+            self._event.set()
+            return True
         self._log(
             "account_refresh_requested",
             reason=normalized_reason,
@@ -285,6 +291,7 @@ class AccountRefreshScheduler:
             "failure_count": self.failure_count,
             "deferred_count": self.deferred_count,
             "skipped_count": self.skipped_count,
+            "coalesced_count": self.coalesced_count,
             "request_count": self.request_count,
             "last_reason": self.last_reason,
             "last_priority": self.last_priority,

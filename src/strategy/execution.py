@@ -321,8 +321,8 @@ async def resolve_effective_order_qty(
 ) -> float:
     await refresh_symbol_state(exchange, symbol, reason)
     post_qty = extract_position_qty(exchange.get_symbol_snapshot(symbol))
-    # Match the reference/question4 philosophy: trading decisions are based on
-    # actual account position movement. Order status and trade history may lag
+    # Trading decisions are based on actual account position movement.
+    # Order status and trade history may lag
     # or arrive out of order, so they should not advance strategy state.
     return (
         position_close_delta(pre_qty, post_qty, side)

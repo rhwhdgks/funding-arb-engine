@@ -36,6 +36,7 @@ def evaluate_entry_policy(
     config: StrategyConfig,
     base_reasons: list[str] | None = None,
     raw_funding_pnl_usd: float,
+    funding_direction_pnl_usd: float | None = None,
     effective_funding_pnl_usd: float,
     expected_net_edge_usd: float,
     expected_net_edge_bps: float,
@@ -52,7 +53,12 @@ def evaluate_entry_policy(
         and effective_funding_pnl_usd < config.min_effective_funding_usd
     ):
         reasons.append("effective_funding_below_usd_threshold")
-    if config.require_funding_payment and raw_funding_pnl_usd >= -EPS:
+    direction_pnl_usd = (
+        raw_funding_pnl_usd
+        if funding_direction_pnl_usd is None
+        else float(funding_direction_pnl_usd)
+    )
+    if config.require_funding_payment and direction_pnl_usd >= -EPS:
         reasons.append("funding_payment_required")
     if expected_net_edge_usd < config.min_expected_net_edge_usd:
         reasons.append("net_edge_below_usd_threshold")

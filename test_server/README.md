@@ -7,7 +7,8 @@
 프로젝트 루트에서 실행합니다.
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
+cd funding-arb-engine
+cp test_server/.env.example test_server/.env
 STRATEGY_ENV_FILE=test_server/.env STRATEGY_RUN_DURATION=30m scripts/runtime/run_strategy_live.sh start
 ```
 

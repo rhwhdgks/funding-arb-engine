@@ -10,7 +10,7 @@ Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 �
 - Runtime: live and test separated by env file
 - Control plane: strategy-attached embedded Ops Console
 - Persistence: optional MariaDB, DB-less runtime supported
-- Latest operational baseline: 24h live run `PASS warnings=0 failures=0`
+- Validation baseline: 41 unit/regression tests and a recorded 24h live run `PASS`
 - Strategy profitability: evaluated separately from system stability
 
 ## What It Handles
@@ -21,7 +21,7 @@ Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 �
 - Entry gates for active pair, open order, margin mode, exposure cap, rate-limit pressure, and manual ownership
 - Embedded Ops Console for manual order, hedge, flatten, cancel, pause, and resume
 - Structured JSONL events, optional MariaDB persistence, and final PASS/FAIL reports
-- Symbol price collector and FX collector as separate runtime services
+- Symbol price/funding collector as a separate runtime service
 
 ## Engineering Guarantees
 
@@ -72,20 +72,47 @@ flowchart LR
 
 ## Quick Start
 
-실제 key, token, DB password는 커밋하지 않습니다. 실행 설정은 실서버는 `.env`, 테스트 서버는 `test_server/.env`를 사용합니다.
+Python 3.12 기준입니다. MariaDB persistence를 사용하지 않아도 엔진과 리포트의 핵심 경로는 실행할 수 있습니다.
+
+Ubuntu에서 MariaDB Python driver 빌드가 필요하면 먼저 `libmariadb-dev`를 설치합니다.
 
 ```bash
-.venv/bin/python -m py_compile main.py strategy.py src/strategy/config.py
+sudo apt-get install libmariadb-dev
+git clone https://github.com/rhwhdgks/funding-arb-engine.git
+cd funding-arb-engine
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -r requirements.lock
+```
+
+로컬 설정 파일을 만든 뒤 필요한 값만 채웁니다. 실제 key, token, DB password는 커밋하지 않습니다.
+
+```bash
+cp .env.example .env
+cp test_server/.env.example test_server/.env
+```
+
+기본 검증:
+
+```bash
+.venv/bin/python -m compileall -q main.py strategy.py src scripts tests
+.venv/bin/python -m unittest discover -s tests -v
 bash -n scripts/runtime/run_strategy_live.sh
 ```
 
-테스트 서버 실행:
+### Test Server
+
+테스트 거래소 credential을 `test_server/.env`에 설정한 뒤 짧은 smoke run부터 시작합니다.
 
 ```bash
 STRATEGY_ENV_FILE=test_server/.env STRATEGY_RUN_DURATION=30m scripts/runtime/run_strategy_live.sh start
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh status
+STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh stop
 ```
 
-실서버 실행:
+### Live Trading
+
+실거래는 test-server 검증, shutdown flat 확인, final report 검토 후에만 활성화합니다.
 
 ```bash
 STRATEGY_ENV_FILE=.env STRATEGY_RUN_DURATION=12h scripts/runtime/run_strategy_live.sh start
@@ -104,6 +131,8 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh stop
 ```bash
 STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label real_12h
 ```
+
+전체 운영 절차와 장애 대응은 [runbook](docs/runbook.md)을 따릅니다.
 
 ## Ops Console
 
@@ -154,12 +183,11 @@ observed_duration=24h 0m 3s
 
 ## Documentation
 
+- [docs/README.md](docs/README.md): 목적별 문서 인덱스
 - [docs/runbook.md](docs/runbook.md): 실행, 중지, health, final report, 장애 대응
 - [docs/env_vars.md](docs/env_vars.md): 환경변수와 secret 분리 원칙
+- [docs/security_release.md](docs/security_release.md): secret 교체, console 보안, 재현 가능한 배포 압축 절차
 - [docs/operator_log_guide.md](docs/operator_log_guide.md): 운영 로그 해석 기준
-- [docs/development_requirements_checklist.md](docs/development_requirements_checklist.md): 요구사항 반영 상태
-- [docs/question4_comparison.md](docs/question4_comparison.md): reference 구현과의 비교
-- [docs/strategy_quality_roadmap.md](docs/strategy_quality_roadmap.md): 전략 품질 개선 로드맵
 - [docs/strategy_experiment_loop.md](docs/strategy_experiment_loop.md): 전략만 교체해 실험하는 표준 루프
 - [docs/strategy_evaluation_criteria.md](docs/strategy_evaluation_criteria.md): expected/actual edge와 체결 품질 평가 기준
 - [docs/strategy_live_operations_runbook.md](docs/strategy_live_operations_runbook.md): 새 전략을 실거래로 옮기는 운영 절차
@@ -171,3 +199,4 @@ observed_duration=24h 0m 3s
 - Do not commit `.env`, API keys, tokens, DB passwords, runtime files, or logs.
 - Live trading should be preceded by test-server runs, shutdown checks, and final report review.
 - Strategy profitability is not assumed from operational PASS reports.
+- Before publishing or packaging a fork, run `python scripts/release/audit_repository.py --history`.

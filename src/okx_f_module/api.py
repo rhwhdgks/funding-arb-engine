@@ -804,12 +804,23 @@ async def get_funding_rate(symbol: str) -> dict[str, Any] | None:
         return None
 
     row = rows[0]
+    funding_time_ms = _safe_int(row.get("fundingTime"), None)
+    next_funding_time_ms = _safe_int(row.get("nextFundingTime"), None)
+    funding_interval_hours = None
+    if funding_time_ms and next_funding_time_ms and next_funding_time_ms > funding_time_ms:
+        interval = (next_funding_time_ms - funding_time_ms) / 3_600_000.0
+        rounded_interval = round(interval)
+        if 0 < rounded_interval <= 24 and abs(interval - rounded_interval) <= 0.05:
+            funding_interval_hours = rounded_interval
 
     return {
         "exchange": "okxFuture",
         "symbol": symbol_to_code(inst_id),
         "funding_rate": _safe_float(row.get("fundingRate"), None),
-        "next_funding_time": _safe_int(row.get("nextFundingTime"), None),
+        "funding_time": funding_time_ms,
+        "next_funding_time": next_funding_time_ms,
+        "funding_interval_hours": funding_interval_hours,
+        "funding_interval_source": "okx_funding_time_delta" if funding_interval_hours else "unknown",
         "timestamp": _now_ms(),
         "raw": row,
     }
@@ -842,6 +853,45 @@ async def get_funding_rate_history(
         }
         for row in data.get("data", [])
     ]
+
+
+async def get_funding_payments(
+    start_time: int | None = None,
+    end_time: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]] | None:
+    params: dict[str, Any] = {
+        "instType": "SWAP",
+        "type": "8",
+        "limit": min(max(limit, 1), 100),
+    }
+    if start_time is not None:
+        params["begin"] = int(start_time)
+    if end_time is not None:
+        params["end"] = int(end_time)
+    status, data, _ = await _request("GET", "/api/v5/account/bills", params=params, auth=True)
+    if status != 200 or not isinstance(data, dict) or data.get("code") != "0":
+        return None
+    payments: list[dict[str, Any]] = []
+    for row in data.get("data") or []:
+        subtype = str(row.get("subType") or "")
+        if subtype not in {"173", "174"}:
+            continue
+        amount = _safe_float(row.get("pnl"), None)
+        if amount is None:
+            amount = _safe_float(row.get("balChg"), 0.0)
+        payments.append(
+            {
+                "movement_id": str(row.get("billId") or ""),
+                "symbol": symbol_to_code(str(row.get("instId") or "")),
+                "asset_code": str(row.get("ccy") or "USDT").upper(),
+                "amount": amount,
+                "event_time_ms": _safe_int(row.get("ts"), 0),
+                "subtype": subtype,
+                "raw": row,
+            }
+        )
+    return payments
 
 
 async def get_ohlcv_1m(symbol: str, limit: int = 500) -> list[dict[str, Any]] | None:

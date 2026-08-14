@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from .account_context import current_account_context
 from .db import db_persistence_enabled, get_db_connection, json_dumps
 from .trading_dev_store import upsert_strategy_entry_quality_row
 
@@ -107,6 +108,7 @@ def build_strategy_entry_quality_row(event: dict[str, Any]) -> dict[str, Any] | 
 
     trade_refs = _collect_ref_values(event)
     return {
+        **current_account_context(),
         "run_id": _run_id_from_event(event),
         "pair_id": pair_id,
         "symbol": symbol.upper(),
@@ -118,6 +120,7 @@ def build_strategy_entry_quality_row(event: dict[str, Any]) -> dict[str, Any] | 
         ),
         "hedge_latency_ms": (
             _safe_int(_first_present(
+                event.get("first_fill_to_hedge_full_fill_ms"),
                 event.get("hedge_latency_ms"),
                 event.get("first_fill_to_hedge_fill_ms"),
                 event.get("hedge_elapsed_ms"),

@@ -96,7 +96,7 @@ def spread_buffer_entry_target_price(
     symbol = candidate.symbol
     first_exchange = exchanges[first_exchange_name]
     first_snapshot = first_exchange.get_symbol_snapshot(symbol)
-    # Question4-style maker quote: opportunity threshold is checked elsewhere;
+    # Fast maker quote: opportunity threshold is checked elsewhere;
     # this price only decides where the maker order rests.
     target_bps = max(config.entry_spread_bps, 0.0) + (max(config.entry_cancel_buffer_bps, 0.0) / 2.0)
 

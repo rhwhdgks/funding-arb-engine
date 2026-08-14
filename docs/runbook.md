@@ -24,7 +24,7 @@
 프로젝트 루트로 이동합니다.
 
 ```bash
-cd "/home/jonghan/findalpha/arbitrage/funding fee"
+cd funding-arb-engine
 ```
 
 기본 컴파일과 런처 문법을 확인합니다.
@@ -32,6 +32,23 @@ cd "/home/jonghan/findalpha/arbitrage/funding fee"
 ```bash
 .venv/bin/python -m py_compile main.py strategy.py src/strategy/config.py src/strategy/candidates.py src/strategy/close_policy.py src/strategy/execution.py
 bash -n scripts/runtime/run_strategy_live.sh
+```
+
+의존성과 안전 회귀 테스트를 확인합니다.
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+private `.env`에는 action token을 생성해 넣습니다. 로컬 콘솔도 상태 변경 요청에는 token이 필요합니다.
+
+```bash
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+```env
+OPS_CONSOLE_ACTION_TOKEN_REQUIRED=1
+OPS_CONSOLE_ACTION_TOKEN=<생성한 값>
 ```
 
 이미 실행 중인 전략이 있는지 확인합니다.
@@ -177,6 +194,31 @@ console 액션은 모두 `command_id` 기준으로 JSONL audit 이벤트를 남�
 - `ops_console_command_expired` / `ops_console_command_skipped`: 오래된 명령 또는 이미 취소된 명령 미실행
 
 수동 주문/취소/청산 사고를 볼 때는 먼저 `command_id`로 위 이벤트들을 묶어서 확인합니다. 성공 응답에도 같은 `command_id`가 포함됩니다.
+
+콘솔에서 상태 변경 전 `실행 5분 허용`을 눌러 action window를 엽니다. token이 비었거나 틀렸거나 window가 만료되면 주문/취소/청산은 fail-closed로 거절됩니다.
+
+## Order Intent 복구
+
+- 주문 submit은 DB와 무관하게 `STRATEGY_ORDER_INTENT_JOURNAL`에 먼저 기록됩니다.
+- 재시작 시 terminal이 아닌 intent가 있으면 거래소 주문 상태와 계정 snapshot을 reconcile합니다.
+- unresolved intent가 남아 있는 심볼은 신규 진입을 막지만 close/recovery/shutdown은 막지 않습니다.
+- 주문이 조회되지 않아도 즉시 취소로 단정하지 않고 unknown grace와 flat/open-order 검증을 거칩니다.
+- shutdown이 실제 포지션과 open order가 없음을 확인한 경우에만 남은 intent를 `COMPENSATED`로 종료합니다.
+
+```bash
+tail -n 20 runtime/order_intents.jsonl
+```
+
+## 배포 압축 생성
+
+수동으로 작업 폴더를 압축하지 않습니다. clean commit에서만 추적 파일 전체와 hash manifest를 포함한 산출물을 만듭니다.
+
+```bash
+.venv/bin/python scripts/release/build_handoff_artifact.py --output dist/funding-arb.tar.xz
+.venv/bin/python scripts/release/verify_handoff_artifact.py dist/funding-arb.tar.xz
+```
+
+builder는 dirty worktree, runtime `.env`, private key, placeholder가 아닌 secret assignment를 거절합니다. API key가 과거 archive나 채팅에 노출됐다면 파일 삭제만으로 충분하지 않으며 Binance/OKX에서 기존 키를 폐기하고 새 키를 발급해야 합니다.
 
 폰이나 다른 장비에서 접속해야 하는 경우:
 
@@ -426,18 +468,22 @@ symbol price 1회 수집:
 STRATEGY_ENV_FILE=.env scripts/runtime/run_symbol_price_collector.sh once
 ```
 
-FX collector:
+market-data 전용 폴더로 분리 실행:
 
 ```bash
-STRATEGY_ENV_FILE=.env scripts/runtime/run_fx_collector.sh start
-STRATEGY_ENV_FILE=.env scripts/runtime/run_fx_collector.sh status
-STRATEGY_ENV_FILE=.env scripts/runtime/run_fx_collector.sh stop
+cp market_data_collector/.env.collector.example market_data_collector/.env.collector
+# market_data_collector/.env.collector에 DB 값과 SYMBOL_PRICE_SYMBOLS를 채운 뒤 실행
+market_data_collector/run_market_data_collector.sh start
+market_data_collector/run_market_data_collector.sh status
+market_data_collector/run_market_data_collector.sh stop
 ```
 
-FX 1회 수집:
+repo 밖으로 폴더를 복사해서 실행할 때:
 
 ```bash
-STRATEGY_ENV_FILE=.env scripts/runtime/run_fx_collector.sh once
+FUNDING_FEE_PROJECT_ROOT="$(pwd)" \
+MARKET_DATA_ENV_FILE="$HOME/market-data-collector/.env.collector" \
+$HOME/market-data-collector/run_market_data_collector.sh start
 ```
 
 ## DB 없는 환경
@@ -485,6 +531,7 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label
 - Event Verdict
 - Strategy Performance
 - Entry Submit Price Age
+- Actual Funding Cashflow
 - DB Verdict
 - Live Exchange Flat
 - Symbol Price Collector

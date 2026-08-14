@@ -22,6 +22,8 @@ from src.ops.persistence.db import ensure_schema, get_db_connection, current_utc
 from src.ops.persistence.trading_dev_normalizers import build_symbol_price_rows
 from src.ops.persistence.trading_dev_store import upsert_funding_rate_rows, upsert_symbol_price_rows
 
+FundingCache = dict[tuple[str, str], dict[str, Any]]
+
 
 def _parse_csv_env(name: str, default: str) -> list[str]:
     raw = os.getenv(name, default)
@@ -326,14 +328,21 @@ async def persist_symbol_price_once(
     ws_stale_sec: float,
     *,
     ws_first: bool,
+    latest_funding: FundingCache | None = None,
 ) -> dict[str, dict[str, int | str]]:
     now_ms = current_utc_ms()
     stale_ms = max(int(ws_stale_sec * 1000), 0)
+    latest_funding = latest_funding or {}
 
     conn = await asyncio.to_thread(get_db_connection)
     try:
         summary: dict[str, dict[str, int | str]] = {}
         for collector in collectors:
+            funding_snapshots = {
+                symbol: snapshot
+                for (exchange_name, symbol), snapshot in latest_funding.items()
+                if exchange_name == collector.exchange_name
+            }
             filtered_impact, stale_count = collector.filtered_impact_state(now_ms, stale_ms)
             ws_rows = collector.ws_prefill_rows(filtered_impact)
             if ws_first and collector.ws_prefill_is_complete(ws_rows):
@@ -346,6 +355,7 @@ async def persist_symbol_price_once(
                 collector.exchange_name,
                 prefill_rows,
                 filtered_impact,
+                funding_snapshots,
                 snapshot_time_ms=now_ms,
             )
             inserted = await asyncio.to_thread(upsert_symbol_price_rows, conn, rows)
@@ -371,7 +381,15 @@ async def _fetch_funding_binance(symbols: list[str]) -> list[dict[str, Any]]:
     results = await asyncio.gather(*[get_funding_rate(s) for s in symbols], return_exceptions=True)
     for s, r in zip(symbols, results):
         if isinstance(r, dict) and r.get("funding_rate") is not None:
-            out.append(("binance", _normalize_symbol(s), r["funding_rate"], r.get("next_funding_time"), r.get("raw")))
+            out.append((
+                "binance",
+                _normalize_symbol(s),
+                r["funding_rate"],
+                r.get("next_funding_time"),
+                r.get("funding_interval_hours"),
+                r.get("funding_interval_source"),
+                r.get("raw"),
+            ))
     return out
 
 
@@ -381,7 +399,15 @@ async def _fetch_funding_okx(symbols: list[str]) -> list[dict[str, Any]]:
     results = await asyncio.gather(*[get_funding_rate(s) for s in symbols], return_exceptions=True)
     for s, r in zip(symbols, results):
         if isinstance(r, dict) and r.get("funding_rate") is not None:
-            out.append(("okx", _normalize_symbol(s), r["funding_rate"], r.get("next_funding_time"), r.get("raw")))
+            out.append((
+                "okx",
+                _normalize_symbol(s),
+                r["funding_rate"],
+                r.get("next_funding_time"),
+                r.get("funding_interval_hours"),
+                r.get("funding_interval_source"),
+                r.get("raw"),
+            ))
     return out
 
 
@@ -407,16 +433,21 @@ async def _fetch_funding_hyperliquid(symbols: list[str]) -> list[dict[str, Any]]
             funding = ctx.get("funding")
             if funding is None:
                 continue
-            out.append(("hyperliquid", sym, float(funding), None, ctx))
+            out.append(("hyperliquid", sym, float(funding), None, 1, "hyperliquid_hourly", ctx))
     except Exception as exc:
         print(f"[symbol-price][hyperliquid][funding][warn] fetch 실패 error={exc}")
     return out
 
 
-async def persist_funding_once(collectors: list[ExchangeCollector]) -> dict[str, int]:
+async def persist_funding_once(
+    collectors: list[ExchangeCollector],
+    *,
+    latest_funding: FundingCache | None = None,
+) -> dict[str, int]:
     import json as _json
     now_ms = current_utc_ms()
     bucket_ms = (now_ms // 60000) * 60000
+    latest_funding = latest_funding if latest_funding is not None else {}
     fetchers = {
         "binance": _fetch_funding_binance,
         "okx": _fetch_funding_okx,
@@ -427,7 +458,7 @@ async def persist_funding_once(collectors: list[ExchangeCollector]) -> dict[str,
         fn = fetchers.get(collector.exchange_name)
         if fn is None or not collector.symbols:
             continue
-        for ex, sym, rate, next_ms, raw in await fn(collector.symbols):
+        for ex, sym, rate, next_ms, interval_hours, interval_source, raw in await fn(collector.symbols):
             all_rows.append({
                 "exchange_name": ex,
                 "symbol": sym,
@@ -436,8 +467,17 @@ async def persist_funding_once(collectors: list[ExchangeCollector]) -> dict[str,
                 "server_time_ms": None,
                 "funding_rate": rate,
                 "next_funding_time_ms": next_ms,
+                "funding_interval_hours": interval_hours,
+                "funding_interval_source": interval_source,
                 "raw_json": _json.dumps(raw, default=str)[:60000] if raw is not None else None,
             })
+            latest_funding[(ex, sym)] = {
+                "funding_rate": rate,
+                "next_funding_time_ms": next_ms,
+                "funding_interval_hours": interval_hours,
+                "funding_interval_source": interval_source,
+                "funding_updated_at_ms": now_ms,
+            }
     if not all_rows:
         return {}
     conn = await asyncio.to_thread(get_db_connection)
@@ -468,21 +508,29 @@ async def run_collector(*, once: bool = False) -> None:
     collectors = await build_collectors(exchange_names, symbols, impact_notional_usd)
     funding_interval_sec = max(int(float(os.getenv("SYMBOL_PRICE_FUNDING_INTERVAL_SEC", "300") or 300)), 60)
     last_funding_ms = 0
+    latest_funding: FundingCache = {}
 
     try:
         await asyncio.sleep(3.0)
         while True:
-            summary = await persist_symbol_price_once(collectors, ws_stale_sec=ws_stale_sec, ws_first=ws_first)
             now_ms = current_utc_ms()
 
             if now_ms - last_funding_ms >= funding_interval_sec * 1000:
                 last_funding_ms = now_ms
                 try:
-                    fcounts = await persist_funding_once(collectors)
+                    fcounts = await persist_funding_once(collectors, latest_funding=latest_funding)
                     if fcounts:
                         print("[symbol-price][funding] " + " ".join(f"{k}={v}" for k, v in fcounts.items()) + f" bucket_ms={now_ms}")
                 except Exception as exc:
                     print(f"[symbol-price][funding][warn] persist 실패 error={exc}")
+
+            summary = await persist_symbol_price_once(
+                collectors,
+                ws_stale_sec=ws_stale_sec,
+                ws_first=ws_first,
+                latest_funding=latest_funding,
+            )
+            now_ms = current_utc_ms()
             for exchange_name, item in summary.items():
                 print(
                     "[symbol-price]"

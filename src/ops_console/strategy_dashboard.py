@@ -7,6 +7,7 @@ from collections import Counter, deque
 from pathlib import Path
 from typing import Any
 
+from src.ops.persistence.account_context import resolve_logic_name
 from src.ops_console.runtime import PROJECT_ROOT, read_entry_control
 
 
@@ -212,9 +213,11 @@ def utc_day_start_ms() -> int:
 def realized_pnl_summary(account_label: str | None, started_at_ms: int) -> dict[str, Any]:
     """Best-effort realized PnL from trade_history. Never raises — the cockpit
     must keep rendering even if the DB is down."""
+    logic = resolve_logic_name()
     summary = {
         "ok": False,
         "account_label": account_label,
+        "logic": logic,
         "today_realized_usd": 0.0,
         "today_fee_usd": 0.0,
         "today_trades": 0,
@@ -236,8 +239,8 @@ def realized_pnl_summary(account_label: str | None, started_at_ms: int) -> dict[
             cur = conn.cursor()
             cur.execute(
                 "SELECT COALESCE(SUM(realized_pnl_usdt),0), COALESCE(SUM(fee),0), COUNT(*) "
-                "FROM trade_history WHERE account_label=%s AND desktop_time_ms>=%s",
-                (account_label, day_start),
+                "FROM trade_history WHERE account_label=%s AND logic=%s AND desktop_time_ms>=%s",
+                (account_label, logic, day_start),
             )
             row = cur.fetchone() or (0, 0, 0)
             summary["today_realized_usd"] = float(row[0] or 0.0)
@@ -246,8 +249,8 @@ def realized_pnl_summary(account_label: str | None, started_at_ms: int) -> dict[
 
             cur.execute(
                 "SELECT COALESCE(SUM(realized_pnl_usdt),0), COALESCE(SUM(fee),0), COUNT(*) "
-                "FROM trade_history WHERE account_label=%s AND desktop_time_ms>=%s",
-                (account_label, max(started_at_ms, 0)),
+                "FROM trade_history WHERE account_label=%s AND logic=%s AND desktop_time_ms>=%s",
+                (account_label, logic, max(started_at_ms, 0)),
             )
             row = cur.fetchone() or (0, 0, 0)
             summary["run_realized_usd"] = float(row[0] or 0.0)
@@ -256,9 +259,9 @@ def realized_pnl_summary(account_label: str | None, started_at_ms: int) -> dict[
 
             cur.execute(
                 "SELECT symbol, COALESCE(SUM(realized_pnl_usdt),0), COALESCE(SUM(fee),0), COUNT(*) "
-                "FROM trade_history WHERE account_label=%s AND desktop_time_ms>=%s "
+                "FROM trade_history WHERE account_label=%s AND logic=%s AND desktop_time_ms>=%s "
                 "GROUP BY symbol ORDER BY SUM(realized_pnl_usdt) ASC",
-                (account_label, max(started_at_ms, 0)),
+                (account_label, logic, max(started_at_ms, 0)),
             )
             summary["by_symbol"] = [
                 {
