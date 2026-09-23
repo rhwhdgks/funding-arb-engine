@@ -1,42 +1,42 @@
-# Funding Arbitrage Execution Engine
+# 선물 거래 실행 엔진
 
-Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 실행 엔진입니다. 거래소 REST/WebSocket 상태 수집부터 주문, 헷지, 잔여 포지션 복구, 청산과 종료 후 점검까지 다룹니다.
+바이낸스와 OKX 선물시장에서 두 포지션을 한 쌍으로 관리하는 프로그램입니다. 한쪽 주문만 먼저 체결되면 다른 거래소에 반대 방향 주문을 내 위험을 줄입니다. 실패하거나 중단될 때는 남은 포지션을 확인·복구합니다.
 
-이 프로젝트는 수익률을 홍보하기 위한 저장소가 아닙니다. 현재 초점은 **전략을 교체해도 안전하게 굴러가는 execution / OMS / ops layer**입니다.
+거래소의 시세·계좌·주문 상태는 REST API와 WebSocket으로 받아옵니다. 이 저장소는 **주문 실행과 운영 점검**을 다루며, 투자 전략의 수익성은 별도로 평가합니다.
 
-## Current Status
+## 현재 범위와 검증
 
-- Main path: Binance Futures / OKX Futures
-- Runtime: live and test separated by env file
-- Control plane: strategy-attached embedded Ops Console
-- Persistence: optional MariaDB, DB-less runtime supported
-- Public validation: 41 unit/regression tests run by [CI](https://github.com/rhwhdgks/funding-arb-engine/actions)
-- Recorded operation: this README includes a 24h live-run `PASS` summary; its raw logs and final report are not in the public repository
-- Strategy profitability: evaluated separately from system stability
+- 주요 연동: Binance Futures, OKX Futures
+- 실거래와 테스트 설정은 별도 환경 파일로 분리
+- 전략 프로세스 안에서 주문·중지 상태를 제어하는 운영 콘솔 제공
+- 거래 기록은 MariaDB에 저장할 수 있으며, 데이터베이스 없이도 실행 가능
+- 공개 검증: 단위·회귀 테스트 41개와 [자동 테스트 기록](https://github.com/rhwhdgks/funding-arb-engine/actions)
+- 운영 기록: README에 24시간 실행의 운영 점검 `PASS` 요약을 기록함. 해당 실행의 원시 로그와 최종 보고서는 공개 저장소에 포함되지 않음
+- 전략 수익성은 시스템 운영 안정성과 별도로 평가
 
-## What It Handles
+## 구현한 기능
 
-- Exchange REST/WebSocket adapters for orderbook, account, position, order, trade, and funding state
-- Maker first-leg entry with immediate hedge on the opposite exchange
-- Pair close, emergency flatten, account imbalance recovery, and shutdown cleanup
-- Entry gates for active pair, open order, margin mode, exposure cap, rate-limit pressure, and manual ownership
-- Embedded Ops Console for manual order, hedge, flatten, cancel, pause, and resume
-- Structured JSONL events, optional MariaDB persistence, and final PASS/FAIL reports
-- Symbol price/funding collector as a separate runtime service
+- REST API와 WebSocket으로 호가·계좌·포지션·주문·체결·펀딩비 상태 수집
+- 첫 거래소의 주문이 체결되면 반대 거래소에서 위험을 줄이는 주문 실행
+- 거래 종료, 긴급 포지션 정리, 계좌 불균형 복구, 종료 후 잔여 상태 확인
+- 중복 주문·노출 한도·주문 대기·API 호출 제한 등을 확인하는 진입 조건
+- 수동 주문·취소·위험 축소·일시정지·재개를 위한 운영 콘솔
+- 사건별 JSONL 기록, 선택적 MariaDB 저장, 종료 후 점검 보고서
+- 가격·펀딩비 수집기를 별도 서비스로 실행
 
-## Design Checks
+## 위험 상황 점검
 
-The operational layer is designed around these checks and recovery paths:
+주문이 예상과 다르게 진행될 때 다음 경로를 확인하도록 설계했습니다.
 
-| Area | Guard or check |
+| 상황 | 처리 또는 점검 |
 | --- | --- |
-| Hedge completion | First-leg fills enter hedge or rollback handling; unresolved residuals enter recovery |
-| Order safety | Checks cover duplicate orders, overfill, stale orderbook, orphan positions, and open-order mismatches |
-| Shutdown | Stop path cancels open orders, closes tracked pairs, checks leftovers, and records shutdown state |
-| Control isolation | Console actions go through a command queue using the strategy-owned exchange sessions |
-| Auditability | Final report checks events, DB consistency, exchange positions and orders, API pressure, and collector freshness |
+| 한쪽 주문만 체결 | 반대쪽 거래나 주문 취소를 시도하고, 남은 수량은 복구 대상으로 관리 |
+| 주문 상태 불일치 | 중복 주문, 초과 체결, 오래된 호가, 추적되지 않는 포지션·주문을 확인 |
+| 프로그램 종료 | 열린 주문 취소, 추적 중인 거래 종료, 남은 포지션과 종료 상태 확인 |
+| 수동 조작 | 운영 콘솔 명령도 전략이 사용하는 거래소 연결을 통해 처리 |
+| 사후 점검 | 사건 기록, DB와 거래소 상태, API 사용량, 수집 데이터의 최신성 확인 |
 
-## Architecture
+## 시스템 구성
 
 ```mermaid
 flowchart LR
@@ -58,22 +58,22 @@ flowchart LR
     M --> O
 ```
 
-## Main Components
+## 주요 코드
 
-| Area | Files |
+| 역할 | 파일 |
 | --- | --- |
-| Runtime entry | [main.py](main.py), [strategy.py](strategy.py) |
-| Strategy modules | [src/strategy](src/strategy) |
-| Binance adapter | [src/binance_f_module](src/binance_f_module) |
-| OKX adapter | [src/okx_f_module](src/okx_f_module) |
-| Ops console | [src/ops_console](src/ops_console) |
-| Persistence/reporting | [src/ops](src/ops), [scripts/ops](scripts/ops) |
-| Runtime scripts | [scripts/runtime](scripts/runtime) |
-| DB schema | [sql/trading_dev_schema.sql](sql/trading_dev_schema.sql) |
+| 실행 시작점 | [main.py](main.py), [strategy.py](strategy.py) |
+| 전략 모듈 | [src/strategy](src/strategy) |
+| 바이낸스 연동 | [src/binance_f_module](src/binance_f_module) |
+| OKX 연동 | [src/okx_f_module](src/okx_f_module) |
+| 운영 콘솔 | [src/ops_console](src/ops_console) |
+| 기록·보고서 | [src/ops](src/ops), [scripts/ops](scripts/ops) |
+| 실행 스크립트 | [scripts/runtime](scripts/runtime) |
+| DB 테이블 정의 | [sql/trading_dev_schema.sql](sql/trading_dev_schema.sql) |
 
-## Quick Start
+## 실행 방법
 
-Python 3.12 기준입니다. MariaDB persistence를 사용하지 않아도 엔진과 리포트의 핵심 경로는 실행할 수 있습니다.
+Python 3.12 기준입니다. MariaDB에 저장하지 않아도 엔진과 보고서의 핵심 기능을 실행할 수 있습니다.
 
 Ubuntu에서 MariaDB Python driver 빌드가 필요하면 먼저 `libmariadb-dev`를 설치합니다.
 
@@ -86,7 +86,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.lock
 ```
 
-로컬 설정 파일을 만든 뒤 필요한 값만 채웁니다. 실제 key, token, DB password는 커밋하지 않습니다.
+로컬 설정 파일을 만든 뒤 필요한 값만 채웁니다. 실제 API 키·토큰·DB 비밀번호는 커밋하지 않습니다.
 
 ```bash
 cp .env.example .env
@@ -101,9 +101,9 @@ cp test_server/.env.example test_server/.env
 bash -n scripts/runtime/run_strategy_live.sh
 ```
 
-### Test Server
+### 테스트 서버
 
-테스트 거래소 credential을 `test_server/.env`에 설정한 뒤 짧은 smoke run부터 시작합니다.
+테스트 거래소의 접속 정보를 `test_server/.env`에 설정한 뒤 짧게 실행해 상태를 확인합니다.
 
 ```bash
 STRATEGY_ENV_FILE=test_server/.env STRATEGY_RUN_DURATION=30m scripts/runtime/run_strategy_live.sh start
@@ -111,9 +111,9 @@ STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh status
 STRATEGY_ENV_FILE=test_server/.env scripts/runtime/run_strategy_live.sh stop
 ```
 
-### Live Trading
+### 실거래
 
-실거래는 test-server 검증, shutdown flat 확인, final report 검토 후에만 활성화합니다.
+실거래는 테스트 서버에서 검증하고, 종료 후 남은 포지션이 없는지와 최종 보고서를 확인한 뒤에만 활성화합니다.
 
 ```bash
 STRATEGY_ENV_FILE=.env STRATEGY_RUN_DURATION=12h scripts/runtime/run_strategy_live.sh start
@@ -133,11 +133,11 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh stop
 STRATEGY_ENV_FILE=.env scripts/runtime/run_strategy_live.sh final-report --label real_12h
 ```
 
-전체 운영 절차와 장애 대응은 [runbook](docs/runbook.md)을 따릅니다.
+전체 운영 절차와 장애 대응은 [운영 안내서](docs/runbook.md)에 정리했습니다.
 
-## Ops Console
+## 운영 콘솔
 
-Ops Console은 전략 프로세스에 내장된 control plane입니다. 전략이 켜질 때 같이 뜨며, 콘솔이 별도 exchange polling session을 만들지 않으므로 브라우저를 열어도 전략과 별개의 API pressure가 생기지 않습니다.
+운영 콘솔은 전략 프로그램과 함께 실행됩니다. 콘솔이 거래소에 별도로 계속 조회 요청을 보내지 않도록, 전략이 쓰는 연결을 함께 사용합니다.
 
 ```env
 OPS_CONSOLE_HOST=127.0.0.1
@@ -156,11 +156,11 @@ STRATEGY_ENV_FILE=.env scripts/runtime/run_ops_console.sh health
 http://127.0.0.1:8010
 ```
 
-전략이 꺼져 있으면 콘솔도 사용할 수 없습니다. `run_ops_console.sh start/status/health`는 전략 내장 콘솔이 살아 있는지만 확인하며, standalone backend는 시작하지 않습니다.
+전략이 꺼져 있으면 콘솔도 사용할 수 없습니다. `run_ops_console.sh start/status/health`는 전략 안의 콘솔 상태만 확인하며, 별도 서버를 시작하지 않습니다.
 
-## Reports
+## 운영 점검 보고서
 
-Final report는 운영 안정성을 판단하는 기준입니다. 전략 수익성 판단과 분리해서 봅니다.
+최종 보고서는 주문·포지션이 안전하게 정리됐는지 판단할 때 사용합니다. 투자 전략의 수익성은 여기서 판정하지 않습니다.
 
 PASS 기준:
 
@@ -169,20 +169,20 @@ PASS 기준:
 - `pair_close_pending=0`
 - `danger_log_lines=0`
 - `remaining_positions=[]`
-- live Binance/OKX positions `0`
-- live Binance/OKX open orders `0`
-- DB open-like orders `0`
-- order/trade reconcile `PASS`
-- API pressure and IP ban checks `PASS`
+- 거래소에 남은 Binance/OKX 포지션 `0`
+- 거래소에 남은 Binance/OKX 미체결 주문 `0`
+- DB에 열린 상태로 남은 주문 `0`
+- 주문·체결 내역 대조 `PASS`
+- API 호출량·접속 제한 점검 `PASS`
 
-README에 기록된 24시간 운영 실행의 요약입니다. 해당 실행의 원시 로그와 최종 리포트는 공개 저장소에 포함되지 않으며, `PASS`는 아래 운영 점검에 대한 판정입니다.
+아래는 README에 기록된 24시간 실행 요약입니다. 해당 실행의 원시 로그와 최종 보고서는 공개 저장소에 없으므로 독립적으로 재검증할 수 없습니다. `PASS`는 위 운영 항목에 대한 판정입니다.
 
 ```text
 final_verdict=PASS warnings=0 failures=0 blocking=0
 observed_duration=24h 0m 3s
 ```
 
-## Documentation
+## 자세한 문서
 
 - [docs/README.md](docs/README.md): 목적별 문서 인덱스
 - [docs/runbook.md](docs/runbook.md): 실행, 중지, health, final report, 장애 대응
@@ -194,10 +194,10 @@ observed_duration=24h 0m 3s
 - [docs/strategy_live_operations_runbook.md](docs/strategy_live_operations_runbook.md): 새 전략을 실거래로 옮기는 운영 절차
 - [test_server/README.md](test_server/README.md): 테스트 서버 실행 가이드
 
-## Safety Notes
+## 사용 시 주의
 
-- This repository is not investment advice.
-- Do not commit `.env`, API keys, tokens, DB passwords, runtime files, or logs.
-- Live trading should be preceded by test-server runs, shutdown checks, and final report review.
-- Strategy profitability is not assumed from operational PASS reports.
-- Before publishing or packaging a fork, run `python scripts/release/audit_repository.py --history`.
+- 이 저장소는 투자 조언을 제공하지 않습니다.
+- `.env`, API 키, 토큰, DB 비밀번호, 실행 중 생성된 파일과 로그를 커밋하지 마세요.
+- 실거래 전에는 테스트 서버 실행, 종료 후 잔여 포지션 확인, 최종 보고서 검토가 필요합니다.
+- 운영 점검 `PASS`를 전략 수익의 증거로 해석하면 안 됩니다.
+- 코드를 복제해 공개하거나 배포할 때는 먼저 `python scripts/release/audit_repository.py --history`로 공개 범위를 점검하세요.
