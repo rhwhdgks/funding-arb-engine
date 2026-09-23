@@ -1,6 +1,6 @@
 # Funding Arbitrage Execution Engine
 
-Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 실행 엔진입니다. 핵심은 전략 아이디어 자체보다, 실제 거래 환경에서 필요한 주문 실행, 헷지, 청산, 복구, 운영 제어, 사후 검증을 일관된 하나의 시스템으로 묶는 것입니다.
+Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 실행 엔진입니다. 거래소 REST/WebSocket 상태 수집부터 주문, 헷지, 잔여 포지션 복구, 청산과 종료 후 점검까지 다룹니다.
 
 이 프로젝트는 수익률을 홍보하기 위한 저장소가 아닙니다. 현재 초점은 **전략을 교체해도 안전하게 굴러가는 execution / OMS / ops layer**입니다.
 
@@ -10,7 +10,8 @@ Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 �
 - Runtime: live and test separated by env file
 - Control plane: strategy-attached embedded Ops Console
 - Persistence: optional MariaDB, DB-less runtime supported
-- Validation baseline: 41 unit/regression tests and a recorded 24h live run `PASS`
+- Public validation: 41 unit/regression tests run by [CI](https://github.com/rhwhdgks/funding-arb-engine/actions)
+- Recorded operation: this README includes a 24h live-run `PASS` summary; its raw logs and final report are not in the public repository
 - Strategy profitability: evaluated separately from system stability
 
 ## What It Handles
@@ -23,17 +24,17 @@ Binance Futures와 OKX Futures를 대상으로 한 선물 페어 트레이딩 �
 - Structured JSONL events, optional MariaDB persistence, and final PASS/FAIL reports
 - Symbol price/funding collector as a separate runtime service
 
-## Engineering Guarantees
+## Design Checks
 
-The operational layer is designed around these invariants:
+The operational layer is designed around these checks and recovery paths:
 
-| Area | Guarantee |
+| Area | Guard or check |
 | --- | --- |
-| Hedge completeness | First-leg fills are hedged or rolled back; residuals go through recovery instead of being ignored blindly |
-| Order safety | Duplicate order, overfill, stale orderbook, orphan position, and open-order mismatch paths are guarded |
-| Shutdown safety | Stop path cancels open orders, closes tracked pairs, flattens leftovers, and records shutdown state |
-| Control isolation | Console actions use the strategy-owned exchange sessions through a command queue |
-| Auditability | Final report checks events, DB consistency, live exchange flat state, API pressure, and collector freshness |
+| Hedge completion | First-leg fills enter hedge or rollback handling; unresolved residuals enter recovery |
+| Order safety | Checks cover duplicate orders, overfill, stale orderbook, orphan positions, and open-order mismatches |
+| Shutdown | Stop path cancels open orders, closes tracked pairs, checks leftovers, and records shutdown state |
+| Control isolation | Console actions go through a command queue using the strategy-owned exchange sessions |
+| Auditability | Final report checks events, DB consistency, exchange positions and orders, API pressure, and collector freshness |
 
 ## Architecture
 
@@ -174,7 +175,7 @@ PASS 기준:
 - order/trade reconcile `PASS`
 - API pressure and IP ban checks `PASS`
 
-최근 검증 기준선:
+README에 기록된 24시간 운영 실행의 요약입니다. 해당 실행의 원시 로그와 최종 리포트는 공개 저장소에 포함되지 않으며, `PASS`는 아래 운영 점검에 대한 판정입니다.
 
 ```text
 final_verdict=PASS warnings=0 failures=0 blocking=0
