@@ -24,9 +24,8 @@ dist/
 
 .vscode/
 .idea/
-.claude/
 
-# Local AI review/handoff artifacts are not part of the public project.
+# Local review/handoff artifacts are not part of the public project.
 /handoff/
 /funding_arb_handoff_*.md
 /funding_arb_project_analysis_*.md
